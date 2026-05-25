@@ -1,7 +1,7 @@
 {
   "domain": "traefik",
   "name": "Traefik",
-  "version": "0.1.0-alpha.2",
+  "version": "0.1.0-alpha.3",
   "codeowners": ["@uncommon-fix"],
   "config_flow": true,
   "documentation": "https://github.com/uncommon-fix/ha-addon-traefik/blob/main/DOCS.md",

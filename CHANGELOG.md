@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.0-alpha.3
+
+- Fix: the setup wizard failed to save with a 500 error (`PUT /api/config`).
+  Config validation no longer crashes when the optional `ha_hostname` field is
+  absent from the payload.
+
 ## 0.1.0-alpha.2
 
 - Removed the supervisor **Configuration** form. All settings (routes,

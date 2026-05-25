@@ -568,7 +568,7 @@ def _validate_config(body):
     if missing:
         raise web.HTTPBadRequest(text=f"missing required: {sorted(missing)}")
     for k, t in CONFIG_TYPES.items():
-        if not isinstance(body[k], t):
+        if k in body and not isinstance(body[k], t):
             raise web.HTTPBadRequest(text=f"{k}: wrong type (expected {t.__name__})")
     if body["provider"] not in ALLOWED_PROVIDERS:
         raise web.HTTPBadRequest(
@@ -581,14 +581,16 @@ def _validate_config(body):
     body["domain"] = body["domain"].strip().lower()
     body["cloudflare_token"] = body["cloudflare_token"].strip()
     body["provider"] = body["provider"].strip().lower()
-    # ha_hostname is a bare subdomain label (no dots) or empty (disable).
-    ha = body["ha_hostname"].strip().lower()
-    if ha and "." in ha:
-        raise web.HTTPBadRequest(
-            text="ha_hostname must be a bare subdomain (no dots); "
-                 "e.g. 'hass' becomes 'hass.<domain>'"
-        )
-    body["ha_hostname"] = ha
+    # ha_hostname is vestigial (the HA system route owns the subdomain) and the
+    # setup wizard omits it; validate only when a client still sends it.
+    if "ha_hostname" in body:
+        ha = (body["ha_hostname"] or "").strip().lower()
+        if ha and "." in ha:
+            raise web.HTTPBadRequest(
+                text="ha_hostname must be a bare subdomain (no dots); "
+                     "e.g. 'hass' becomes 'hass.<domain>'"
+            )
+        body["ha_hostname"] = ha
     # entryPoint names: DNS-label-safe, non-empty, not reserved.
     for field in ("entrypoint_http", "entrypoint_https"):
         name = body[field].strip().lower()
