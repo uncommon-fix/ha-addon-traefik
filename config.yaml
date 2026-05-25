@@ -1,0 +1,109 @@
+name: Traefik
+version: "0.1.0-alpha.1"
+slug: traefik
+description: LAN reverse-proxy add-on for Home Assistant. Bundles Traefik with a custom UI for routes, middlewares, Cloudflare DNS-01 TLS, and the Traefik dashboard.
+arch:
+  - aarch64    # production target (RPi HAOS)
+  - amd64      # dev / x86 hosts
+init: false
+startup: services
+boot: manual
+# Prebuilt multi-arch images are published to GHCR by CI; the supervisor pulls
+# <image>:<version> for store installs. KEEP THIS COMMENTED for local builds:
+# when `image:` is set, the supervisor PULLS the prebuilt image instead of
+# building from this Dockerfile, so local-add-on dev iteration needs it off.
+image: ghcr.io/uncommon-fix/ha-addon-traefik
+# AppArmor is disabled for the alpha: the add-on runs under Docker's default
+# profile rather than a custom one. A tailored profile is planned for a later
+# release. (Several official add-ons also ship without a custom profile.)
+apparmor: false
+# 0.9.0: enabled so backend can POST /core/restart via SUPERVISOR_TOKEN
+# (the user clicks "Restart HA Core" in the addon UI banner after the
+# bundled reachability integration is first deployed). hassio_api alone
+# does NOT cover /core/* endpoints — homeassistant_api is required for that.
+homeassistant_api: true
+# 0.5.1: enabled so the backend can POST /addons/self/restart via the
+# SUPERVISOR_TOKEN env var. Used after a Setup-tab save to apply new
+# credentials without forcing the user to click Restart in HA's UI.
+# Default role ("default") permits only self-management, not other addons.
+hassio_api: true
+hassio_role: default
+# 0.9.0: /homeassistant RW so cont-init's 99-deploy-integration.sh can
+# write /homeassistant/custom_components/traefik/ (bundled reachability
+# integration). The `:rw` suffix is REQUIRED -- map entries default to `:ro`,
+# and without write access find/cp fail with "Read-only file system".
+map:
+  - homeassistant_config:rw
+ingress: true
+ingress_port: 8080
+# Phase D wires the sidebar entry to our aiohttp backend's two-tab UI
+# (Settings + Traefik dashboard iframe). panel_admin defaults to true per HA
+# docs (gates the entry to admin users); explicit `true` for documentation.
+panel_icon: mdi:router-network
+panel_title: Traefik
+panel_admin: true
+ports:
+  "80/tcp": 80
+  "443/tcp": 443
+ports_description:
+  "80/tcp": "HTTP entryPoint (Traefik) — port-forward from your router here for public routes"
+  "443/tcp": "HTTPS entryPoint (Traefik) — port-forward from your router here for public TLS routes"
+# Options ordering matters: the supervisor's Configure form renders fields in
+# schema-key insertion order, and the only "grouping" primitive HA exposes is
+# whether a field is optional (hidden under the "Show unused optional
+# configuration options" toggle).
+#
+# Phase D follow-up (v0.5.0): domain / acme_email / cloudflare_token / routes
+# moved into the add-on's own Setup + Routes tabs (managed via the ingress UI;
+# stored in /data/{config,routes}.yml). They are kept in this schema as
+# vestigial back-compat (Phase C lesson: removing schema fields with orphaned
+# saved-options keys breaks `ha apps update`); the renderer and backend ignore
+# them once /data/config.yml exists. Edits in the supervisor Configure tab
+# are silently lost on next save from the add-on UI.
+options:
+  domain: ""
+  acme_email: ""
+  cloudflare_token: ""
+  # `routes` is vestigial from Phase A-C: managed via the add-on's own UI
+  # (Settings tab) and stored in /data/routes.yml as of Phase D v0.4.0.
+  # Kept in the schema for back-compat with installed-options that still carry
+  # the field. DO NOT change the default to absent; supervisor rejects schema
+  # updates that orphan saved-option keys.
+  routes: []
+  acme_resolver: "cloudflare"
+  entrypoint_http: "web"
+  entrypoint_https: "websecure"
+  log_level: "INFO"
+schema:
+  # --- Primary configuration (always visible) ---
+  # `domain` is the shared apex. Per-route `hostname` is a bare subdomain label
+  # (e.g. `cloud` -> `cloud.example.com`). Use `@` or empty hostname for the
+  # apex. Leaving `domain` empty falls back to Phase B behaviour where
+  # `hostname` is a full FQDN. Required (no `?`) so it's always shown; empty
+  # string is a valid value meaning "no shared apex".
+  domain: str
+  # Required so the field is always visible. Empty string = "ACME inactive";
+  # the renderer's _acme_active() treats empty as missing and TLS routes fall
+  # back to Traefik's self-signed cert.
+  acme_email: str
+  # Required so the form always surfaces it. Empty string = ACME inactive.
+  cloudflare_token: password
+  routes:
+    - hostname: str
+      backend_kind: "list(external|home_assistant)"
+      backend_host: "str?"
+      backend_port: "port?"
+      scheme: "list(http|https)"
+      tls: bool
+      enabled: bool
+      middlewares:
+        - "str?"
+      health_path: "str?"
+      system: "str?"
+  # --- Advanced configuration (under "Show unused ..." toggle) ---
+  # All optional with defaults. Most users won't change these; keep them out
+  # of the primary view.
+  acme_resolver: "str?"
+  entrypoint_http: "str?"
+  entrypoint_https: "str?"
+  log_level: "list(DEBUG|INFO|WARN|ERROR|FATAL)?"

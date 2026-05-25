@@ -1,0 +1,19 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to Traefik",
+        "description": "Enter the URL of the Traefik add-on's backend. The default works when this integration runs alongside the bundled add-on.",
+        "data": {
+          "api_url": "API URL"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not reach the Traefik backend. Check that the add-on is running and the URL is correct."
+    },
+    "abort": {
+      "single_instance_allowed": "Only one Traefik integration instance is allowed."
+    }
+  }
+}

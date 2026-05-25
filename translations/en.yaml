@@ -1,0 +1,25 @@
+configuration:
+  domain:
+    name: Domain
+    description: Set this in the add-on UI (Open Web UI → setup wizard).
+  acme_email:
+    name: ACME contact email
+    description: Set this in the add-on UI (Open Web UI → setup wizard).
+  cloudflare_token:
+    name: Cloudflare API token
+    description: Set this in the add-on UI (Open Web UI → setup wizard).
+  routes:
+    name: Routes
+    description: Managed in the add-on UI (Open Web UI → Routes tab).
+  acme_resolver:
+    name: ACME resolver name
+    description: Managed in the add-on UI; rarely needs changing.
+  entrypoint_http:
+    name: HTTP entry point name
+    description: Managed in the add-on UI (Open Web UI → Advanced).
+  entrypoint_https:
+    name: HTTPS entry point name
+    description: Managed in the add-on UI (Open Web UI → Advanced).
+  log_level:
+    name: Log level
+    description: Managed in the add-on UI (Open Web UI → Advanced).

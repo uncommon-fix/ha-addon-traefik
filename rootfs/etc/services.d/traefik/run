@@ -1,0 +1,4 @@
+#!/usr/bin/with-contenv bashio
+set -euo pipefail
+bashio::log.info "starting traefik (file provider + entryPoints web/websecure/traefik@127.0.0.1:8090)"
+exec traefik --configFile=/etc/traefik/traefik.yml

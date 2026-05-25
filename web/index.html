@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="ingress-path" content="{{INGRESS_PATH}}">
+  <title>Traefik</title>
+  <script src="{{INGRESS_PATH}}/static/tailwindcss-3.4.17.min.js"></script>
+  <script src="{{INGRESS_PATH}}/static/app.js"></script>
+  <script defer src="{{INGRESS_PATH}}/static/alpinejs-3.15.12.min.js"></script>
+</head>
+<body class="h-full bg-gray-50 text-gray-900 antialiased" x-data="traefikApp" x-init="load()" x-cloak>
+  <header class="border-b bg-white px-6 py-3 flex items-center gap-6">
+    <h1 class="text-lg font-semibold">Traefik</h1>
+    <nav class="flex gap-1">
+      <button @click="if (state.configured) { tab='routes' }"
+              :disabled="!state.configured"
+              :class="tab==='routes' ? 'bg-blue-100 text-blue-900' : (state.configured ? 'hover:bg-gray-100' : 'opacity-40 cursor-not-allowed')"
+              class="px-3 py-1.5 rounded text-sm font-medium transition"
+              :title="state.configured ? '' : 'Complete the setup wizard first'">Routes</button>
+      <button @click="if (state.configured) { tab='middlewares' }"
+              :disabled="!state.configured"
+              :class="tab==='middlewares' ? 'bg-blue-100 text-blue-900' : (state.configured ? 'hover:bg-gray-100' : 'opacity-40 cursor-not-allowed')"
+              class="px-3 py-1.5 rounded text-sm font-medium transition"
+              :title="state.configured ? '' : 'Complete the setup wizard first'">Middlewares</button>
+      <button @click="if (state.configured) { tab='dashboard'; dashboardLoaded=true }"
+              :disabled="!state.configured"
+              :class="tab==='dashboard' ? 'bg-blue-100 text-blue-900' : (state.configured ? 'hover:bg-gray-100' : 'opacity-40 cursor-not-allowed')"
+              class="px-3 py-1.5 rounded text-sm font-medium transition"
+              :title="state.configured ? '' : 'Complete the setup wizard first'">Traefik Dashboard</button>
+    </nav>
+    <div class="ml-auto flex items-center gap-3">
+      <button @click="tab='config'"
+              :class="tab==='config' ? 'bg-blue-100 text-blue-900' : 'hover:bg-gray-100'"
+              class="px-3 py-1.5 rounded text-sm font-medium transition">Configuration</button>
+      <div class="text-xs text-gray-500 flex items-center gap-2">
+        <span x-show="!state.configured" class="text-amber-600">Setup incomplete</span>
+        <span x-show="state.configured && status.traefik_up === false" class="text-amber-600">Traefik starting...</span>
+        <span x-show="state.configured && status.traefik_up" class="text-green-600">Traefik ready</span>
+        <template x-if="status.version"><span x-text="'v' + status.version"></span></template>
+      </div>
+    </div>
+  </header>
+
+  <!-- ============ INTEGRATION-DEPLOY BANNER (Phase 4, 0.9.0) ============ -->
+  <!-- Persistent. Visible whenever cont-init's 99-deploy-integration.sh has
+       written /data/integration_pending_restart (i.e. the bundled
+       reachability integration was just freshly copied to /config/
+       custom_components/traefik/ and HA Core hasn't been restarted to load
+       it yet). Single button -> POST /api/restart-core via supervisor.
+       NOT dismissible — it reflects backend state, not a notification. -->
+  <div x-show="state.integration_pending_restart" x-transition.opacity
+       class="bg-amber-100 border-b border-amber-300 px-6 py-3 flex items-center justify-between gap-3">
+    <div class="text-sm text-amber-900">
+      <strong>Traefik integration ready.</strong>
+      Restart Home&nbsp;Assistant Core to load the reachability sensors.
+      After restart, add it via <span class="font-medium">Settings → Devices &amp; services → Add Integration → Traefik</span>.
+    </div>
+    <button @click="restartCore()" :disabled="restartingCore"
+            class="shrink-0 px-3 py-1.5 rounded bg-amber-600 text-white text-sm font-medium hover:bg-amber-700 disabled:bg-gray-400">
+      <span x-show="!restartingCore">Restart HA Core</span>
+      <span x-show="restartingCore">Restarting HA Core...</span>
+    </button>
+  </div>
+  <div x-show="restartCoreError" x-transition
+       class="bg-red-50 border-b border-red-300 px-6 py-2 text-sm text-red-900 font-mono whitespace-pre-wrap"
+       x-text="restartCoreError"></div>
+
+  <main :class="tab === 'dashboard' ? '' : 'p-6'">
+    <!-- ============ CONFIGURATION TAB ============ -->
+    <!-- Single page with all editable settings. The setup wizard (overlay
+         below) is a guided alternative for the 5 initial-config fields,
+         opened automatically on first-run and re-openable via the link at
+         the bottom of this form. -->
+    <section x-show="tab==='config'" x-transition class="max-w-2xl">
+      <div class="mb-6">
+        <h2 class="text-base font-semibold">Configuration</h2>
+        <p class="text-sm text-gray-500 mt-1">
+          All Traefik settings live here. The supervisor's Configure tab
+          is no longer used. Changes apply on add-on restart.
+        </p>
+      </div>
+
+      <div x-show="restartRequired" x-transition
+           class="mb-4 p-3 rounded border border-amber-300 bg-amber-50 text-sm text-amber-900 flex items-center justify-between gap-3">
+        <span>
+          Configuration saved. <strong>Restart the add-on</strong>
+          so Traefik picks up the new settings.
+        </span>
+        <button @click="restartAddon()" :disabled="restarting"
+                class="shrink-0 px-3 py-1.5 rounded bg-amber-600 text-white text-sm font-medium hover:bg-amber-700 disabled:bg-gray-400">
+          <span x-show="!restarting">Restart now</span>
+          <span x-show="restarting">Restarting...</span>
+        </button>
+      </div>
+
+      <div x-show="restartError" x-transition
+           class="mb-4 p-3 rounded border border-red-300 bg-red-50 text-sm text-red-900 font-mono whitespace-pre-wrap"
+           x-text="restartError"></div>
+      <div x-show="setupError" x-transition
+           class="mb-4 p-3 rounded border border-red-300 bg-red-50 text-sm text-red-900 font-mono whitespace-pre-wrap"
+           x-text="setupError"></div>
+      <div x-show="setupOk" x-transition
+           class="mb-4 p-3 rounded border border-green-300 bg-green-50 text-sm text-green-900"
+           x-text="setupOk"></div>
+
+      <form @submit.prevent="saveConfig()" class="space-y-5">
+        <div>
+          <label class="block text-sm font-medium mb-1">Log level</label>
+          <select x-model="config.log_level"
+                  class="block w-full border rounded px-3 py-2 bg-white">
+            <option value="DEBUG">DEBUG</option>
+            <option value="INFO">INFO</option>
+            <option value="WARN">WARN</option>
+            <option value="ERROR">ERROR</option>
+            <option value="FATAL">FATAL</option>
+          </select>
+        </div>
+
+        <div>
+          <label class="block text-sm font-medium mb-1">HTTP entry point name</label>
+          <input type="text" x-model="config.entrypoint_http"
+                 placeholder="web"
+                 class="block w-full font-mono border rounded px-3 py-2">
+          <p class="text-xs text-gray-500 mt-1">
+            Name Traefik uses for the :80 listener.
+            Default <span class="font-mono">web</span>.
+          </p>
+        </div>
+
+        <div>
+          <label class="block text-sm font-medium mb-1">HTTPS entry point name</label>
+          <input type="text" x-model="config.entrypoint_https"
+                 placeholder="websecure"
+                 class="block w-full font-mono border rounded px-3 py-2">
+          <p class="text-xs text-gray-500 mt-1">
+            Name for the :443 listener.
+            Default <span class="font-mono">websecure</span>.
+          </p>
+        </div>
+
+        <div class="flex items-center gap-4 pt-2">
+          <button type="submit"
+                  :disabled="savingConfig"
+                  class="px-4 py-2 rounded bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 disabled:bg-gray-400">
+            <span x-show="!savingConfig">Save</span>
+            <span x-show="savingConfig">Saving...</span>
+          </button>
+          <button type="button" @click="openWizard()"
+                  class="text-sm text-blue-600 hover:text-blue-800 underline">
+            Re-run setup wizard
+          </button>
+        </div>
+      </form>
+    </section>
+
+    <!-- ============ ROUTES TAB ============ -->
+    <section x-show="tab==='routes'" x-transition>
+      <div class="flex items-center justify-between mb-4">
+        <div>
+          <h2 class="text-base font-semibold">Routes</h2>
+          <p class="text-sm text-gray-500" x-show="config.domain">
+            Hostnames under <span class="font-mono" x-text="config.domain"></span>;
+            use <span class="font-mono">@</span> or empty for the apex.
+          </p>
+        </div>
+        <button @click="addRoute()"
+                class="px-3 py-1.5 rounded bg-blue-600 text-white text-sm font-medium hover:bg-blue-700">
+          Add route
+        </button>
+      </div>
+
+      <div x-show="saveError" x-transition
+           class="mb-3 p-3 rounded border border-red-300 bg-red-50 text-sm text-red-900 font-mono whitespace-pre-wrap"
+           x-text="saveError"></div>
+      <div x-show="saveOk" x-transition
+           class="mb-3 p-3 rounded border border-green-300 bg-green-50 text-sm text-green-900"
+           x-text="saveOk"></div>
+
+      <div x-show="routes.length === 0" class="p-8 text-center text-gray-400 border border-dashed rounded">
+        No routes yet. Click <span class="font-medium">Add route</span> to create one.
+      </div>
+
+      <div x-show="systemRowInvalid" x-transition
+           class="mb-3 p-3 rounded border border-amber-300 bg-amber-50 text-sm text-amber-900">
+        The Home Assistant system route has no hostname. Type one (or disable it) before saving.
+      </div>
+
+      <table x-show="routes.length > 0" class="w-full border-collapse text-sm">
+        <thead>
+          <tr class="text-left border-b">
+            <th class="py-2 pr-2 w-16"></th>
+            <th class="py-2 pr-3">Enabled</th>
+            <th class="py-2 pr-3">Hostname</th>
+            <th class="py-2 pr-3">Backend</th>
+            <th class="py-2 pr-3">Scheme</th>
+            <th class="py-2 pr-3">TLS</th>
+            <th class="py-2 pr-3">Middlewares</th>
+            <th class="py-2"></th>
+          </tr>
+        </thead>
+        <tbody>
+          <template x-for="r in sortedRoutes" :key="r._uid">
+            <tr :class="r.system ? 'bg-blue-50 border-b border-blue-200' : 'border-b hover:bg-gray-50'">
+              <!-- System badge column -->
+              <td class="py-2 pr-2">
+                <template x-if="r.system">
+                  <span class="inline-block px-1.5 py-0.5 text-[10px] font-semibold rounded bg-blue-200 text-blue-900 uppercase tracking-wide">System</span>
+                </template>
+              </td>
+              <!-- Enabled: static label for system rows; checkbox for user routes -->
+              <td class="py-2 pr-3">
+                <template x-if="r.system">
+                  <span class="text-xs text-gray-700" x-text="r.enabled ? 'Enabled' : 'Disabled'"></span>
+                </template>
+                <template x-if="!r.system">
+                  <input type="checkbox" x-model="r.enabled">
+                </template>
+              </td>
+              <!-- Hostname: editable on BOTH system and user rows -->
+              <td class="py-2 pr-3">
+                <input type="text" x-model="r.hostname"
+                       class="font-mono border rounded px-2 py-1 w-44 bg-white"
+                       :placeholder="r.system ? 'hass' : 'cloud or cloud.example.com'">
+              </td>
+              <!-- Backend: static label for system rows -->
+              <td class="py-2 pr-3">
+                <template x-if="r.system">
+                  <span class="text-xs text-gray-700">
+                    Home Assistant<br>
+                    <span class="font-mono text-gray-500">homeassistant:8123</span>
+                  </span>
+                </template>
+                <template x-if="!r.system">
+                  <div>
+                    <select x-model="r.backend_kind" class="border rounded px-2 py-1">
+                      <option value="home_assistant">Home Assistant</option>
+                      <option value="external">External</option>
+                    </select>
+                    <div x-show="r.backend_kind === 'external'" class="mt-1 flex gap-1">
+                      <input type="text" x-model="r.backend_host" placeholder="host"
+                             class="font-mono border rounded px-2 py-1 w-32">
+                      <input type="number" x-model.number="r.backend_port" placeholder="port"
+                             min="1" max="65535"
+                             class="font-mono border rounded px-2 py-1 w-20">
+                    </div>
+                  </div>
+                </template>
+              </td>
+              <!-- Scheme: static for system rows -->
+              <td class="py-2 pr-3">
+                <template x-if="r.system">
+                  <span class="font-mono text-xs text-gray-500">http</span>
+                </template>
+                <template x-if="!r.system">
+                  <select x-model="r.scheme" class="border rounded px-2 py-1"
+                          :disabled="r.backend_kind === 'home_assistant'">
+                    <option value="http">http</option>
+                    <option value="https">https</option>
+                  </select>
+                </template>
+              </td>
+              <!-- TLS: static for system rows -->
+              <td class="py-2 pr-3">
+                <template x-if="r.system">
+                  <span class="text-xs text-gray-700" x-text="r.tls ? 'TLS on' : 'TLS off'"></span>
+                </template>
+                <template x-if="!r.system">
+                  <input type="checkbox" x-model="r.tls">
+                </template>
+              </td>
+              <!-- Middlewares + Health path: stacked. System rows show static markers
+                   (locked); user rows have two stacked inputs in the same cell width. -->
+              <td class="py-2 pr-3">
+                <template x-if="r.system">
+                  <div>
+                    <span class="text-xs text-gray-500">—</span>
+                    <div class="font-mono text-[10px] text-gray-400 mt-0.5">health: /</div>
+                  </div>
+                </template>
+                <template x-if="!r.system">
+                  <div class="flex flex-col gap-1">
+                    <input type="text"
+                           :value="(r.middlewares || []).join(', ')"
+                           @input="r.middlewares = $event.target.value.split(',').map(s=>s.trim()).filter(Boolean)"
+                           placeholder="auth, hsts"
+                           class="font-mono border rounded px-2 py-1 w-40 text-xs">
+                    <input type="text" :value="r.health_path || ''"
+                           @input="r.health_path = $event.target.value || null"
+                           placeholder="health: /"
+                           class="font-mono border rounded px-2 py-1 w-40 text-[11px] text-gray-700">
+                  </div>
+                </template>
+              </td>
+              <!-- Remove button: hidden for system rows -->
+              <td class="py-2 text-right">
+                <button x-show="!r.system" @click="removeRoute(r)"
+                        class="text-red-600 hover:text-red-800 text-sm">Remove</button>
+              </td>
+            </tr>
+          </template>
+        </tbody>
+      </table>
+
+      <div class="mt-6 flex items-center gap-3">
+        <button @click="save()"
+                :disabled="saving || systemRowInvalid"
+                class="px-4 py-2 rounded bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 disabled:bg-gray-400"
+                :title="systemRowInvalid ? 'Fix the HA system route hostname first' : ''">
+          <span x-show="!saving">Save and apply</span>
+          <span x-show="saving">Saving...</span>
+        </button>
+        <button @click="load()" :disabled="saving"
+                class="px-3 py-2 rounded border text-sm font-medium hover:bg-gray-50 disabled:opacity-50">
+          Discard changes
+        </button>
+        <span class="text-xs text-gray-500" x-show="lastSavedAt"
+              x-text="'Last saved: ' + lastSavedAt"></span>
+      </div>
+    </section>
+
+    <!-- ============ MIDDLEWARES TAB ============ -->
+    <section x-show="tab==='middlewares'" x-transition>
+      <div class="flex items-center justify-between mb-4">
+        <div>
+          <h2 class="text-base font-semibold">Middlewares</h2>
+          <p class="text-sm text-gray-500">
+            Define basicAuth, IP allow-lists, HTTP→HTTPS redirects, and custom headers.
+            Reference them by name in a route's <span class="font-mono">Middlewares</span> column.
+          </p>
+        </div>
+        <button @click="addMiddleware()"
+                class="px-3 py-1.5 rounded bg-blue-600 text-white text-sm font-medium hover:bg-blue-700">
+          Add middleware
+        </button>
+      </div>
+
+      <div x-show="mwError" x-transition
+           class="mb-3 p-3 rounded border border-red-300 bg-red-50 text-sm text-red-900 font-mono whitespace-pre-wrap"
+           x-text="mwError"></div>
+      <div x-show="mwOk" x-transition
+           class="mb-3 p-3 rounded border border-green-300 bg-green-50 text-sm text-green-900"
+           x-text="mwOk"></div>
+
+      <div x-show="middlewares.length === 0" class="p-8 text-center text-gray-400 border border-dashed rounded">
+        No middlewares yet. Click <span class="font-medium">Add middleware</span> to create one.
+      </div>
+
+      <div class="space-y-4">
+        <template x-for="m in middlewares" :key="m._uid">
+          <div class="border rounded p-4 bg-white">
+            <div class="flex items-start gap-3 mb-3">
+              <div class="flex-1">
+                <label class="block text-xs font-medium text-gray-600 mb-1">Name</label>
+                <input type="text" x-model="m.name"
+                       placeholder="my-middleware"
+                       class="font-mono border rounded px-2 py-1 w-full">
+              </div>
+              <div class="w-48">
+                <label class="block text-xs font-medium text-gray-600 mb-1">Type</label>
+                <select :value="m.type"
+                        @change="changeMiddlewareType(m, $event.target.value)"
+                        class="border rounded px-2 py-1 w-full bg-white">
+                  <option value="basicAuth">basicAuth</option>
+                  <option value="ipAllowList">ipAllowList</option>
+                  <option value="redirectScheme">redirectScheme</option>
+                  <option value="headers">headers</option>
+                </select>
+              </div>
+              <button @click="removeMiddleware(m)"
+                      class="self-end text-red-600 hover:text-red-800 text-sm pb-1">Remove</button>
+            </div>
+
+            <!-- basicAuth editor -->
+            <div x-show="m.type === 'basicAuth'" class="border-t pt-3 mt-2 space-y-2">
+              <div class="flex items-center justify-between">
+                <label class="text-xs font-medium text-gray-600">Users</label>
+                <button @click="addBasicAuthUser(m)"
+                        class="text-xs text-blue-600 hover:text-blue-800">+ Add user</button>
+              </div>
+              <template x-for="u in (m.config.users || [])" :key="u._orig_username + ':' + (m.config.users.indexOf(u))">
+                <div class="flex gap-2 items-center">
+                  <input type="text" x-model="u.username"
+                         placeholder="username"
+                         class="font-mono border rounded px-2 py-1 w-40">
+                  <input type="password" x-model="u.password"
+                         :placeholder="u.password_set ? '••••• (set; leave blank to keep)' : 'password'"
+                         autocomplete="new-password"
+                         class="font-mono border rounded px-2 py-1 flex-1">
+                  <button @click="removeBasicAuthUser(m, u)"
+                          class="text-red-600 hover:text-red-800 text-sm">Remove</button>
+                </div>
+              </template>
+              <p class="text-xs text-gray-500">
+                Passwords are bcrypt-hashed at save time and never shown back.
+                Renaming a user requires setting a new password.
+              </p>
+            </div>
+
+            <!-- ipAllowList editor -->
+            <div x-show="m.type === 'ipAllowList'" class="border-t pt-3 mt-2 space-y-2">
+              <div class="flex items-center justify-between">
+                <label class="text-xs font-medium text-gray-600">Allowed CIDR ranges</label>
+                <button @click="addAllowRange(m)"
+                        class="text-xs text-blue-600 hover:text-blue-800">+ Add range</button>
+              </div>
+              <template x-for="(s, idx) in (m.config.sourceRange || [])" :key="idx">
+                <div class="flex gap-2 items-center">
+                  <input type="text"
+                         :value="s"
+                         @input="m.config.sourceRange[idx] = $event.target.value"
+                         placeholder="192.168.1.0/24 or 10.0.0.5"
+                         class="font-mono border rounded px-2 py-1 flex-1">
+                  <button @click="removeAllowRange(m, idx)"
+                          class="text-red-600 hover:text-red-800 text-sm">Remove</button>
+                </div>
+              </template>
+              <p class="text-xs text-gray-500">
+                Bare IPs become <span class="font-mono">/32</span> (or <span class="font-mono">/128</span> for IPv6).
+                Host bits are normalised to the network address on save.
+              </p>
+            </div>
+
+            <!-- redirectScheme editor -->
+            <div x-show="m.type === 'redirectScheme'" class="border-t pt-3 mt-2 space-y-3">
+              <div class="flex items-center gap-4">
+                <label class="text-xs font-medium text-gray-600">Redirect to</label>
+                <select x-model="m.config.scheme" class="border rounded px-2 py-1 bg-white">
+                  <option value="https">https</option>
+                  <option value="http">http</option>
+                </select>
+              </div>
+              <label class="flex items-center gap-2 text-sm">
+                <input type="checkbox" x-model="m.config.permanent">
+                <span>Permanent redirect (301 instead of 302)</span>
+              </label>
+              <p class="text-xs text-gray-500">
+                Common use: attach to an HTTP route to force browsers to upgrade to HTTPS.
+              </p>
+            </div>
+
+            <!-- headers editor -->
+            <div x-show="m.type === 'headers'" class="border-t pt-3 mt-2 space-y-4">
+              <div>
+                <div class="flex items-center justify-between mb-1">
+                  <label class="text-xs font-medium text-gray-600">Custom request headers (to backend)</label>
+                  <button @click="addHeaderRow(m, 'customRequestHeaders')"
+                          class="text-xs text-blue-600 hover:text-blue-800">+ Add header</button>
+                </div>
+                <template x-for="(row, idx) in (m.config.customRequestHeaders || [])" :key="'req-' + idx">
+                  <div class="flex gap-2 items-center mb-1">
+                    <input type="text" x-model="row.key" placeholder="Header-Name"
+                           class="font-mono border rounded px-2 py-1 w-56">
+                    <input type="text" x-model="row.value" placeholder="value (empty = sets to empty)"
+                           class="font-mono border rounded px-2 py-1 flex-1">
+                    <button @click="removeHeaderRow(m, 'customRequestHeaders', idx)"
+                            class="text-red-600 hover:text-red-800 text-sm">Remove</button>
+                  </div>
+                </template>
+              </div>
+              <div>
+                <div class="flex items-center justify-between mb-1">
+                  <label class="text-xs font-medium text-gray-600">Custom response headers (to client)</label>
+                  <button @click="addHeaderRow(m, 'customResponseHeaders')"
+                          class="text-xs text-blue-600 hover:text-blue-800">+ Add header</button>
+                </div>
+                <template x-for="(row, idx) in (m.config.customResponseHeaders || [])" :key="'res-' + idx">
+                  <div class="flex gap-2 items-center mb-1">
+                    <input type="text" x-model="row.key" placeholder="Header-Name"
+                           class="font-mono border rounded px-2 py-1 w-56">
+                    <input type="text" x-model="row.value" placeholder="value (empty = sets to empty)"
+                           class="font-mono border rounded px-2 py-1 flex-1">
+                    <button @click="removeHeaderRow(m, 'customResponseHeaders', idx)"
+                            class="text-red-600 hover:text-red-800 text-sm">Remove</button>
+                  </div>
+                </template>
+              </div>
+              <p class="text-xs text-gray-500">
+                Removing a row deletes the entry on save. An empty value SETS the header to empty
+                (Traefik does not delete via empty value).
+              </p>
+            </div>
+          </div>
+        </template>
+      </div>
+
+      <div class="mt-6 flex items-center gap-3">
+        <button @click="saveMiddlewares()"
+                :disabled="savingMw"
+                class="px-4 py-2 rounded bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 disabled:bg-gray-400">
+          <span x-show="!savingMw">Save and apply</span>
+          <span x-show="savingMw">Saving...</span>
+        </button>
+        <button @click="loadMiddlewares()" :disabled="savingMw"
+                class="px-3 py-2 rounded border text-sm font-medium hover:bg-gray-50 disabled:opacity-50">
+          Discard changes
+        </button>
+      </div>
+    </section>
+
+    <!-- ============ TRAEFIK DASHBOARD TAB ============ -->
+    <section x-show="tab==='dashboard'" x-transition class="w-full">
+      <template x-if="dashboardLoaded">
+        <iframe :src="ingressPath + '/dashboard/'"
+                class="w-full block bg-white border-0"
+                style="height: calc(100vh - 49px);"
+                title="Traefik dashboard"></iframe>
+      </template>
+    </section>
+  </main>
+
+  <!-- ============ SETUP WIZARD OVERLAY ============ -->
+  <!-- Shown on first load when !state.configured, OR when the user clicks
+       "Re-run setup wizard" from the Configuration page. The wizard owns
+       the initial-config fields (provider/token/email/domain/ha_hostname);
+       they're NOT duplicated on the Configuration page.
+
+       Backdrop and panel animate independently so the backdrop just fades
+       and doesn't visibly zoom along with the panel. -->
+  <div x-show="wizardOpen" x-transition.opacity
+       class="fixed inset-0 z-40 bg-gray-900/40"></div>
+  <div x-show="wizardOpen" x-transition
+       class="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto p-6 pointer-events-none">
+    <div class="bg-white rounded-lg shadow-xl max-w-xl w-full my-12 p-8 relative pointer-events-auto">
+      <button x-show="state.configured" @click="closeWizard()"
+              class="absolute top-3 right-4 text-gray-400 hover:text-gray-700 text-2xl leading-none"
+              title="Close (configuration is already saved)">&times;</button>
+
+      <h2 class="text-lg font-semibold mb-1">Setup wizard</h2>
+      <p class="text-sm text-gray-500 mb-6">
+        Pick a TLS certificate provider and provide the credentials Traefik
+        needs to obtain certificates via DNS-01 challenge.
+      </p>
+
+      <div x-show="setupError" x-transition
+           class="mb-4 p-3 rounded border border-red-300 bg-red-50 text-sm text-red-900 font-mono whitespace-pre-wrap"
+           x-text="setupError"></div>
+
+      <form @submit.prevent="saveWizard()" class="space-y-5">
+        <div>
+          <label class="block text-sm font-medium mb-1">1. Certificate provider</label>
+          <select x-model="config.provider"
+                  class="block w-full border rounded px-3 py-2 bg-white">
+            <option value="cloudflare">Cloudflare (DNS-01)</option>
+          </select>
+        </div>
+
+        <div>
+          <label class="block text-sm font-medium mb-1">2. Cloudflare API token</label>
+          <input type="password" x-model="config.cloudflare_token"
+                 :placeholder="state.cloudflare_token_present ? '••••• (token set; leave blank to keep)' : 'Paste your Cloudflare API token'"
+                 autocomplete="new-password"
+                 class="block w-full font-mono border rounded px-3 py-2">
+          <p class="text-xs text-gray-500 mt-1">
+            Token needs <span class="font-mono">Zone:Zone:Read</span> +
+            <span class="font-mono">Zone:DNS:Edit</span> on the target zone.
+          </p>
+        </div>
+
+        <div>
+          <label class="block text-sm font-medium mb-1">3. ACME contact email</label>
+          <input type="email" x-model="config.acme_email"
+                 placeholder="you@example.com"
+                 class="block w-full border rounded px-3 py-2">
+          <p class="text-xs text-gray-500 mt-1">
+            Used to register your Let's Encrypt account. LE rejects
+            <span class="font-mono">example.com</span> addresses.
+          </p>
+        </div>
+
+        <div>
+          <label class="block text-sm font-medium mb-1">4. Domain</label>
+          <input type="text" x-model="config.domain"
+                 placeholder="example.com"
+                 class="block w-full font-mono border rounded px-3 py-2">
+          <p class="text-xs text-gray-500 mt-1">
+            Shared apex for your routes. Per-route hostnames become bare
+            subdomain labels under it.
+          </p>
+        </div>
+
+        <div class="flex items-center gap-3 pt-2">
+          <button type="submit"
+                  :disabled="savingConfig"
+                  class="px-4 py-2 rounded bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 disabled:bg-gray-400">
+            <span x-show="!savingConfig">Save and finish</span>
+            <span x-show="savingConfig">Saving...</span>
+          </button>
+          <button x-show="state.configured" type="button" @click="closeWizard()"
+                  class="px-3 py-2 rounded border text-sm font-medium hover:bg-gray-50">
+            Cancel
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+</body>
+</html>

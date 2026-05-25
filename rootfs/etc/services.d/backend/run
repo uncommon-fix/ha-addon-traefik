@@ -1,0 +1,4 @@
+#!/usr/bin/with-contenv bashio
+set -euo pipefail
+bashio::log.info "starting backend (aiohttp on :8080)"
+exec python3 /usr/local/bin/backend/server.py
