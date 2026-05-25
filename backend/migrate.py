@@ -31,6 +31,15 @@ OPTIONS = DATA / "options.json"
 # Order preserved so the YAML is human-readable.
 CORE_CONFIG_FIELDS = ["provider", "cloudflare_token", "acme_email", "domain"]
 
+# Default HTTP->HTTPS redirect middleware, seeded + attached to the HA system
+# route so http://<domain> 308-redirects to https:// out of the box.
+REDIRECT_MW_NAME = "redirect-to-https"
+REDIRECT_MW = {
+    "name": REDIRECT_MW_NAME,
+    "type": "redirectScheme",
+    "config": {"scheme": "https", "permanent": True},
+}
+
 
 def _dump(data: dict) -> str:
     return yaml.safe_dump(
@@ -159,6 +168,54 @@ def _ensure_middlewares_file() -> None:
     print("migrate: wrote empty /data/middlewares.yml", file=sys.stderr)
 
 
+def _ensure_redirect_middleware() -> None:
+    """Idempotently seed the redirect-to-https middleware and attach it to the
+    HA system route. Runs unconditionally so EXISTING installs get back-filled,
+    but only once: a `redirect_seeded` marker in config.yml stops it from
+    resurrecting a middleware/attachment the user later removed on purpose."""
+    cfg: dict = {}
+    if CONFIG_YML.exists():
+        cfg = yaml.safe_load(CONFIG_YML.read_text()) or {}
+    if cfg.get("redirect_seeded"):
+        return
+
+    # 1. Ensure the middleware exists in /data/middlewares.yml (by name).
+    if MIDDLEWARES_YML.exists():
+        mw_doc = yaml.safe_load(MIDDLEWARES_YML.read_text()) or {}
+    else:
+        mw_doc = {"version": 1, "middlewares": []}
+    mws = mw_doc.get("middlewares") or []
+    if not any(m.get("name") == REDIRECT_MW_NAME for m in mws):
+        mws.append(dict(REDIRECT_MW))
+        mw_doc["middlewares"] = mws
+        MIDDLEWARES_YML.write_text(_dump(mw_doc))
+        print(f"migrate: seeded {REDIRECT_MW_NAME!r} middleware", file=sys.stderr)
+
+    # 2. Attach it to the HA system route only (never user routes).
+    if ROUTES_YML.exists():
+        routes_doc = yaml.safe_load(ROUTES_YML.read_text()) or {}
+        routes = routes_doc.get("routes") or []
+        changed = False
+        for r in routes:
+            if r.get("system") == "ha_self":
+                r_mws = r.get("middlewares") or []
+                if REDIRECT_MW_NAME not in r_mws:
+                    r_mws.append(REDIRECT_MW_NAME)
+                    r["middlewares"] = r_mws
+                    changed = True
+        if changed:
+            routes_doc["routes"] = routes
+            ROUTES_YML.write_text(_dump(routes_doc))
+            print(
+                "migrate: attached redirect-to-https to HA system route",
+                file=sys.stderr,
+            )
+
+    # 3. One-shot marker (config.yml already exists by this point in main()).
+    cfg["redirect_seeded"] = True
+    CONFIG_YML.write_text(_dump(cfg))
+
+
 def main() -> int:
     # Phase A-E bootstrap: routes + config from options.json (or empty defaults).
     bootstrap_rc = 0
@@ -198,6 +255,11 @@ def main() -> int:
         _ensure_middlewares_file()
     except Exception as e:
         print(f"migrate: middlewares step failed: {e}", file=sys.stderr)
+        bootstrap_step_rc = 1
+    try:
+        _ensure_redirect_middleware()
+    except Exception as e:
+        print(f"migrate: redirect middleware step failed: {e}", file=sys.stderr)
         bootstrap_step_rc = 1
 
     return bootstrap_rc or bootstrap_step_rc

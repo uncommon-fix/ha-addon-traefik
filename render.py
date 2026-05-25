@@ -273,6 +273,13 @@ def _build_dynamic(opts: dict[str, Any]) -> tuple[dict[str, Any], int, int]:
     # a user route's slug collide-and-win over the system route.
     routes_input = sorted(routes_input, key=lambda r: 0 if r.get("system") else 1)
 
+    # Middleware name -> type map. A `redirectScheme` middleware on a TLS route
+    # is applied via a dedicated web-entrypoint redirect router (so http gets a
+    # 308); everything else stays on the main router. Loaded once and reused for
+    # the http.middlewares block below.
+    mw_raw = _load_middlewares()
+    mw_type = {m["name"]: m.get("type") for m in mw_raw if m.get("name")}
+
     for route in routes_input:
         if not route.get("enabled", True):
             skipped += 1
@@ -337,7 +344,13 @@ def _build_dynamic(opts: dict[str, Any]) -> tuple[dict[str, Any], int, int]:
                 continue
 
         tls = bool(route.get("tls", True))
-        middlewares = [m for m in (route.get("middlewares") or []) if m]
+        route_mws = [m for m in (route.get("middlewares") or []) if m]
+        # Split by resolved type (order-preserving). redirectScheme middlewares
+        # drive a separate web-entrypoint redirect router; the rest stay on the
+        # main router. Keeping redirect OFF the websecure router avoids an
+        # https->https 308 loop.
+        redirect_mws = [m for m in route_mws if mw_type.get(m) == "redirectScheme"]
+        other_mws = [m for m in route_mws if mw_type.get(m) != "redirectScheme"]
 
         router: dict[str, Any] = {
             "rule": f"Host(`{hostname}`)",
@@ -346,8 +359,8 @@ def _build_dynamic(opts: dict[str, Any]) -> tuple[dict[str, Any], int, int]:
             ],
             "service": slug,
         }
-        if middlewares:
-            router["middlewares"] = middlewares
+        if other_mws:
+            router["middlewares"] = other_mws
         if tls:
             if _acme_active(opts):
                 router["tls"] = {"certResolver": config["acme_resolver"]}
@@ -356,6 +369,27 @@ def _build_dynamic(opts: dict[str, Any]) -> tuple[dict[str, Any], int, int]:
                 router["tls"] = {}
 
         routers[slug] = router
+
+        # HTTP->HTTPS redirect: a TLS route carrying a redirectScheme middleware
+        # gets a second router on the web (:80) entrypoint applying ONLY the
+        # redirect middleware (308 to https before the service is reached). A
+        # non-TLS route ignores redirect middlewares — redirecting an http-only
+        # route to https would break it.
+        if tls and redirect_mws:
+            redirect_slug = f"{slug}-redirecthttps"
+            if redirect_slug in routers or redirect_slug in seen_slugs:
+                print(
+                    f"WARN: redirect router {redirect_slug!r} collides with an "
+                    "existing route; skipping http->https redirect",
+                    file=sys.stderr,
+                )
+            else:
+                routers[redirect_slug] = {
+                    "rule": f"Host(`{hostname}`)",
+                    "entryPoints": [config["entrypoint_http"]],
+                    "middlewares": redirect_mws,
+                    "service": slug,
+                }
         services[slug] = {
             "loadBalancer": {
                 "servers": [
@@ -379,7 +413,7 @@ def _build_dynamic(opts: dict[str, Any]) -> tuple[dict[str, Any], int, int]:
     # http.middlewares block. WARN-log any route that references an undefined
     # middleware (the backend validator rejects this at save time; this WARN
     # covers the hand-edited routes.yml path).
-    middlewares_defs = _build_middlewares(_load_middlewares())
+    middlewares_defs = _build_middlewares(mw_raw)
     defined_names = set(middlewares_defs)
     for slug, router in routers.items():
         for mw_name in router.get("middlewares", []) or []:

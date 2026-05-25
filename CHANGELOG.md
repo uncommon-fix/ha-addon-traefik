@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.0-alpha.5
+
+- HTTP now redirects to HTTPS automatically. A `redirect-to-https` middleware
+  ships by default and is applied to the Home Assistant route, so
+  `http://<your-domain>/` 308-redirects to `https://`. It also back-fills onto
+  existing installs. (The redirect is a permanent/308 — if you toggle a route's
+  TLS off, clear your browser cache.)
+- Fixed: an add-on update that doesn't change the bundled integration no longer
+  shows a spurious "restart Home Assistant" prompt.
+
 ## 0.1.0-alpha.4
 
 - "Restart Home Assistant to load the updated integration" is now also surfaced

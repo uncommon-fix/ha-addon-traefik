@@ -26,7 +26,11 @@ fi
 bashio::log.info "integration deploy: ${DEPLOYED} -> ${BUNDLED}"
 mkdir -p "${DST}"
 # busybox Alpine has no rsync; pre-clean + cp -a covers --delete semantics.
-find "${DST}" -mindepth 1 -delete
+# Preserve .loaded_content_hash: the integration writes it on load to record
+# which content HA imported. Wiping it here would make every redeploy (even an
+# identical-content add-on-only release) look like "restart needed" until HA
+# restarts and the integration rewrites it.
+find "${DST}" -mindepth 1 ! -name '.loaded_content_hash' -delete
 cp -a "${SRC}/." "${DST}/"
 echo "${BUNDLED}" > "${VERSION_FILE_DST}"
 
