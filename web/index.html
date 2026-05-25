@@ -337,23 +337,52 @@
               <!-- Middlewares + Health path: stacked. System rows show static markers
                    (locked); user rows have two stacked inputs in the same cell width. -->
               <td class="py-2 pr-3">
+                <!-- System row: middlewares are add-on-managed; LIST them read-only. -->
                 <template x-if="r.system">
                   <div>
-                    <span class="text-xs text-gray-500">—</span>
+                    <template x-if="(r.middlewares || []).length">
+                      <div class="flex flex-wrap gap-1">
+                        <template x-for="mw in r.middlewares" :key="mw">
+                          <span class="inline-block px-1.5 py-0.5 rounded bg-gray-100 text-gray-600 text-[10px] font-mono"
+                                x-text="mw"></span>
+                        </template>
+                      </div>
+                    </template>
+                    <template x-if="!(r.middlewares || []).length">
+                      <span class="text-xs text-gray-500">—</span>
+                    </template>
                     <div class="font-mono text-[10px] text-gray-400 mt-0.5">health: /</div>
                   </div>
                 </template>
+                <!-- User row: multiselect of configured middlewares + health path. -->
                 <template x-if="!r.system">
                   <div class="flex flex-col gap-1">
-                    <input type="text"
-                           :value="(r.middlewares || []).join(', ')"
-                           @input="r.middlewares = $event.target.value.split(',').map(s=>s.trim()).filter(Boolean)"
-                           placeholder="auth, hsts"
-                           class="font-mono border rounded px-2 py-1 w-40 text-xs">
+                    <div class="border rounded px-2 py-1 w-44 text-xs max-h-28 overflow-y-auto">
+                      <template x-if="!middlewares.length">
+                        <span class="text-gray-400 text-[11px]">No middlewares defined</span>
+                      </template>
+                      <template x-for="mw in middlewares" :key="mw.name">
+                        <label class="flex items-center gap-1.5 py-0.5 cursor-pointer">
+                          <input type="checkbox"
+                                 :checked="(r.middlewares || []).includes(mw.name)"
+                                 @change="toggleRouteMiddleware(r, mw.name, $event.target.checked)">
+                          <span class="font-mono text-[11px]" x-text="mw.name"></span>
+                        </label>
+                      </template>
+                      <!-- Orphan refs: still-attached but no longer defined; keep
+                           visible (checked) so saving doesn't silently drop them. -->
+                      <template x-for="mw in (r.middlewares || []).filter(n => !middlewares.some(m => m.name === n))" :key="'orphan-'+mw">
+                        <label class="flex items-center gap-1.5 py-0.5 cursor-pointer">
+                          <input type="checkbox" checked
+                                 @change="toggleRouteMiddleware(r, mw, $event.target.checked)">
+                          <span class="font-mono text-[11px] text-amber-700" x-text="mw + ' (missing)'"></span>
+                        </label>
+                      </template>
+                    </div>
                     <input type="text" :value="r.health_path || ''"
                            @input="r.health_path = $event.target.value || null"
                            placeholder="health: /"
-                           class="font-mono border rounded px-2 py-1 w-40 text-[11px] text-gray-700">
+                           class="font-mono border rounded px-2 py-1 w-44 text-[11px] text-gray-700">
                   </div>
                 </template>
               </td>
@@ -416,24 +445,40 @@
           <div class="border rounded p-4 bg-white">
             <div class="flex items-start gap-3 mb-3">
               <div class="flex-1">
-                <label class="block text-xs font-medium text-gray-600 mb-1">Name</label>
+                <label class="block text-xs font-medium text-gray-600 mb-1">
+                  Name
+                  <span x-show="m.system"
+                        class="ml-1 inline-block px-1.5 py-0.5 rounded bg-gray-200 text-gray-600 text-[10px] align-middle">Built-in</span>
+                </label>
                 <input type="text" x-model="m.name"
+                       :readonly="m.system"
                        placeholder="my-middleware"
-                       class="font-mono border rounded px-2 py-1 w-full">
+                       class="font-mono border rounded px-2 py-1 w-full"
+                       :class="m.system ? 'bg-gray-100 text-gray-500 cursor-not-allowed' : ''">
               </div>
               <div class="w-48">
                 <label class="block text-xs font-medium text-gray-600 mb-1">Type</label>
                 <select :value="m.type"
                         @change="changeMiddlewareType(m, $event.target.value)"
-                        class="border rounded px-2 py-1 w-full bg-white">
+                        :disabled="m.system"
+                        class="border rounded px-2 py-1 w-full bg-white"
+                        :class="m.system ? 'bg-gray-100 text-gray-500 cursor-not-allowed' : ''">
                   <option value="basicAuth">basicAuth</option>
                   <option value="ipAllowList">ipAllowList</option>
                   <option value="redirectScheme">redirectScheme</option>
                   <option value="headers">headers</option>
+                  <!-- skipTlsVerify is built-in-only: render the option solely so
+                       the locked skip-tls-verify select displays its value. -->
+                  <template x-if="m.system && m.type === 'skipTlsVerify'">
+                    <option value="skipTlsVerify">skipTlsVerify</option>
+                  </template>
                 </select>
               </div>
-              <button @click="removeMiddleware(m)"
+              <button x-show="!m.system" @click="removeMiddleware(m)"
                       class="self-end text-red-600 hover:text-red-800 text-sm pb-1">Remove</button>
+              <span x-show="m.system"
+                    class="self-end text-xs text-gray-400 pb-1"
+                    title="Built-in middleware managed by the add-on">Locked</span>
             </div>
 
             <!-- basicAuth editor -->
@@ -501,6 +546,15 @@
               </label>
               <p class="text-xs text-gray-500">
                 Common use: attach to an HTTP route to force browsers to upgrade to HTTPS.
+              </p>
+            </div>
+
+            <!-- skipTlsVerify editor (built-in; no config) -->
+            <div x-show="m.type === 'skipTlsVerify'" class="border-t pt-3 mt-2">
+              <p class="text-xs text-gray-500">
+                No configuration. Attach <span class="font-mono">skip-tls-verify</span>
+                to a route to skip TLS verification of that route's HTTPS backend —
+                useful for backends with a self-signed certificate on the LAN.
               </p>
             </div>
 

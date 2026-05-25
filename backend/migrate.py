@@ -40,6 +40,20 @@ REDIRECT_MW = {
     "config": {"scheme": "https", "permanent": True},
 }
 
+# alpha.7: a second built-in. `skip-tls-verify` (synthetic type skipTlsVerify,
+# no config) is attachable to a route; render.py translates it into a
+# serversTransport (insecureSkipVerify) so the route can front a self-signed
+# HTTPS backend. Unlike redirect-to-https it is NOT auto-attached anywhere — it's
+# a tool the user adds to a route on demand.
+SKIP_TLS_MW_NAME = "skip-tls-verify"
+SKIP_TLS_MW = {
+    "name": SKIP_TLS_MW_NAME,
+    "type": "skipTlsVerify",
+    "config": {},
+}
+# name -> canonical type for every add-on-managed built-in.
+BUILTIN_MIDDLEWARES = [REDIRECT_MW, SKIP_TLS_MW]
+
 
 def _dump(data: dict) -> str:
     return yaml.safe_dump(
@@ -168,6 +182,44 @@ def _ensure_middlewares_file() -> None:
     print("migrate: wrote empty /data/middlewares.yml", file=sys.stderr)
 
 
+def _ensure_builtin_middlewares() -> None:
+    """alpha.7: reconcile-always — ensure every add-on-managed built-in exists in
+    /data/middlewares.yml with its canonical type. Idempotent and runs on every
+    start (no one-shot marker): built-ins are tools the add-on owns, so a missing
+    one (fresh install, or a pre-alpha.7 install lacking skip-tls-verify) is
+    seeded, and a wrong-typed one is fixed in place (user config preserved). Does
+    NOT attach anything to a route — redirect-to-https's one-time ha_self
+    attachment stays in _ensure_redirect_middleware()."""
+    if MIDDLEWARES_YML.exists():
+        doc = yaml.safe_load(MIDDLEWARES_YML.read_text()) or {}
+    else:
+        doc = {"version": 1, "middlewares": []}
+    mws = doc.get("middlewares") or []
+    by_name = {m.get("name"): m for m in mws}
+    changed = False
+    for builtin in BUILTIN_MIDDLEWARES:
+        name = builtin["name"]
+        existing = by_name.get(name)
+        if existing is None:
+            mws.append(dict(builtin))
+            changed = True
+            print(f"migrate: seeded built-in middleware {name!r}", file=sys.stderr)
+        elif existing.get("type") != builtin["type"]:
+            existing["type"] = builtin["type"]
+            if existing.get("config") is None:
+                existing["config"] = dict(builtin["config"])
+            changed = True
+            print(
+                f"migrate: fixed built-in middleware {name!r} type "
+                f"-> {builtin['type']}",
+                file=sys.stderr,
+            )
+    if changed:
+        doc["middlewares"] = mws
+        doc.setdefault("version", 1)
+        MIDDLEWARES_YML.write_text(_dump(doc))
+
+
 def _ensure_redirect_middleware() -> None:
     """Idempotently seed the redirect-to-https middleware and attach it to the
     HA system route. Runs unconditionally so EXISTING installs get back-filled,
@@ -255,6 +307,11 @@ def main() -> int:
         _ensure_middlewares_file()
     except Exception as e:
         print(f"migrate: middlewares step failed: {e}", file=sys.stderr)
+        bootstrap_step_rc = 1
+    try:
+        _ensure_builtin_middlewares()
+    except Exception as e:
+        print(f"migrate: built-in middlewares step failed: {e}", file=sys.stderr)
         bootstrap_step_rc = 1
     try:
         _ensure_redirect_middleware()

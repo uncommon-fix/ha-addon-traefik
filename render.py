@@ -35,6 +35,13 @@ ROUTES_OUT = DYNAMIC_DIR / "routes.yml"
 HA_INTERNAL_HOST = "homeassistant"
 HA_INTERNAL_PORT = 8123
 
+# alpha.7: shared serversTransport for routes carrying the skip-tls-verify
+# built-in. SERVERS_TRANSPORT_REF must be @file-qualified — a bare name resolves
+# to @internal and Traefik errors. The map KEY under http.serversTransports is
+# the bare name; only the service's reference is qualified.
+SERVERS_TRANSPORT_NAME = "insecure-skip-verify"
+SERVERS_TRANSPORT_REF = "insecure-skip-verify@file"
+
 # Traefik uses '@' for provider-qualification (cloudflare@file); spaces/dots
 # break the YAML-key + name-lookup path. Restrict the resolver name to a safe
 # subset that Traefik unambiguously accepts as a map key and a cross-reference.
@@ -245,6 +252,9 @@ def _build_dynamic(opts: dict[str, Any]) -> tuple[dict[str, Any], int, int]:
     # the collision as a config bug.
     seen_slugs: dict[str, str] = {}
     enabled = skipped = 0
+    # alpha.7: emit the shared insecure-skip-verify serversTransport only if a
+    # route actually references it (keeps the dynamic file minimal).
+    uses_skip_transport = False
 
     # Optional shared apex: when `domain` is set, route `hostname` fields are
     # treated as bare subdomain labels (e.g. "cloud" + "example.com" ->
@@ -345,12 +355,20 @@ def _build_dynamic(opts: dict[str, Any]) -> tuple[dict[str, Any], int, int]:
 
         tls = bool(route.get("tls", True))
         route_mws = [m for m in (route.get("middlewares") or []) if m]
-        # Split by resolved type (order-preserving). redirectScheme middlewares
-        # drive a separate web-entrypoint redirect router; the rest stay on the
-        # main router. Keeping redirect OFF the websecure router avoids an
-        # https->https 308 loop.
+        # Split by resolved type (order-preserving), three ways:
+        #  - redirectScheme: drives a separate web-entrypoint redirect router
+        #    (keeping redirect OFF the websecure router avoids an https->https
+        #    308 loop);
+        #  - skipTlsVerify (alpha.7): NOT a Traefik middleware — translated into
+        #    the service's serversTransport below; excluded from the router here
+        #    so Traefik never sees it as an (undefined) router middleware;
+        #  - everything else stays on the main router, in order.
         redirect_mws = [m for m in route_mws if mw_type.get(m) == "redirectScheme"]
-        other_mws = [m for m in route_mws if mw_type.get(m) != "redirectScheme"]
+        skip_mws = [m for m in route_mws if mw_type.get(m) == "skipTlsVerify"]
+        other_mws = [
+            m for m in route_mws
+            if mw_type.get(m) not in ("redirectScheme", "skipTlsVerify")
+        ]
 
         router: dict[str, Any] = {
             "rule": f"Host(`{hostname}`)",
@@ -390,22 +408,26 @@ def _build_dynamic(opts: dict[str, Any]) -> tuple[dict[str, Any], int, int]:
                     "middlewares": redirect_mws,
                     "service": slug,
                 }
-        services[slug] = {
-            "loadBalancer": {
-                "servers": [
-                    {"url": f"{scheme}://{backend_host}:{backend_port}"}
-                ],
-                # Per-service healthCheck so /api/http/services populates
-                # serverStatus (the reachability integration depends on this).
-                # Per-route override via the
-                # optional `health_path` field on the route dict.
-                "healthCheck": {
-                    "path": _resolve_health_path(route),
-                    "interval": "30s",
-                    "timeout": "5s",
-                },
+        load_balancer: dict[str, Any] = {
+            "servers": [
+                {"url": f"{scheme}://{backend_host}:{backend_port}"}
+            ],
+            # Per-service healthCheck so /api/http/services populates
+            # serverStatus (the reachability integration depends on this).
+            # Per-route override via the optional `health_path` field.
+            "healthCheck": {
+                "path": _resolve_health_path(route),
+                "interval": "30s",
+                "timeout": "5s",
             },
         }
+        # alpha.7: skip-tls-verify built-in -> service serversTransport that
+        # disables backend cert verification (lets a route front a self-signed
+        # HTTPS backend). No-op on http backends. Coexists with healthCheck.
+        if skip_mws:
+            load_balancer["serversTransport"] = SERVERS_TRANSPORT_REF
+            uses_skip_transport = True
+        services[slug] = {"loadBalancer": load_balancer}
         seen_slugs[slug] = hostname
         enabled += 1
 
@@ -434,6 +456,13 @@ def _build_dynamic(opts: dict[str, Any]) -> tuple[dict[str, Any], int, int]:
         http_config["services"] = services
     if middlewares_defs:
         http_config["middlewares"] = middlewares_defs
+    # alpha.7: define the shared insecure-skip-verify transport only when a
+    # service references it (the map key is the bare name; services reference it
+    # as insecure-skip-verify@file).
+    if uses_skip_transport:
+        http_config["serversTransports"] = {
+            SERVERS_TRANSPORT_NAME: {"insecureSkipVerify": True}
+        }
     return {"http": http_config}, enabled, skipped
 
 

@@ -99,7 +99,9 @@ function normalizeMiddlewares(defs) {
             cfg = { sourceRange: (cfg.sourceRange || []).slice() };
         }
         // redirectScheme: shape is already flat {scheme, permanent}.
-        return { _uid: ++_mwUid, name: m.name, type, config: cfg };
+        // skipTlsVerify: no config ({}). system flag (add-on built-in) is
+        // server-derived; the UI uses it to gray/lock the card.
+        return { _uid: ++_mwUid, name: m.name, type, config: cfg, system: !!m.system };
     });
 }
 
@@ -530,16 +532,27 @@ function traefikAppData() {
             }
         },
 
+        // alpha.7: toggle a middleware on/off for a user route (multiselect).
+        // Append/remove preserves insertion order (Traefik applies in list order).
+        toggleRouteMiddleware(route, name, checked) {
+            if (!Array.isArray(route.middlewares)) route.middlewares = [];
+            const i = route.middlewares.indexOf(name);
+            if (checked && i === -1) route.middlewares.push(name);
+            else if (!checked && i !== -1) route.middlewares.splice(i, 1);
+        },
+
         addMiddleware() {
             this.middlewares.push(makeBlankMiddleware());
         },
 
         removeMiddleware(m) {
+            if (m.system) return;  // built-ins can't be removed (server re-injects anyway)
             const i = this.middlewares.indexOf(m);
             if (i >= 0) this.middlewares.splice(i, 1);
         },
 
         changeMiddlewareType(m, newType) {
+            if (m.system) return;  // built-in type is locked
             if (newType === m.type) return;
             // If the user has typed anything into the current config, confirm
             // before discarding. Use a heuristic: any populated array OR any

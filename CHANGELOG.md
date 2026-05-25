@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.0-alpha.7
+
+- New: a built-in **`skip-tls-verify`** middleware. Attach it to a route whose
+  backend is HTTPS with a self-signed/untrusted certificate (e.g. a LAN app) and
+  Traefik will stop verifying that backend's cert.
+- Routes tab: the middlewares column is now a **multiselect** of your configured
+  middlewares (no more comma-typing), and the Home Assistant system route now
+  **lists** its applied middlewares (e.g. `redirect-to-https`) instead of showing
+  a dash.
+- The two built-in middlewares (`redirect-to-https`, `skip-tls-verify`) are shown
+  as **Built-in** in the Middlewares tab: their config can still be edited where
+  applicable, but they can't be renamed, retyped, or removed.
+
 ## 0.1.0-alpha.6
 
 - New: a **Fix automatically** button for the HTTPS-returns-400 problem. When

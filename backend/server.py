@@ -148,7 +148,21 @@ ROUTE_TYPES = {
 }
 
 # Phase F (0.7.0): middleware definitions surface.
-ALLOWED_MIDDLEWARE_TYPES = {"basicAuth", "ipAllowList", "redirectScheme", "headers"}
+# alpha.7: skipTlsVerify is a synthetic type — it carries no Traefik middleware;
+# the renderer translates a route's skipTlsVerify middleware into a service-level
+# serversTransport (insecureSkipVerify) so a route can front a self-signed HTTPS
+# backend. It has no config.
+ALLOWED_MIDDLEWARE_TYPES = {
+    "basicAuth", "ipAllowList", "redirectScheme", "headers", "skipTlsVerify",
+}
+# alpha.7: add-on-managed built-ins. Server is the source of truth for
+# "system-ness" (never trust a client flag): these names map to their canonical
+# type, cannot be deleted or retyped via the UI/API, and are reconciled on every
+# start by migrate.py. Their config is still user-editable where the type allows.
+SYSTEM_MIDDLEWARE_NAMES = {
+    "redirect-to-https": "redirectScheme",
+    "skip-tls-verify": "skipTlsVerify",
+}
 MIDDLEWARE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,30}$")
 # Reserved as a UX choice (not a Traefik correctness requirement -- bare names
 # get @file qualified internally so they can't actually collide with @internal).
@@ -474,9 +488,21 @@ async def _validate_middlewares(body, existing_defs: list) -> list:
             )
         seen_names.add(name)
         typ = mw.get("type")
+        # System built-ins: the server owns their type — a client can't retype
+        # them (e.g. turn redirect-to-https into a basicAuth). Force canonical.
+        if name in SYSTEM_MIDDLEWARE_NAMES:
+            typ = SYSTEM_MIDDLEWARE_NAMES[name]
         if typ not in ALLOWED_MIDDLEWARE_TYPES:
             raise web.HTTPBadRequest(
                 text=f"middleware[{i}].type: must be one of {sorted(ALLOWED_MIDDLEWARE_TYPES)}"
+            )
+        # skipTlsVerify is a built-in-only synthetic type (renders to a service
+        # serversTransport, not a Traefik middleware). Don't let users mint new
+        # ones under arbitrary names.
+        if typ == "skipTlsVerify" and name not in SYSTEM_MIDDLEWARE_NAMES:
+            raise web.HTTPBadRequest(
+                text=f"middleware[{i}].type: skipTlsVerify is reserved for the "
+                     "built-in 'skip-tls-verify' middleware"
             )
         cfg = mw.get("config")
         if typ == "basicAuth":
@@ -488,6 +514,8 @@ async def _validate_middlewares(body, existing_defs: list) -> list:
             cfg_out = _validate_redirectScheme(cfg, i)
         elif typ == "headers":
             cfg_out = _validate_headers(cfg, i)
+        elif typ == "skipTlsVerify":
+            cfg_out = {}  # no configuration
         else:
             raise web.HTTPInternalServerError(text="unreachable")
         out.append({"name": name, "type": typ, "config": cfg_out})
@@ -499,7 +527,13 @@ def _redact_middlewares(defs: list) -> list:
     so callers can mutate the result without polluting the on-disk shape."""
     out: list = []
     for mw in defs:
-        copy = {"name": mw.get("name"), "type": mw.get("type")}
+        copy = {
+            "name": mw.get("name"),
+            "type": mw.get("type"),
+            # alpha.7: add-on-managed built-in (UI grays it out: name+type locked,
+            # not removable). Derived server-side; never read from the stored def.
+            "system": mw.get("name") in SYSTEM_MIDDLEWARE_NAMES,
+        }
         cfg = mw.get("config") or {}
         if mw.get("type") == "basicAuth":
             copy["config"] = {
@@ -522,6 +556,28 @@ def _load_middlewares_yml() -> list:
         return []
     parsed = yaml.safe_load(MIDDLEWARES_YML.read_text()) or {}
     return parsed.get("middlewares") or []
+
+
+def _system_default_config(name: str) -> dict:
+    if name == "redirect-to-https":
+        return {"scheme": "https", "permanent": True}
+    return {}  # skip-tls-verify and any future no-config built-in
+
+
+def _reinject_system_middlewares(defs: list, existing: list) -> list:
+    """alpha.7: built-ins can't be deleted via the UI/API. After validation,
+    re-add any system middleware that this PUT omitted — preserving its stored
+    config (or seeding the default if it didn't exist yet) and its canonical
+    type. Idempotent: names already present are left untouched."""
+    present = {m.get("name") for m in defs}
+    by_name = {m.get("name"): m for m in existing}
+    for name, canon_type in SYSTEM_MIDDLEWARE_NAMES.items():
+        if name in present:
+            continue
+        prior = by_name.get(name)
+        cfg = (prior.get("config") if prior else None) or _system_default_config(name)
+        defs.append({"name": name, "type": canon_type, "config": cfg})
+    return defs
 
 
 # ---------- helpers ----------
@@ -1152,6 +1208,7 @@ async def put_middlewares(request):
     async with request.app["save_lock"]:
         existing = _load_middlewares_yml()
         defs = await _validate_middlewares(body.get("middlewares", []), existing)
+        defs = _reinject_system_middlewares(defs, existing)
         _atomic_write_yml(MIDDLEWARES_YML, {"version": 1, "middlewares": defs})
         proc = await asyncio.create_subprocess_exec(
             "python3", RENDER_PY,
