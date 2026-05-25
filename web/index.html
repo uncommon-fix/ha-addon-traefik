@@ -458,21 +458,23 @@
               </div>
               <div class="w-48">
                 <label class="block text-xs font-medium text-gray-600 mb-1">Type</label>
-                <select :value="m.type"
-                        @change="changeMiddlewareType(m, $event.target.value)"
-                        :disabled="m.system"
-                        class="border rounded px-2 py-1 w-full bg-white"
-                        :class="m.system ? 'bg-gray-100 text-gray-500 cursor-not-allowed' : ''">
-                  <option value="basicAuth">basicAuth</option>
-                  <option value="ipAllowList">ipAllowList</option>
-                  <option value="redirectScheme">redirectScheme</option>
-                  <option value="headers">headers</option>
-                  <!-- skipTlsVerify is built-in-only: render the option solely so
-                       the locked skip-tls-verify select displays its value. -->
-                  <template x-if="m.system && m.type === 'skipTlsVerify'">
-                    <option value="skipTlsVerify">skipTlsVerify</option>
-                  </template>
-                </select>
+                <!-- Built-in: type is locked. Render it read-only (a <select> with
+                     a conditional <template> option is invalid HTML and breaks the
+                     :value binding, defaulting to the first option). -->
+                <template x-if="m.system">
+                  <div class="font-mono border rounded px-2 py-1 w-full bg-gray-100 text-gray-500"
+                       x-text="m.type"></div>
+                </template>
+                <template x-if="!m.system">
+                  <select :value="m.type"
+                          @change="changeMiddlewareType(m, $event.target.value)"
+                          class="border rounded px-2 py-1 w-full bg-white">
+                    <option value="basicAuth">basicAuth</option>
+                    <option value="ipAllowList">ipAllowList</option>
+                    <option value="redirectScheme">redirectScheme</option>
+                    <option value="headers">headers</option>
+                  </select>
+                </template>
               </div>
               <button x-show="!m.system" @click="removeMiddleware(m)"
                       class="self-end text-red-600 hover:text-red-800 text-sm pb-1">Remove</button>

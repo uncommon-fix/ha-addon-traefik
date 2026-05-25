@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.0-alpha.8
+
+- Fixed: the built-in middlewares' **Type** field showed the wrong value
+  (`basicAuth`) in the Middlewares tab. It now correctly shows the locked type
+  (`redirectScheme` / `skipTlsVerify`).
+
 ## 0.1.0-alpha.7
 
 - New: a built-in **`skip-tls-verify`** middleware. Attach it to a route whose
