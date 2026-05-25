@@ -102,6 +102,7 @@ def _load_core_config(opts: dict[str, Any]) -> dict[str, Any]:
         "entrypoint_https": "websecure",
         "log_level": "INFO",
         "acme_resolver": "cloudflare",
+        "force_ssl": False,
     }
     if opts.get("acme_resolver"):
         merged["acme_resolver"] = opts["acme_resolver"]
@@ -110,6 +111,8 @@ def _load_core_config(opts: dict[str, Any]) -> dict[str, Any]:
                   "entrypoint_http", "entrypoint_https", "log_level"):
         if opts.get(field):
             merged[field] = opts[field]
+    if "force_ssl" in opts:
+        merged["force_ssl"] = bool(opts["force_ssl"])
     if CONFIG_IN.exists():
         try:
             data = yaml.safe_load(CONFIG_IN.read_text()) or {}
@@ -118,6 +121,8 @@ def _load_core_config(opts: dict[str, Any]) -> dict[str, Any]:
                           "entrypoint_https", "log_level"):
                 if field in data and data[field] is not None:
                     merged[field] = data[field]
+            if "force_ssl" in data and data["force_ssl"] is not None:
+                merged["force_ssl"] = bool(data["force_ssl"])
             # acme_resolver name in Traefik = provider name in config.yml.
             if data.get("provider"):
                 merged["acme_resolver"] = data["provider"]
@@ -196,6 +201,26 @@ def main() -> int:
     return 0
 
 
+def _http_entrypoint(config: dict[str, Any]) -> dict[str, Any]:
+    """The :80 entrypoint. When force_ssl is on, attach a global redirection to
+    the https entrypoint (permanent/301), so EVERY http request upgrades before
+    routing — superseding the per-route redirect-to-https middleware. DNS-01 ACME
+    is unaffected (it never uses :80; an HTTP-01 switch would need to exempt
+    /.well-known/acme-challenge/ from this)."""
+    ep: dict[str, Any] = {"address": ":80"}
+    if config.get("force_ssl"):
+        ep["http"] = {
+            "redirections": {
+                "entryPoint": {
+                    "to": config["entrypoint_https"],
+                    "scheme": "https",
+                    "permanent": True,
+                }
+            }
+        }
+    return ep
+
+
 def _build_static(opts: dict[str, Any]) -> dict[str, Any]:
     # 0.5.3: log_level + entrypoint names come from /data/config.yml (Advanced
     # tab) with supervisor-options fallback for Phase A-C back-compat.
@@ -206,7 +231,7 @@ def _build_static(opts: dict[str, Any]) -> dict[str, Any]:
         # per Traefik v3 docs; the supervisor captures stdout for the add-on Log.
         "accessLog": {},
         "entryPoints": {
-            config_full["entrypoint_http"]: {"address": ":80"},
+            config_full["entrypoint_http"]: _http_entrypoint(config_full),
             config_full["entrypoint_https"]: {"address": ":443"},
             # Phase D: localhost-only entryPoint for Traefik's own dashboard.
             # `api.insecure: true` below auto-attaches the dashboard router to
@@ -263,6 +288,7 @@ def _build_dynamic(opts: dict[str, Any]) -> tuple[dict[str, Any], int, int]:
     # Phase D follow-up: domain comes from /data/config.yml first.
     config = _load_core_config(opts)
     domain = (config.get("domain") or "").strip().lower()
+    force_ssl = bool(config.get("force_ssl"))
 
     # Phase F (0.7.0): the HA self-route is no longer renderer-injected here.
     # It now lives as a real, persisted route in /data/routes.yml marked with
@@ -354,6 +380,20 @@ def _build_dynamic(opts: dict[str, Any]) -> tuple[dict[str, Any], int, int]:
                 continue
 
         tls = bool(route.get("tls", True))
+        # force_ssl redirects ALL :80 traffic to :443 at the entrypoint, before
+        # routing. An http-only (tls:false) route would be redirected to https
+        # where it has no websecure router -> 404. Skip it loudly rather than
+        # serve a redirect-to-nowhere.
+        if force_ssl and not tls:
+            print(
+                f"WARN: skipping http-only route {hostname!r}: force_ssl is on "
+                "(all http redirects to https) but this route has tls disabled, "
+                "so it has no HTTPS router. Enable tls on the route or turn off "
+                "Force SSL.",
+                file=sys.stderr,
+            )
+            skipped += 1
+            continue
         route_mws = [m for m in (route.get("middlewares") or []) if m]
         # Split by resolved type (order-preserving), three ways:
         #  - redirectScheme: drives a separate web-entrypoint redirect router
@@ -393,7 +433,7 @@ def _build_dynamic(opts: dict[str, Any]) -> tuple[dict[str, Any], int, int]:
         # redirect middleware (308 to https before the service is reached). A
         # non-TLS route ignores redirect middlewares — redirecting an http-only
         # route to https would break it.
-        if tls and redirect_mws:
+        if tls and redirect_mws and not force_ssl:
             redirect_slug = f"{slug}-redirecthttps"
             if redirect_slug in routers or redirect_slug in seen_slugs:
                 print(

@@ -92,6 +92,7 @@ def _empty_config() -> dict:
         "entrypoint_http": "web",
         "entrypoint_https": "websecure",
         "log_level": "INFO",
+        "force_ssl": False,
     }
 
 

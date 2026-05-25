@@ -94,6 +94,10 @@ CONFIG_TYPES = {
     "entrypoint_http": str,
     "entrypoint_https": str,
     "log_level": str,
+    # alpha.9: global HTTP->HTTPS redirect. When true, render.py adds an
+    # entrypoint-level redirection (all :80 -> :443) and the per-route
+    # redirect-to-https mechanism is superseded.
+    "force_ssl": bool,
 }
 
 # Supervisor's documented ingress URL shape. Reject anything else to defuse a
@@ -609,6 +613,7 @@ def _load_config_yml() -> dict:
         "entrypoint_http": "web",
         "entrypoint_https": "websecure",
         "log_level": "INFO",
+        "force_ssl": False,
     }
     try:
         opts = json.loads(OPTIONS.read_text())
@@ -687,6 +692,9 @@ def _validate_config(body):
             text=f"log_level must be one of {sorted(ALLOWED_LOG_LEVELS)}"
         )
     body["log_level"] = lvl
+    # force_ssl: optional bool (not in CONFIG_REQUIRED). Normalise if present.
+    if "force_ssl" in body:
+        body["force_ssl"] = bool(body["force_ssl"])
     return body
 
 

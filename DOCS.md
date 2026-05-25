@@ -23,9 +23,10 @@ The UI is source-of-truth. Hand-edit `/data/*.yml` only when the UI is broken.
 ## Tab notes (gotchas only — UI labels the rest)
 
 - **Routes tab — system row.** The first row is pinned, marked "System" (the HA backend). Only its hostname is editable; everything else is locked. Its applied middlewares (e.g. `redirect-to-https`) are listed read-only.
-- **Routes tab — middlewares.** Pick middlewares per route from the multiselect (your configured middlewares, built-ins included). Order = the order you tick them (Traefik applies middlewares in list order).
+- **Routes tab — middlewares.** Pick middlewares per route from the compact dropdown (your configured middlewares; `skip-tls-verify` and — when Force SSL is on — `redirect-to-https` are managed elsewhere and not listed). Order = the order you tick them.
+- **Force SSL (Configuration page).** When enabled, every HTTP request is redirected to HTTPS at the entry point (301), globally — the built-in `redirect-to-https` middleware is applied for you and hidden from the Middlewares tab. While on, an HTTP-only route (TLS off) is **not served** (it would redirect to an HTTPS router that doesn't exist). Leave it off to redirect only the routes you attach `redirect-to-https` to.
 - **Middlewares tab — built-ins.** `redirect-to-https` and `skip-tls-verify` are add-on-managed, shown as **Built-in**: editable config where applicable, but not renamable/removable.
-- **Fronting an HTTPS backend with a self-signed cert.** Set the route's scheme to `https`, then attach the built-in **`skip-tls-verify`** middleware to that route — Traefik will skip verifying the backend's certificate. (LAN-appropriate; it disables cert checks for that route's backend only.)
+- **Fronting an HTTPS backend with a self-signed cert.** Set the route's scheme to `https`, then tick the **Skip TLS verify** checkbox that appears under the scheme — Traefik will skip verifying that backend's certificate. (LAN-appropriate; affects that route's backend only.)
 - **Middlewares tab — basicAuth hashes.** The Traefik dashboard exposes the stored bcrypt hashes in middleware definitions. This is by design — bcrypt is a one-way hash; the dashboard isn't leaking anything reversible.
 - **Middlewares tab — headers empty value.** Setting a header value to empty string SETS the header to empty (Traefik semantics). To DELETE a header, remove the entire row — its key drops out of the saved map.
 - **Traefik dashboard tab.** Read-only iframe of Traefik's own dashboard. No edits flow back from here.

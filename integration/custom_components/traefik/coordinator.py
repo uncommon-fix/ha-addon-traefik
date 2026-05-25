@@ -127,7 +127,11 @@ class TraefikCoordinator(DataUpdateCoordinator[dict[str, ServiceState]]):
                 server_status=server_status,
             )
 
-        self.hass.async_create_task(self._reconcile_entities(result))
+        # Inline-await (NOT fire-and-forget): async_create_task detaches the
+        # reconcile so exceptions vanish into the default handler and ordering vs
+        # the next poll isn't guaranteed. Awaiting surfaces failures and keeps
+        # entity adds ordered with the data they're derived from.
+        await self._reconcile_entities(result)
         return result
 
     async def _reconcile_entities(self, latest: dict[str, ServiceState]) -> None:

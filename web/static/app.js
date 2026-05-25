@@ -116,6 +116,7 @@ function blankConfig() {
         entrypoint_http: 'web',
         entrypoint_https: 'websecure',
         log_level: 'INFO',
+        force_ssl: false,
     };
 }
 
@@ -259,6 +260,7 @@ function traefikAppData() {
                     entrypoint_http: j.entrypoint_http || 'web',
                     entrypoint_https: j.entrypoint_https || 'websecure',
                     log_level: j.log_level || 'INFO',
+                    force_ssl: !!j.force_ssl,
                 };
                 this.state = j.state || blankState();
             } catch (e) {
@@ -314,6 +316,7 @@ function traefikAppData() {
                 entrypoint_http: this.config.entrypoint_http,
                 entrypoint_https: this.config.entrypoint_https,
                 log_level: this.config.log_level,
+                force_ssl: !!this.config.force_ssl,
             };
             try {
                 const r = await fetch(this.url('/api/config'), {
@@ -539,6 +542,32 @@ function traefikAppData() {
             const i = route.middlewares.indexOf(name);
             if (checked && i === -1) route.middlewares.push(name);
             else if (!checked && i !== -1) route.middlewares.splice(i, 1);
+        },
+
+        // alpha.9: middlewares selectable in a route's dropdown. Excludes
+        // skip-tls-verify (its own per-route checkbox when scheme=https) and
+        // redirect-to-https when Force SSL is on (applied globally instead).
+        eligibleRouteMiddlewares() {
+            return this.middlewares.filter(m => {
+                if (m.name === 'skip-tls-verify') return false;
+                if (m.name === 'redirect-to-https' && this.config.force_ssl) return false;
+                return true;
+            });
+        },
+
+        // alpha.9: summary text for the compact route-middlewares dropdown
+        // (skip-tls-verify is shown via the scheme checkbox, not here).
+        routeMwSummary(route) {
+            const names = (route.middlewares || []).filter(n => n !== 'skip-tls-verify');
+            return names.length ? names.join(', ') : 'No middlewares';
+        },
+
+        // alpha.9: skip-tls-verify only applies to https backends; drop it when
+        // the route's scheme is changed away from https.
+        onRouteSchemeChange(route) {
+            if (route.scheme !== 'https') {
+                this.toggleRouteMiddleware(route, 'skip-tls-verify', false);
+            }
         },
 
         addMiddleware() {

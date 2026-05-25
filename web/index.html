@@ -170,6 +170,18 @@
            x-text="setupOk"></div>
 
       <form @submit.prevent="saveConfig()" class="space-y-5">
+        <div class="flex items-start gap-2 p-3 rounded border bg-gray-50">
+          <input type="checkbox" id="force_ssl" x-model="config.force_ssl" class="mt-0.5">
+          <label for="force_ssl" class="text-sm">
+            <span class="font-medium">Force SSL</span>
+            <span class="block text-xs text-gray-500 mt-0.5">
+              Redirect every HTTP request to HTTPS at the entry point (301). When on,
+              the built-in <span class="font-mono">redirect-to-https</span> middleware
+              is applied globally (and hidden), and HTTP-only routes (TLS off) are not
+              served. Applies on add-on restart.
+            </span>
+          </label>
+        </div>
         <div>
           <label class="block text-sm font-medium mb-1">Log level</label>
           <select x-model="config.log_level"
@@ -318,11 +330,23 @@
                   <span class="font-mono text-xs text-gray-500">http</span>
                 </template>
                 <template x-if="!r.system">
-                  <select x-model="r.scheme" class="border rounded px-2 py-1"
-                          :disabled="r.backend_kind === 'home_assistant'">
-                    <option value="http">http</option>
-                    <option value="https">https</option>
-                  </select>
+                  <div class="flex flex-col gap-1">
+                    <select x-model="r.scheme" @change="onRouteSchemeChange(r)"
+                            class="border rounded px-2 py-1"
+                            :disabled="r.backend_kind === 'home_assistant'">
+                      <option value="http">http</option>
+                      <option value="https">https</option>
+                    </select>
+                    <!-- alpha.9: skip backend TLS verification (self-signed HTTPS
+                         backend). Toggles the skip-tls-verify built-in on this route. -->
+                    <label x-show="r.scheme === 'https'"
+                           class="flex items-center gap-1 text-[11px] text-gray-600">
+                      <input type="checkbox"
+                             :checked="(r.middlewares || []).includes('skip-tls-verify')"
+                             @change="toggleRouteMiddleware(r, 'skip-tls-verify', $event.target.checked)">
+                      Skip TLS verify
+                    </label>
+                  </div>
                 </template>
               </td>
               <!-- TLS: static for system rows -->
@@ -354,30 +378,38 @@
                     <div class="font-mono text-[10px] text-gray-400 mt-0.5">health: /</div>
                   </div>
                 </template>
-                <!-- User row: multiselect of configured middlewares + health path. -->
+                <!-- User row: compact middlewares dropdown + health path. -->
                 <template x-if="!r.system">
                   <div class="flex flex-col gap-1">
-                    <div class="border rounded px-2 py-1 w-44 text-xs max-h-28 overflow-y-auto">
-                      <template x-if="!middlewares.length">
-                        <span class="text-gray-400 text-[11px]">No middlewares defined</span>
-                      </template>
-                      <template x-for="mw in middlewares" :key="mw.name">
-                        <label class="flex items-center gap-1.5 py-0.5 cursor-pointer">
-                          <input type="checkbox"
-                                 :checked="(r.middlewares || []).includes(mw.name)"
-                                 @change="toggleRouteMiddleware(r, mw.name, $event.target.checked)">
-                          <span class="font-mono text-[11px]" x-text="mw.name"></span>
-                        </label>
-                      </template>
-                      <!-- Orphan refs: still-attached but no longer defined; keep
-                           visible (checked) so saving doesn't silently drop them. -->
-                      <template x-for="mw in (r.middlewares || []).filter(n => !middlewares.some(m => m.name === n))" :key="'orphan-'+mw">
-                        <label class="flex items-center gap-1.5 py-0.5 cursor-pointer">
-                          <input type="checkbox" checked
-                                 @change="toggleRouteMiddleware(r, mw, $event.target.checked)">
-                          <span class="font-mono text-[11px] text-amber-700" x-text="mw + ' (missing)'"></span>
-                        </label>
-                      </template>
+                    <div class="relative" x-data="{ open: false }" @click.outside="open = false">
+                      <button type="button" @click="open = !open"
+                              class="border rounded px-2 py-1 w-44 text-[11px] flex justify-between items-center gap-1 hover:bg-gray-50">
+                        <span class="font-mono truncate" x-text="routeMwSummary(r)"></span>
+                        <span class="text-gray-400">&#9662;</span>
+                      </button>
+                      <div x-show="open" x-transition
+                           class="absolute z-10 mt-1 w-48 bg-white border rounded shadow-lg p-1 max-h-40 overflow-y-auto">
+                        <template x-if="!eligibleRouteMiddlewares().length">
+                          <div class="text-gray-400 text-[11px] px-1 py-0.5">No middlewares defined</div>
+                        </template>
+                        <template x-for="mw in eligibleRouteMiddlewares()" :key="mw.name">
+                          <label class="flex items-center gap-1.5 py-0.5 px-1 cursor-pointer hover:bg-gray-50 rounded">
+                            <input type="checkbox"
+                                   :checked="(r.middlewares || []).includes(mw.name)"
+                                   @change="toggleRouteMiddleware(r, mw.name, $event.target.checked)">
+                            <span class="font-mono text-[11px]" x-text="mw.name"></span>
+                          </label>
+                        </template>
+                        <!-- Orphan refs: deleted middleware still attached; keep
+                             visible (checked) so saving doesn't silently drop it. -->
+                        <template x-for="mw in (r.middlewares || []).filter(n => n !== 'skip-tls-verify' && !middlewares.some(m => m.name === n))" :key="'orphan-'+mw">
+                          <label class="flex items-center gap-1.5 py-0.5 px-1 cursor-pointer">
+                            <input type="checkbox" checked
+                                   @change="toggleRouteMiddleware(r, mw, $event.target.checked)">
+                            <span class="font-mono text-[11px] text-amber-700" x-text="mw + ' (missing)'"></span>
+                          </label>
+                        </template>
+                      </div>
                     </div>
                     <input type="text" :value="r.health_path || ''"
                            @input="r.health_path = $event.target.value || null"
@@ -442,7 +474,8 @@
 
       <div class="space-y-4">
         <template x-for="m in middlewares" :key="m._uid">
-          <div class="border rounded p-4 bg-white">
+          <div class="border rounded p-4 bg-white"
+               x-show="!(config.force_ssl && m.name === 'redirect-to-https')">
             <div class="flex items-start gap-3 mb-3">
               <div class="flex-1">
                 <label class="block text-xs font-medium text-gray-600 mb-1">

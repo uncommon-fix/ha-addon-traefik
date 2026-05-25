@@ -46,6 +46,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: TraefikConfigEntry) -> b
     await hass.async_add_executor_job(write_loaded_content_hash)
     await coordinator.async_config_entry_first_refresh()
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    # Keep the coordinator polling for the lifetime of the entry, even when zero
+    # entities are live. DataUpdateCoordinator is listener-gated — it cancels its
+    # interval timer when listeners hit zero — and our entities are dynamic
+    # (added by the coordinator's add-only reconcile). Without a permanent
+    # listener, if no route currently materialises an entity (all stale/removed),
+    # polling stops and NEW routes never get discovered until an HA restart. The
+    # no-op listener is the reconcile's keep-alive; the reconcile is the real
+    # consumer of each poll.
+    entry.async_on_unload(coordinator.async_add_listener(lambda: None))
     return True
 
 

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.0-alpha.9
+
+- Fixed: new routes now show up as reachability sensors automatically (within
+  ~30s), without needing a Home Assistant restart. The integration's poller
+  could stop when no sensors were live; it now always polls.
+- New: **Force SSL** setting on the Configuration page. When enabled, every HTTP
+  request is redirected to HTTPS globally (and the built-in redirect middleware
+  is applied for you and hidden). HTTP-only routes are not served while it's on.
+- Routes tab: middlewares are now a compact dropdown (shorter rows), and an
+  HTTPS route shows a **Skip TLS verify** checkbox (for self-signed backends)
+  right under the scheme — no need to attach the middleware by hand.
+
 ## 0.1.0-alpha.8
 
 - Fixed: the built-in middlewares' **Type** field showed the wrong value
