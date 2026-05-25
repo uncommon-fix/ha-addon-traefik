@@ -21,6 +21,7 @@ import ipaddress
 import json
 import os
 import re
+import shutil
 import sys
 from pathlib import Path
 
@@ -46,6 +47,18 @@ RENDER_TIMEOUT = 10.0
 INTEGRATION_DIR = Path("/homeassistant/custom_components/traefik")
 CONTENT_HASH_FILE = INTEGRATION_DIR / ".content_hash"
 LOADED_HASH_FILE = INTEGRATION_DIR / ".loaded_content_hash"
+# alpha.6: trusted_proxies quick-fix. Behind HA ingress + Traefik, HA Core
+# returns 400 on forwarded HTTPS requests unless configuration.yaml trusts the
+# supervisor proxy network. 172.30.32.0/23 is the supervisor mask (superset of
+# the add-on's 172.30.33.0/24); use_x_forwarded_for must be set alongside it.
+HA_CONFIGURATION_YAML = Path("/homeassistant/configuration.yaml")
+TRUSTED_PROXY_CIDR = "172.30.32.0/23"
+TRUSTED_PROXIES_SNIPPET = (
+    "http:\n"
+    "  use_x_forwarded_for: true\n"
+    "  trusted_proxies:\n"
+    "    - 172.30.32.0/23\n"
+)
 # Supervisor REST: SUPERVISOR_TOKEN is injected by HA when hassio_api: true
 # is set in config.yaml. POST /addons/self/restart restarts our own
 # container. Used after Setup save so the user doesn't have to click
@@ -621,21 +634,195 @@ def _validate_config(body):
     return body
 
 
-def _integration_restart_pending() -> bool:
-    """True when the deployed integration content differs from what HA loaded
-    (or it's deployed but never loaded). Drives the add-on banner; the HA
-    Repairs card uses the same signal from the integration side."""
+def _read_raw_config() -> dict:
+    """Read /data/config.yml verbatim (PyYAML). Unlike _load_config_yml this
+    does NOT drop unknown keys — needed so the dismiss marker and redirect_seeded
+    survive a read-modify-write."""
+    if not CONFIG_YML.exists():
+        return {}
+    try:
+        data = yaml.safe_load(CONFIG_YML.read_text())
+    except yaml.YAMLError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+# ---------- integration banner (content-hash 3-state) ----------
+def _integration_state() -> dict:
+    """Drive the add-on integration banner from the two content-hash files:
+    .content_hash (D, written by cont-init on deploy) and .loaded_content_hash
+    (L, written by the integration's async_setup_entry — i.e. only once the user
+    has ADDED it). Three states:
+      - D absent (unreadable/empty)      -> ok (no banner), regardless of L
+      - L absent                          -> available (deployed, never added)
+      - L present, D != L                 -> update_pending (added, content changed)
+      - L present, D == L                 -> ok
+    `available` is suppressed once the user dismisses it FOR THE CURRENT D (a new
+    deploy with new content re-surfaces it; adding the integration writes L and
+    moots it)."""
     try:
         deployed = CONTENT_HASH_FILE.read_text(encoding="utf-8").strip()
     except OSError:
-        return False
+        deployed = ""
     if not deployed:
-        return False
+        return {"integration_pending_restart": False,
+                "integration_available": False}
     try:
         loaded = LOADED_HASH_FILE.read_text(encoding="utf-8").strip()
     except OSError:
         loaded = ""
-    return deployed != loaded
+    if not loaded:
+        dismissed_for = (
+            _read_raw_config().get("integration_available_dismissed_for") or ""
+        )
+        return {"integration_pending_restart": False,
+                "integration_available": dismissed_for != deployed}
+    return {"integration_pending_restart": loaded != deployed,
+            "integration_available": False}
+
+
+# ---------- trusted_proxies quick-fix (alpha.6) ----------
+class _FixBail(Exception):
+    """Raised when configuration.yaml can't be safely auto-edited. The message
+    is surfaced to the UI alongside the manual snippet."""
+
+
+def _tolerant_yaml():
+    """ruamel round-trip loader that tolerates unknown tags (!include /
+    !include_dir_merge_named / !secret / !env_var) anywhere in the document.
+
+    Round-trip mode preserves unknown tags natively (its construct_object
+    fallback builds tagged CommentedMap/Seq/TaggedScalar proxies that dump
+    faithfully). Do NOT register a None catch-all to construct_undefined — that
+    method RAISES ('could not determine a constructor for the tag'), and
+    registering it hijacks ruamel's native fallback. Raises ImportError if
+    ruamel is unavailable (callers treat that as 'unsure')."""
+    from ruamel.yaml import YAML
+
+    y = YAML()  # round-trip by default; preserves unknown tags
+    y.preserve_quotes = True
+    y.width = 4096
+    return y
+
+
+def _tag_str(node) -> str | None:
+    """The YAML tag string on a ruamel node, or None if untagged. Handles both
+    the modern Tag-object API and the older string-tag API."""
+    tag = getattr(node, "tag", None)
+    if tag is None:
+        return None
+    val = getattr(tag, "value", None)
+    if isinstance(val, str):
+        return val
+    return tag if isinstance(tag, str) else None
+
+
+def _is_plain_mapping(node) -> bool:
+    """A real, untagged mapping (so `http: !include x.yaml` / `http: !foo {}`
+    are excluded and left for the user to edit by hand)."""
+    return isinstance(node, dict) and _tag_str(node) is None
+
+
+def _trusted_proxy_covered(tp) -> bool:
+    """True if TRUSTED_PROXY_CIDR is a subnet of any entry in the list."""
+    if not isinstance(tp, list):
+        return False
+    target = ipaddress.ip_network(TRUSTED_PROXY_CIDR)
+    for entry in tp:
+        try:
+            net = ipaddress.ip_network(str(entry).strip(), strict=False)
+        except ValueError:
+            continue
+        if target.version == net.version and target.subnet_of(net):
+            return True
+    return False
+
+
+def _trusted_proxies_pending() -> bool:
+    """True when configuration.yaml lacks the trusted_proxies / use_x_forwarded_for
+    config that lets HTTPS-through-Traefik work. CONSERVATIVE: any uncertainty
+    (missing file, parse error incl. DuplicateKeyError, tag-valued http:) returns
+    False so split-config users are never nagged."""
+    try:
+        text = HA_CONFIGURATION_YAML.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    try:
+        data = _tolerant_yaml().load(text)
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    http = data.get("http")
+    if http is None:
+        return True  # no http block -> the keys are missing
+    if not _is_plain_mapping(http):
+        return False  # http: !include / tagged -> don't touch
+    xff_ok = http.get("use_x_forwarded_for") is True
+    tp_ok = _trusted_proxy_covered(http.get("trusted_proxies"))
+    return not (xff_ok and tp_ok)
+
+
+def _do_fix_trusted_proxies() -> None:
+    """Sync (run in executor). Idempotently add use_x_forwarded_for + the
+    supervisor CIDR to configuration.yaml's http: block, preserving comments and
+    custom tags. Backs up first; the original is only replaced at the very end
+    (so any earlier failure leaves it untouched). Raises _FixBail on any state we
+    must not auto-edit."""
+    from ruamel.yaml.comments import CommentedMap, CommentedSeq
+
+    try:
+        real = HA_CONFIGURATION_YAML.resolve()
+    except OSError as e:
+        raise _FixBail(f"cannot resolve configuration.yaml: {e}")
+    if not real.exists():
+        raise _FixBail("configuration.yaml not found")
+    try:
+        text = real.read_text(encoding="utf-8")
+    except OSError as e:
+        raise _FixBail(f"cannot read configuration.yaml: {e}")
+    try:
+        yaml_rt = _tolerant_yaml()
+        data = yaml_rt.load(text)
+    except Exception as e:
+        raise _FixBail(f"configuration.yaml could not be parsed: {e}")
+
+    if data is None:
+        data = CommentedMap()
+    if not isinstance(data, dict):
+        raise _FixBail("configuration.yaml top level is not a mapping")
+
+    http = data.get("http")
+    if http is None:
+        http = CommentedMap()
+        data["http"] = http
+    elif not _is_plain_mapping(http):
+        raise _FixBail("http: is a tag node (e.g. !include); edit it by hand")
+
+    if http.get("use_x_forwarded_for") is not True:
+        http["use_x_forwarded_for"] = True
+    tp = http.get("trusted_proxies")
+    if not _trusted_proxy_covered(tp):
+        if not isinstance(tp, list):
+            tp = CommentedSeq()
+            http["trusted_proxies"] = tp
+        if not any(str(x).strip() == TRUSTED_PROXY_CIDR for x in tp):
+            tp.append(TRUSTED_PROXY_CIDR)
+
+    tmp = real.with_name(real.name + ".traefik-addon.tmp")
+    bak = real.with_name(real.name + ".traefik-addon.bak")
+    try:
+        shutil.copy2(real, bak)  # preserves mode + mtime
+    except OSError as e:
+        raise _FixBail(f"cannot write backup: {e}")
+    try:
+        with tmp.open("w", encoding="utf-8") as f:
+            yaml_rt.dump(data, f)
+        shutil.copystat(real, tmp)
+        os.replace(tmp, real)  # atomic; same fs
+    except Exception as e:
+        tmp.unlink(missing_ok=True)
+        raise _FixBail(f"failed to write configuration.yaml: {e}")
 
 
 def _config_state(config: dict) -> dict:
@@ -649,16 +836,20 @@ def _config_state(config: dict) -> dict:
         "entrypoint_http", "entrypoint_https", "log_level",
     }
     missing = [f for f in onboarding_fields if not (config.get(f) or "").strip()]
-    return {
+    state = {
         "configured": not missing,
         "missing": missing,
         # Boolean so the UI knows whether to show "token set" placeholder
         # vs an empty input. We NEVER return the token itself.
         "cloudflare_token_present": bool(config.get("cloudflare_token", "").strip()),
-        # Drives the "Restart HA Core" banner. Content-based (see
-        # _integration_restart_pending); self-clears when the integration reloads.
-        "integration_pending_restart": _integration_restart_pending(),
+        # alpha.6: drives the trusted_proxies quick-fix banner.
+        "trusted_proxies_pending": _trusted_proxies_pending(),
     }
+    # alpha.6: integration banner is a 3-state, content-hash-derived signal.
+    # integration_pending_restart (= update_pending) self-clears on restart;
+    # integration_available (deployed-but-never-added) is dismissible.
+    state.update(_integration_state())
+    return state
 
 
 def _redact_config(config: dict) -> dict:
@@ -859,6 +1050,39 @@ async def post_restart_core(request):
         text=f"supervisor /core/restart failed after {len(backoffs)} attempts "
              f"(last: {last_reason}, status={last_status})"
     )
+
+
+async def post_fix_trusted_proxies(request):
+    """alpha.6: add use_x_forwarded_for + the supervisor CIDR to HA's
+    configuration.yaml so HTTPS-through-Traefik stops returning 400. The edit is
+    comment-preserving, custom-tag-safe, backed up and idempotent; on any
+    condition we can't safely auto-edit, bail with the manual snippet."""
+    loop = asyncio.get_running_loop()
+    async with request.app["save_lock"]:
+        try:
+            await loop.run_in_executor(None, _do_fix_trusted_proxies)
+        except _FixBail as e:
+            raise web.HTTPUnprocessableEntity(
+                text=f"{e}\n\nAdd this to configuration.yaml by hand, then "
+                     f"restart Home Assistant:\n\n{TRUSTED_PROXIES_SNIPPET}"
+            )
+    return web.json_response({"fixed": True})
+
+
+async def post_dismiss_integration(request):
+    """alpha.6: dismiss the 'reachability integration available' banner for the
+    CURRENTLY-deployed integration content. A future deploy with new content
+    re-surfaces it (content-scoped). Reads/writes config.yml RAW so unrelated
+    keys (redirect_seeded, etc.) are preserved."""
+    async with request.app["save_lock"]:
+        raw = _read_raw_config()
+        try:
+            deployed = CONTENT_HASH_FILE.read_text(encoding="utf-8").strip()
+        except OSError:
+            deployed = ""
+        raw["integration_available_dismissed_for"] = deployed
+        _atomic_write_yml(CONFIG_YML, raw)
+    return web.json_response({"dismissed": True})
 
 
 async def put_routes(request):
@@ -1091,6 +1315,8 @@ def make_app():
     app.router.add_get("/api/status", get_status)
     app.router.add_post("/api/restart", post_restart)
     app.router.add_post("/api/restart-core", post_restart_core)
+    app.router.add_post("/api/fix-trusted-proxies", post_fix_trusted_proxies)
+    app.router.add_post("/api/dismiss-integration", post_dismiss_integration)
     # NOTE: /dashboard/api/* must register BEFORE /dashboard/* so it wins
     # the route match (aiohttp resolves in registration order). It catches
     # the dashboard SPA's monkey-patched API fetches and forwards to

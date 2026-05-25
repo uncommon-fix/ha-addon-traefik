@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.0-alpha.6
+
+- New: a **Fix automatically** button for the HTTPS-returns-400 problem. When
+  `configuration.yaml` is missing the `trusted_proxies` / `use_x_forwarded_for`
+  settings that let Home Assistant trust the Traefik proxy, the add-on shows a
+  banner and can add them for you (it edits `configuration.yaml` in place,
+  preserving comments, makes a `configuration.yaml.traefik-addon.bak` backup,
+  and leaves split configs using `!include`/`!secret` untouched). Restart Home
+  Assistant afterwards to apply.
+- Fixed: the "reachability integration" banner no longer nags forever before you
+  add the integration. It now distinguishes "available — add it (optional)" from
+  "updated — restart to load," the available one has a **Dismiss** button, and
+  the restart button no longer falsely times out.
+
 ## 0.1.0-alpha.5
 
 - HTTP now redirects to HTTPS automatically. A `redirect-to-https` middleware

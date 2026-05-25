@@ -122,9 +122,14 @@ function blankState() {
         configured: false,
         missing: [],
         cloudflare_token_present: false,
-        // Phase 4 (0.9.0): true when cont-init has freshly deployed the
-        // bundled reachability integration and HA Core hasn't restarted yet.
+        // alpha.6: configuration.yaml lacks the trusted_proxies/use_x_forwarded_for
+        // config (HTTPS-through-Traefik 400s without it).
+        trusted_proxies_pending: false,
+        // Integration banner (content-hash-derived). update_pending = was loaded,
+        // new content deployed (State A); available = deployed but never added
+        // (State B). Both default false so a poll error hides the banners.
         integration_pending_restart: false,
+        integration_available: false,
     };
 }
 
@@ -155,6 +160,14 @@ function traefikAppData() {
         // both flows can run independently without UI confusion.
         restartingCore: false,
         restartCoreError: '',
+
+        // alpha.6: trusted_proxies quick-fix banner.
+        fixingTrustedProxies: false,
+        trustedProxiesError: '',
+        trustedProxiesFixed: false,
+        showTpSnippet: false,
+        // alpha.6: dismiss the "integration available" (State B) banner.
+        dismissingIntegration: false,
 
         // Routes tab
         routes: [],
@@ -325,10 +338,17 @@ function traefikAppData() {
         },
 
         async restartCore() {
-            // Phase 4 (0.9.0): POST /api/restart-core; backend proxies to
-            // supervisor /core/restart with retry+backoff. HA Core takes
-            // ~30-90s to come back; poll /api/state until the marker clears
-            // (success). On error, surface the backend's error body.
+            // Shared by all three restart triggers (integration update_pending,
+            // integration available/discovery, trusted_proxies fix). POST
+            // /api/restart-core; backend proxies to supervisor with retry+backoff.
+            // HA Core takes ~30-90s to come back.
+            //
+            // alpha.6 poll fix: every browser->add-on request traverses HA Core
+            // ingress (:8123), so when Core restarts the poll fetch FAILS. Wait
+            // for HA to actually go down and come back (sawDown) rather than for
+            // a marker flag — State B (available) never sets a pending flag, so
+            // the old "exit when !integration_pending_restart" condition fired on
+            // the first poll (before Core even went down) and reloaded too early.
             this.restartingCore = true;
             this.restartCoreError = '';
             try {
@@ -337,30 +357,67 @@ function traefikAppData() {
                     const text = await r.text();
                     throw new Error(`POST /api/restart-core -> ${r.status}: ${text}`);
                 }
-                // Backend returned 200 — supervisor accepted the restart.
-                // HA Core ingress will go away briefly. Poll /api/state until
-                // the marker clears OR 120s elapses.
                 const start = Date.now();
+                let sawDown = false;
                 while (Date.now() - start < 120000) {
                     await new Promise(r => setTimeout(r, 2000));
+                    let up = false;
                     try {
-                        const r2 = await fetch(this.url('/api/state'));
-                        if (r2.ok) {
-                            const j = await r2.json();
-                            if (!j.integration_pending_restart) {
-                                // Marker cleared (we cleared it on success).
-                                // Reload so the UI re-syncs all state.
-                                window.location.reload();
-                                return;
-                            }
-                        }
-                    } catch (_) { /* still down; keep polling */ }
+                        const r2 = await fetch(this.url('/api/state'), { cache: 'no-store' });
+                        up = r2.ok;
+                    } catch (_) { up = false; }
+                    if (!up) {
+                        sawDown = true;          // Core (or its ingress) is down
+                    } else if (sawDown) {
+                        // Down then back up = restart completed. Reload to re-sync.
+                        window.location.reload();
+                        return;
+                    }
                 }
                 this.restartCoreError = 'Restart timed out after 120s. Refresh the page manually.';
             } catch (e) {
                 this.restartCoreError = String(e);
             } finally {
                 this.restartingCore = false;
+            }
+        },
+
+        async fixTrustedProxies() {
+            // alpha.6: POST /api/fix-trusted-proxies. On success the backend has
+            // edited configuration.yaml; surface the "restart to apply" banner.
+            // On a 4xx bail the body carries the reason + manual snippet.
+            this.fixingTrustedProxies = true;
+            this.trustedProxiesError = '';
+            this.trustedProxiesFixed = false;
+            try {
+                const r = await fetch(this.url('/api/fix-trusted-proxies'), { method: 'POST' });
+                if (!r.ok) {
+                    const text = await r.text();
+                    throw new Error(text || `POST /api/fix-trusted-proxies -> ${r.status}`);
+                }
+                this.trustedProxiesFixed = true;
+                // Detection re-reads the file; the pending banner clears on next poll.
+                this.state.trusted_proxies_pending = false;
+            } catch (e) {
+                this.trustedProxiesError = String(e);
+            } finally {
+                this.fixingTrustedProxies = false;
+            }
+        },
+
+        async dismissIntegration() {
+            // alpha.6: hide the "integration available" (State B) banner for the
+            // current integration content. Persisted server-side (content-scoped),
+            // so a future integration version re-surfaces it.
+            this.dismissingIntegration = true;
+            try {
+                const r = await fetch(this.url('/api/dismiss-integration'), { method: 'POST' });
+                if (r.ok) {
+                    this.state.integration_available = false;
+                }
+            } catch (_) { /* best-effort; banner returns on next load if it failed */ }
+            finally {
+                this.dismissingIntegration = false;
             }
         },
 

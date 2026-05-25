@@ -13,7 +13,10 @@ ARG TRAEFIK_SHA256_ARM64=911ad9f4c21a58fdcbf09c75d967a280c9eec22b3d056fc7f4950cd
 # chmod + cleanup + build-time smoke test that the binary runs.
 # py3-aiohttp 3.9.3-r1 on Alpine 3.20 pulls in py3-aiosignal, py3-multidict,
 # py3-yarl, py3-frozenlist as transitive deps automatically.
-RUN apk add --no-cache python3 py3-yaml py3-aiohttp py3-bcrypt ca-certificates \
+# alpha.6: py3-ruamel.yaml (Alpine community repo; auto-pulls py3-ruamel.yaml.clib)
+# powers the comment-preserving configuration.yaml edit for the trusted_proxies
+# quick-fix. NOTE the dot in the package name (py3-ruamel.yaml, not -yaml).
+RUN apk add --no-cache python3 py3-yaml py3-aiohttp py3-bcrypt py3-ruamel.yaml ca-certificates \
  && case "$(uname -m)" in \
         x86_64) ARCH=amd64; SHA="${TRAEFIK_SHA256_AMD64}" ;; \
         aarch64) ARCH=arm64; SHA="${TRAEFIK_SHA256_ARM64}" ;; \
@@ -77,7 +80,7 @@ COPY web/ /usr/share/traefik-web/
 # differs from what's already deployed. BUILD_VERSION is auto-injected by the
 # home-assistant/builder CI action (= config.yaml's version:); the default
 # below covers local builds — keep it in sync with config.yaml's version: field.
-ARG BUILD_VERSION=0.1.0-alpha.5
+ARG BUILD_VERSION=0.1.0-alpha.6
 COPY integration/custom_components /usr/share/traefik-integration/custom_components
 RUN echo "${BUILD_VERSION}" > /usr/share/traefik-integration/.bundled_version
 

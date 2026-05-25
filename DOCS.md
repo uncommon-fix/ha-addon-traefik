@@ -34,7 +34,7 @@ The UI is source-of-truth. Hand-edit `/data/*.yml` only when the UI is broken.
 
 ## Troubleshooting
 
-- **HA-backend route returns HTTP 400** → add `172.30.32.0/23` (the supervisor docker network) to HA's `http.trusted_proxies` in `configuration.yaml`. HA Core rejects proxied requests from unknown sources.
+- **HTTPS / HA-backend route returns HTTP 400** → HA Core rejects proxied requests from untrusted sources. The add-on detects this and shows a **Fix automatically** banner that adds `use_x_forwarded_for: true` + `trusted_proxies: [172.30.32.0/23]` (the supervisor docker network) to your `configuration.yaml` for you (a `configuration.yaml.traefik-addon.bak` backup is written; comments and `!include`/`!secret` are preserved). Restart Home Assistant afterwards. If your `http:` block is split out via `!include`, the add-on won't touch it — add those two keys by hand.
 - **ACME silently fails / no cert issued** → open the add-on **Log** tab (Settings → Add-ons → Traefik → Log) and look for `acme`. Common causes: token scope (see above), or Let's Encrypt rate-limit (5 certs/domain/hour) after a previous failure storm. Fix the cause, don't retry-loop.
 - **Where are the logs?** Settings → Add-ons → Traefik → **Log** tab shows Traefik + the add-on backend output.
 
@@ -42,11 +42,12 @@ The UI is source-of-truth. Hand-edit `/data/*.yml` only when the UI is broken.
 
 The addon ships a small HA integration that publishes `binary_sensor.traefik_route_<slug>_reachable` (one per Traefik service, `connectivity` device class) so automations can react to a backend going down.
 
-- **First install**: an amber banner appears at the top of the addon UI ("Traefik integration ready — restart HA Core to activate"). Click **Restart HA Core**. After HA is back, go to **Settings → Devices & services → Add Integration → Traefik** and accept the default URL.
+- **Optional**: the sensors are a convenience, not required for routing. On first install a banner offers them ("Reachability sensors available"). A freshly-deployed integration isn't in HA's Add-Integration list until a Core restart, so click **Restart HA Core** first, then **Settings → Devices & services → Add Integration → Traefik** and accept the default URL. Don't want them? Click **Dismiss** (the banner stays gone until a newer integration version ships).
+- **After an add-on update that changes the integration**: a separate "integration updated — restart to load" banner appears. Click **Restart HA Core** to pick up the new version.
 - **Entities**: one binary_sensor per route (including the HA system route). `on` = all backends `UP` in Traefik's `serverStatus`; `off` = any `DOWN` (target unreachable); `unavailable` = Traefik not reachable, healthCheck hasn't completed its first cycle (~30s), OR the route no longer exists ("not configured"). `unavailable` deliberately covers "route removed" so a deleted route never reads as `off`/unreachable.
 - **Add**: a new route on the Routes tab → its sensor appears on the next 30s poll.
 - **Remove**: deleting a route does NOT delete its sensor (that would break dashboards/automations). The sensor goes `unavailable` and persists. To clean up a sensor you're truly done with, delete its device from Settings → Devices & services → Traefik.
-- **Version coupling**: the integration is shipped *as part of the addon image*. Bumping the addon version → cont-init re-deploys the integration → banner reappears → restart HA again. There is no separate update path.
+- **Version coupling**: the integration ships *inside the addon image*. The "updated — restart" banner is keyed on the integration's actual content, not the add-on version — so an add-on release that doesn't change the integration won't ask you to restart. There is no separate update path.
 
 ## Security notes
 

@@ -42,25 +42,90 @@
     </div>
   </header>
 
-  <!-- ============ INTEGRATION-DEPLOY BANNER (Phase 4, 0.9.0) ============ -->
-  <!-- Persistent. Visible whenever cont-init's 99-deploy-integration.sh has
-       written /data/integration_pending_restart (i.e. the bundled
-       reachability integration was just freshly copied to /config/
-       custom_components/traefik/ and HA Core hasn't been restarted to load
-       it yet). Single button -> POST /api/restart-core via supervisor.
-       NOT dismissible — it reflects backend state, not a notification. -->
+  <!-- ============ TRUSTED-PROXIES BANNER (alpha.6) ============ -->
+  <!-- Shown when configuration.yaml lacks the trusted_proxies /
+       use_x_forwarded_for config that lets HTTPS-through-Traefik work (HA Core
+       400s otherwise). The backend re-reads the file on every /api/state poll,
+       so this self-clears once fixed (by us or by hand). -->
+  <div x-show="state.trusted_proxies_pending" x-transition.opacity
+       class="bg-amber-100 border-b border-amber-300 px-6 py-3">
+    <div class="flex items-center justify-between gap-3">
+      <div class="text-sm text-amber-900">
+        <strong>HTTPS requests return 400 until Home&nbsp;Assistant trusts the proxy.</strong>
+        Add <code>use_x_forwarded_for</code> + <code>trusted_proxies</code> to
+        <span class="font-medium">configuration.yaml</span>.
+        <button type="button" @click="showTpSnippet = !showTpSnippet"
+                class="underline hover:no-underline">Show manual snippet</button>
+      </div>
+      <button @click="fixTrustedProxies()" :disabled="fixingTrustedProxies"
+              class="shrink-0 px-3 py-1.5 rounded bg-amber-600 text-white text-sm font-medium hover:bg-amber-700 disabled:bg-gray-400">
+        <span x-show="!fixingTrustedProxies">Fix automatically</span>
+        <span x-show="fixingTrustedProxies">Fixing...</span>
+      </button>
+    </div>
+    <pre x-show="showTpSnippet" x-transition
+         class="mt-2 p-2 rounded bg-amber-50 border border-amber-300 text-xs text-amber-900 whitespace-pre overflow-x-auto">http:
+  use_x_forwarded_for: true
+  trusted_proxies:
+    - 172.30.32.0/23</pre>
+  </div>
+  <div x-show="trustedProxiesError" x-transition
+       class="bg-red-50 border-b border-red-300 px-6 py-2 text-sm text-red-900 font-mono whitespace-pre-wrap"
+       x-text="trustedProxiesError"></div>
+  <div x-show="trustedProxiesFixed" x-transition
+       class="bg-green-50 border-b border-green-300 px-6 py-3 flex items-center justify-between gap-3">
+    <div class="text-sm text-green-900">
+      <strong>configuration.yaml updated.</strong>
+      Restart Home&nbsp;Assistant Core to apply.
+    </div>
+    <button @click="restartCore()" :disabled="restartingCore"
+            class="shrink-0 px-3 py-1.5 rounded bg-green-600 text-white text-sm font-medium hover:bg-green-700 disabled:bg-gray-400">
+      <span x-show="!restartingCore">Restart HA Core</span>
+      <span x-show="restartingCore">Restarting HA Core...</span>
+    </button>
+  </div>
+
+  <!-- ============ INTEGRATION UPDATE-PENDING BANNER (State A, alpha.6) =========== -->
+  <!-- Content-hash-derived (NOT a marker file): cont-init writes .content_hash on
+       deploy; the integration writes .loaded_content_hash when it loads. Shown
+       only when the integration was loaded before AND new content was deployed
+       -> a restart loads it. NOT dismissible; self-clears on restart. -->
   <div x-show="state.integration_pending_restart" x-transition.opacity
        class="bg-amber-100 border-b border-amber-300 px-6 py-3 flex items-center justify-between gap-3">
     <div class="text-sm text-amber-900">
-      <strong>Traefik integration ready.</strong>
-      Restart Home&nbsp;Assistant Core to load the reachability sensors.
-      After restart, add it via <span class="font-medium">Settings → Devices &amp; services → Add Integration → Traefik</span>.
+      <strong>Traefik integration updated.</strong>
+      Restart Home&nbsp;Assistant Core to load the new version.
     </div>
     <button @click="restartCore()" :disabled="restartingCore"
             class="shrink-0 px-3 py-1.5 rounded bg-amber-600 text-white text-sm font-medium hover:bg-amber-700 disabled:bg-gray-400">
       <span x-show="!restartingCore">Restart HA Core</span>
       <span x-show="restartingCore">Restarting HA Core...</span>
     </button>
+  </div>
+
+  <!-- ============ INTEGRATION AVAILABLE BANNER (State B, alpha.6) ============ -->
+  <!-- Deployed but never added. A freshly-dropped custom_component isn't in HA's
+       Add-Integration list until a Core restart, so Restart is the primary
+       action. Optional feature -> Dismiss (content-scoped: a NEW integration
+       version re-surfaces it). -->
+  <div x-show="state.integration_available" x-transition.opacity
+       class="bg-sky-100 border-b border-sky-300 px-6 py-3 flex items-center justify-between gap-3">
+    <div class="text-sm text-sky-900">
+      <strong>Reachability sensors available (optional).</strong>
+      Restart Home&nbsp;Assistant Core, then add the integration via
+      <span class="font-medium">Settings → Devices &amp; services → Add Integration → Traefik</span>.
+    </div>
+    <div class="shrink-0 flex items-center gap-2">
+      <button @click="restartCore()" :disabled="restartingCore"
+              class="px-3 py-1.5 rounded bg-sky-600 text-white text-sm font-medium hover:bg-sky-700 disabled:bg-gray-400">
+        <span x-show="!restartingCore">Restart HA Core</span>
+        <span x-show="restartingCore">Restarting HA Core...</span>
+      </button>
+      <button @click="dismissIntegration()" :disabled="dismissingIntegration"
+              class="px-3 py-1.5 rounded border border-sky-400 text-sky-800 text-sm font-medium hover:bg-sky-200 disabled:opacity-50">
+        Dismiss
+      </button>
+    </div>
   </div>
   <div x-show="restartCoreError" x-transition
        class="bg-red-50 border-b border-red-300 px-6 py-2 text-sm text-red-900 font-mono whitespace-pre-wrap"
