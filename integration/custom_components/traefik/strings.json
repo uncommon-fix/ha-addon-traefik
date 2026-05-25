@@ -15,5 +15,19 @@
     "abort": {
       "single_instance_allowed": "Only one Traefik integration instance is allowed."
     }
+  },
+  "issues": {
+    "restart_required": {
+      "title": "Restart Home Assistant to load the updated Traefik integration",
+      "description": "The Traefik add-on deployed a newer version of its integration. Restart Home Assistant to load it.",
+      "fix_flow": {
+        "step": {
+          "confirm": {
+            "title": "Restart Home Assistant?",
+            "description": "This restarts Home Assistant Core now to load the updated Traefik integration."
+          }
+        }
+      }
+    }
   }
 }

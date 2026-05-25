@@ -9,10 +9,20 @@ from typing import TYPE_CHECKING, Any
 import aiohttp
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .const import API_PATH, CONF_API_URL, DOMAIN, INTERNAL_SUFFIX, UPDATE_INTERVAL
+from .const import (
+    API_PATH,
+    CONF_API_URL,
+    DOMAIN,
+    INTERNAL_SUFFIX,
+    ISSUE_RESTART_REQUIRED,
+    UPDATE_INTERVAL,
+    get_loaded_content_hash,
+    read_content_hash,
+)
 
 if TYPE_CHECKING:
     from . import TraefikData
@@ -42,8 +52,48 @@ class TraefikCoordinator(DataUpdateCoordinator[dict[str, ServiceState]]):
         self._session = async_get_clientsession(hass)
         self._url = entry.data[CONF_API_URL].rstrip("/") + API_PATH
         self._entry = entry
+        # Last-known restart-required state; None until first evaluated. Used to
+        # log + touch the issue registry only on transitions, not every poll.
+        self._restart_required: bool | None = None
+
+    async def async_check_restart_required(self) -> None:
+        """Raise/clear the HA Repairs issue when the deployed integration
+        content differs from what this process loaded. Independent of Traefik
+        reachability so it still runs when the backend is down. Best-effort: a
+        failure here must never break the reachability poll.
+        """
+        try:
+            loaded = await self.hass.async_add_executor_job(get_loaded_content_hash)
+            deployed = await self.hass.async_add_executor_job(read_content_hash)
+        except Exception as err:  # noqa: BLE001 - never let this break the poll
+            _LOGGER.debug("restart-required check skipped: %s", err)
+            return
+        pending = bool(deployed) and deployed != loaded
+        if pending == self._restart_required:
+            return  # no transition
+        self._restart_required = pending
+        if pending:
+            _LOGGER.info(
+                "Traefik integration updated on disk (deployed=%s, loaded=%s); "
+                "restart Home Assistant to load it",
+                deployed,
+                loaded,
+            )
+            ir.async_create_issue(
+                self.hass,
+                DOMAIN,
+                ISSUE_RESTART_REQUIRED,
+                is_fixable=True,
+                severity=ir.IssueSeverity.WARNING,
+                translation_key=ISSUE_RESTART_REQUIRED,
+            )
+        else:
+            ir.async_delete_issue(self.hass, DOMAIN, ISSUE_RESTART_REQUIRED)
 
     async def _async_update_data(self) -> dict[str, ServiceState]:
+        # Runs first, before the Traefik call, so the restart-required signal is
+        # evaluated every cycle even when Traefik is unreachable.
+        await self.async_check_restart_required()
         try:
             async with self._session.get(
                 self._url, timeout=aiohttp.ClientTimeout(total=10)

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.0-alpha.4
+
+- "Restart Home Assistant to load the updated integration" is now also surfaced
+  as an official **Settings → System → Repairs** card (one-click restart), in
+  addition to the add-on banner.
+- The banner now clears automatically after a restart from **any** source (the
+  Repairs card, a manual restart, etc.), not only the add-on's own button.
+- Restart prompts are now based on the integration's actual content, so add-on
+  releases that don't change the integration no longer ask for a restart.
+- Fixed a harmless `runtime_data` AttributeError logged by the integration on
+  startup.
+
 ## 0.1.0-alpha.3
 
 - Fix: the setup wizard failed to save with a 500 error (`PUT /api/config`).

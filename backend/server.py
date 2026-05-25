@@ -37,11 +37,15 @@ WEB_ROOT = Path("/usr/share/traefik-web")
 RENDER_PY = "/usr/local/bin/render.py"
 TRAEFIK_URL = "http://127.0.0.1:8090"
 RENDER_TIMEOUT = 10.0
-# Phase 4 (0.9.0): cont-init's 99-deploy-integration.sh touches this file
-# after a successful copy to /homeassistant/custom_components/traefik/.
-# The UI shows a banner + "Restart HA Core" button while it exists; the
-# /api/restart-core handler unlinks it on success.
-INTEGRATION_PENDING_RESTART = Path("/data/integration_pending_restart")
+# "Restart required" is content-based: cont-init writes .content_hash (the
+# deployed integration content) and the integration writes .loaded_content_hash
+# (what it actually loaded) — both under /config. Pending == they differ (or
+# .loaded missing = deployed but not yet loaded). Self-clears on ANY restart
+# because the integration rewrites .loaded_content_hash when it reloads, so the
+# banner no longer depends on our button being the one that triggered it.
+INTEGRATION_DIR = Path("/homeassistant/custom_components/traefik")
+CONTENT_HASH_FILE = INTEGRATION_DIR / ".content_hash"
+LOADED_HASH_FILE = INTEGRATION_DIR / ".loaded_content_hash"
 # Supervisor REST: SUPERVISOR_TOKEN is injected by HA when hassio_api: true
 # is set in config.yaml. POST /addons/self/restart restarts our own
 # container. Used after Setup save so the user doesn't have to click
@@ -617,6 +621,23 @@ def _validate_config(body):
     return body
 
 
+def _integration_restart_pending() -> bool:
+    """True when the deployed integration content differs from what HA loaded
+    (or it's deployed but never loaded). Drives the add-on banner; the HA
+    Repairs card uses the same signal from the integration side."""
+    try:
+        deployed = CONTENT_HASH_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return False
+    if not deployed:
+        return False
+    try:
+        loaded = LOADED_HASH_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        loaded = ""
+    return deployed != loaded
+
+
 def _config_state(config: dict) -> dict:
     """Onboarding state surfaced to the UI. Token value never leaves; only
     presence is reported."""
@@ -634,9 +655,9 @@ def _config_state(config: dict) -> dict:
         # Boolean so the UI knows whether to show "token set" placeholder
         # vs an empty input. We NEVER return the token itself.
         "cloudflare_token_present": bool(config.get("cloudflare_token", "").strip()),
-        # Phase 4 (0.9.0): drives the persistent "Restart HA Core" banner.
-        # Cleared by POST /api/restart-core on success; never written here.
-        "integration_pending_restart": INTEGRATION_PENDING_RESTART.exists(),
+        # Drives the "Restart HA Core" banner. Content-based (see
+        # _integration_restart_pending); self-clears when the integration reloads.
+        "integration_pending_restart": _integration_restart_pending(),
     }
 
 
@@ -796,12 +817,9 @@ async def post_restart_core(request):
             text="SUPERVISOR_TOKEN env var missing -- check homeassistant_api: true "
                  "in config.yaml and that the addon was rebuilt."
         )
-    def _clear_marker(why: str) -> None:
-        if INTEGRATION_PENDING_RESTART.exists():
-            try:
-                INTEGRATION_PENDING_RESTART.unlink()
-            except OSError as e:
-                sys.stderr.write(f"WARN failed to clear marker: {e}\n")
+    def _log_success(why: str) -> None:
+        # Nothing to clear: the banner is content-based and self-clears once the
+        # integration reloads and rewrites .loaded_content_hash.
         sys.stderr.write(f"INFO supervisor /core/restart succeeded ({why})\n")
 
     backoffs = (1.0, 2.0, 4.0)
@@ -817,7 +835,7 @@ async def post_restart_core(request):
             ) as r:
                 last_status = r.status
                 if r.status < 400:
-                    _clear_marker(f"http {r.status} on attempt {attempt}")
+                    _log_success(f"http {r.status} on attempt {attempt}")
                     return web.json_response({"restarting": True})
                 last_reason = f"http {r.status}"
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
@@ -826,8 +844,8 @@ async def post_restart_core(request):
             # restarted itself mid-response." That IS the success path.
             # On retries, treat the same way — if a previous attempt landed,
             # Core's now booting and connection-refused/timeout is expected.
-            _clear_marker(f"{type(e).__name__} on attempt {attempt} "
-                          f"(treating as success — Core restarted mid-request)")
+            _log_success(f"{type(e).__name__} on attempt {attempt} "
+                         f"(treating as success — Core restarted mid-request)")
             return web.json_response(
                 {"restarting": True, "note": type(e).__name__}
             )

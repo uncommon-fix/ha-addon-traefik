@@ -77,7 +77,7 @@ COPY web/ /usr/share/traefik-web/
 # differs from what's already deployed. BUILD_VERSION is auto-injected by the
 # home-assistant/builder CI action (= config.yaml's version:); the default
 # below covers local builds — keep it in sync with config.yaml's version: field.
-ARG BUILD_VERSION=0.1.0-alpha.3
+ARG BUILD_VERSION=0.1.0-alpha.4
 COPY integration/custom_components /usr/share/traefik-integration/custom_components
 RUN echo "${BUILD_VERSION}" > /usr/share/traefik-integration/.bundled_version
 

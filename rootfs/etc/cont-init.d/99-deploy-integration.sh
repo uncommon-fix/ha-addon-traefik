@@ -1,18 +1,19 @@
 #!/usr/bin/with-contenv bashio
 # Deploy the bundled reachability integration to
 # /homeassistant/custom_components/traefik/ if the baked-in version differs
-# from what's on disk. Touch /data/integration_pending_restart so the
-# backend's UI can prompt the user to restart HA Core.
+# from what's on disk, then write `.content_hash` — a deterministic hash of the
+# deployed integration content. The integration snapshots that value when it
+# loads (writing `.loaded_content_hash`); the add-on banner AND the HA Repairs
+# card both show "restart required" when the two differ. Keying on CONTENT (not
+# the version string) means add-on-only releases never falsely demand a restart.
 #
-# NO supervisor calls in this script — restart is user-triggered via the
-# addon UI's banner. That avoids a cont-init/supervisor-startup deadlock.
+# NO supervisor calls in this script — restart is user-triggered.
 set -euo pipefail
 
 SRC=/usr/share/traefik-integration/custom_components/traefik
 DST=/homeassistant/custom_components/traefik
 VERSION_FILE_SRC=/usr/share/traefik-integration/.bundled_version
 VERSION_FILE_DST="${DST}/.bundled_version"
-MARKER=/data/integration_pending_restart
 
 BUNDLED="$(cat "${VERSION_FILE_SRC}")"
 DEPLOYED="$(cat "${VERSION_FILE_DST}" 2>/dev/null || echo none)"
@@ -43,5 +44,13 @@ else
     bashio::log.warning "could not resolve addon hostname; integration will use its default api_url"
 fi
 
-touch "${MARKER}"
-bashio::log.info "integration deployed (v${BUNDLED}); user must restart HA Core"
+# Deterministic content hash of the deployed integration (excludes the deploy
+# marker dotfiles + __pycache__). Identical content -> identical hash, so an
+# add-on-only release that re-copies the same files produces no "restart" signal.
+CONTENT_HASH="$(cd "${DST}" && find . -type f \
+    ! -name '.content_hash' ! -name '.loaded_content_hash' \
+    ! -name '.api_url' ! -name '.bundled_version' \
+    ! -path '*/__pycache__/*' \
+    -exec sha256sum {} + | sort | sha256sum | cut -d' ' -f1)"
+printf '%s' "${CONTENT_HASH}" > "${DST}/.content_hash"
+bashio::log.info "integration deployed (v${BUNDLED}, content ${CONTENT_HASH:0:12}); restart HA Core to load it"
