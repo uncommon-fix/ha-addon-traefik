@@ -294,11 +294,17 @@
                   <input type="checkbox" x-model="r.enabled">
                 </template>
               </td>
-              <!-- Hostname: editable on BOTH system and user rows -->
+              <!-- Hostname: editable on BOTH system and user rows. A status dot
+                   to the left reflects backend reachability (alpha.10). -->
               <td class="py-2 pr-3">
-                <input type="text" x-model="r.hostname"
-                       class="font-mono border rounded px-2 py-1 w-44 bg-white"
-                       :placeholder="r.system ? 'hass' : 'cloud or cloud.example.com'">
+                <div class="flex items-center gap-2">
+                  <span class="shrink-0 w-2.5 h-2.5 rounded-full"
+                        :class="routeStatusColor(r)"
+                        :title="routeStatusTitle(r)"></span>
+                  <input type="text" x-model="r.hostname"
+                         class="font-mono border rounded px-2 py-1 w-44 bg-white"
+                         :placeholder="r.system ? 'hass' : 'cloud or cloud.example.com'">
+                </div>
               </td>
               <!-- Backend: static label for system rows -->
               <td class="py-2 pr-3">

@@ -1242,6 +1242,69 @@ async def put_middlewares(request):
     })
 
 
+def _effective_slug(raw_hostname: str, domain: str) -> str | None:
+    """Mirror render.py's hostname→slug rule so route-health keys match the
+    rendered Traefik service names. None for routes the renderer skips."""
+    raw = (raw_hostname or "").strip().lower()
+    if "*" in raw:
+        return None  # wildcard routes are skipped by the renderer
+    if domain:
+        if raw in ("", "@"):
+            host = domain
+        elif "." in raw:
+            return None  # invalid when a domain is set (renderer skips it)
+        else:
+            host = f"{raw}.{domain}"
+    else:
+        host = raw
+    if not host:
+        return None
+    return host.replace(".", "-")
+
+
+async def get_route_health(request):
+    """Per-route backend reachability for the UI's status dots. Maps each route
+    (keyed by its raw hostname) to "up" | "down" | "unknown" | "disabled" using
+    Traefik's serverStatus (same logic as the reachability integration). The
+    backend owns the slug computation so the UI doesn't replicate it."""
+    config = _load_config_yml()
+    domain = (config.get("domain") or "").strip().lower()
+    routes = _load_routes_yml()
+    try:
+        async with request.app["client"].get(
+            f"{TRAEFIK_URL}/api/http/services",
+            timeout=aiohttp.ClientTimeout(total=2.0),
+        ) as r:
+            services = await r.json()
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        return web.json_response({"traefik_up": False, "health": {}}, status=200)
+
+    svc_health: dict[str, str] = {}
+    for svc in services if isinstance(services, list) else []:
+        name = svc.get("name", "")
+        if not name or name.endswith("@internal"):
+            continue
+        slug = name[:-5] if name.endswith("@file") else name
+        server_status = svc.get("serverStatus") or {}
+        if not server_status:
+            svc_health[slug] = "unknown"  # healthCheck hasn't run yet
+        else:
+            up = svc.get("status") == "enabled" and all(
+                v == "UP" for v in server_status.values()
+            )
+            svc_health[slug] = "up" if up else "down"
+
+    health: dict[str, str] = {}
+    for rt in routes:
+        host = rt.get("hostname", "")
+        if not rt.get("enabled", True):
+            health[host] = "disabled"
+            continue
+        slug = _effective_slug(host, domain)
+        health[host] = svc_health.get(slug, "unknown") if slug else "unknown"
+    return web.json_response({"traefik_up": True, "health": health})
+
+
 async def get_status(request):
     """Reverse-proxy Traefik's /api/overview with friendlier 503-on-down."""
     try:
@@ -1378,6 +1441,7 @@ def make_app():
     app.router.add_put("/api/config", put_config)
     app.router.add_get("/api/state", get_state)
     app.router.add_get("/api/status", get_status)
+    app.router.add_get("/api/route-health", get_route_health)
     app.router.add_post("/api/restart", post_restart)
     app.router.add_post("/api/restart-core", post_restart_core)
     app.router.add_post("/api/fix-trusted-proxies", post_fix_trusted_proxies)

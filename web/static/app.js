@@ -188,6 +188,9 @@ function traefikAppData() {
         // Dashboard / status badge
         status: {},
         _statusTimer: null,
+        // alpha.10: per-route backend reachability (hostname -> up|down|unknown|
+        // disabled), refreshed by pollStatus; drives the status dot per route.
+        routeHealth: {},
 
         // Phase F: system routes render first in the table (and a colliding
         // user route would lose; see render.py for the matching invariant).
@@ -297,6 +300,36 @@ function traefikAppData() {
             } catch (_) {
                 this.status = { traefik_up: false };
             }
+            // alpha.10: per-route backend reachability for the status dots.
+            try {
+                const rh = await fetch(this.url('/api/route-health'));
+                if (rh.ok) {
+                    const j = await rh.json();
+                    this.routeHealth = j.health || {};
+                }
+            } catch (_) { /* keep last-known on a blip */ }
+        },
+
+        // alpha.10: reachability of a route's backend, keyed by raw hostname.
+        // up = backend healthy; down = backend unreachable; disabled = route off;
+        // unknown = Traefik down / healthCheck not yet run / route not rendered.
+        routeStatus(route) {
+            return this.routeHealth[route.hostname] || 'unknown';
+        },
+
+        routeStatusColor(route) {
+            const s = this.routeStatus(route);
+            if (s === 'up') return 'bg-green-500';
+            if (s === 'down') return 'bg-red-500';
+            return 'bg-gray-300';  // unknown / disabled
+        },
+
+        routeStatusTitle(route) {
+            const s = this.routeStatus(route);
+            if (s === 'up') return 'Backend reachable';
+            if (s === 'down') return 'Backend unreachable';
+            if (s === 'disabled') return 'Route disabled';
+            return 'Status unknown (Traefik down or health check pending)';
         },
 
         async saveConfig() {

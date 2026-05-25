@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.0-alpha.10
+
+- Routes tab: each route now shows a **status dot** to the left of its hostname —
+  green = backend reachable, red = unreachable, grey = unknown (Traefik down,
+  health check still pending, or route disabled). Refreshes every few seconds.
+
 ## 0.1.0-alpha.9
 
 - Fixed: new routes now show up as reachability sensors automatically (within
