@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.0-alpha.2
+
+- Removed the supervisor **Configuration** form. All settings (routes,
+  middlewares, TLS, entry points, log level) live in the add-on's **Web UI**
+  ("Open Web UI"); the supervisor now shows only the **Network** section for
+  port mapping.
+- After updating, a one-time "Restart HA Core" banner appears (the bundled
+  reachability integration redeploys on the version bump).
+
 ## 0.1.0-alpha.1
 
 Initial public alpha. Expect breaking changes between releases.

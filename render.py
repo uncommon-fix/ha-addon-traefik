@@ -1,8 +1,8 @@
-"""Render Traefik static + dynamic YAML from the add-on's options.json.
+"""Render Traefik static + dynamic YAML from /data/config.yml + /data/routes.yml.
 
-Called by run.sh on every container start. Re-renders are triggered by the
-supervisor restarting the container after the user clicks Restart in the
-Configuration tab (the supervisor does NOT auto-restart on options save).
+Run from cont-init on every container start and re-run by the backend after each
+Save in the add-on's Web UI. /data/options.json is only a back-compat fallback
+for pre-0.5 installs; the Web UI (state in /data/*.yml) is the source of truth.
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ RESOLVER_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,30}$")
 
 YAML_HEADER = (
     "# Managed by the traefik add-on - do not edit by hand.\n"
-    "# Re-rendered from /data/options.json on every container start.\n"
+    "# Re-rendered from /data/config.yml + /data/routes.yml on every start.\n"
 )
 
 
@@ -134,11 +134,17 @@ def _acme_active(opts: dict[str, Any]) -> bool:
 
 
 def main() -> int:
-    try:
-        opts = json.loads(OPTIONS.read_text())
-    except (OSError, json.JSONDecodeError) as err:
-        print(f"FATAL: cannot read options.json: {err}", file=sys.stderr)
-        return 1
+    # /data/options.json is a back-compat fallback only; with no supervisor
+    # schema it may be absent or {}. Treat missing as empty; FATAL only on a
+    # present-but-corrupt file (mirrors backend's _load_config_yml).
+    if OPTIONS.exists():
+        try:
+            opts = json.loads(OPTIONS.read_text())
+        except (OSError, json.JSONDecodeError) as err:
+            print(f"FATAL: cannot read options.json: {err}", file=sys.stderr)
+            return 1
+    else:
+        opts = {}
 
     config = _load_core_config(opts)
     resolver_name = (config.get("acme_resolver") or "").strip()
@@ -336,7 +342,7 @@ def _build_dynamic(opts: dict[str, Any]) -> tuple[dict[str, Any], int, int]:
         router: dict[str, Any] = {
             "rule": f"Host(`{hostname}`)",
             "entryPoints": [
-                opts["entrypoint_https"] if tls else opts["entrypoint_http"]
+                config["entrypoint_https"] if tls else config["entrypoint_http"]
             ],
             "service": slug,
         }
