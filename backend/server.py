@@ -23,6 +23,7 @@ import os
 import re
 import shutil
 import sys
+import traceback
 from pathlib import Path
 
 import aiohttp
@@ -558,7 +559,14 @@ def _redact_middlewares(defs: list) -> list:
 def _load_middlewares_yml() -> list:
     if not MIDDLEWARES_YML.exists():
         return []
-    parsed = yaml.safe_load(MIDDLEWARES_YML.read_text()) or {}
+    try:
+        parsed = yaml.safe_load(MIDDLEWARES_YML.read_text()) or {}
+    except yaml.YAMLError as e:
+        raise web.HTTPInternalServerError(
+            text=f"/data/middlewares.yml has invalid YAML and the add-on "
+                 f"refuses to overwrite it. Fix the file by hand before "
+                 f"saving. ({e})"
+        )
     return parsed.get("middlewares") or []
 
 
@@ -585,18 +593,49 @@ def _reinject_system_middlewares(defs: list, existing: list) -> list:
 
 
 # ---------- helpers ----------
-def _atomic_write_yml(path: Path, data: dict) -> None:
+# Token-shaped substring redactor. Cheap insurance: render.py / subprocess stderr
+# returned to the UI gets matched against the Cloudflare-token shape and masked.
+# Same character class + length window as _validate_config's token regex.
+_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{20,256}")
+
+
+def _redact(text: str) -> str:
+    return _TOKEN_RE.sub("<redacted>", text)
+
+
+def _fsync_parent_dir(path: Path) -> None:
+    # Persist the directory entry rename to disk. Without this, a power loss
+    # between the os.replace and the writeback can leave the directory entry
+    # pointing at the OLD inode while the data blocks are gone.
+    fd = os.open(str(path.parent), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    # Crash-safe: write to a sibling tmp, flush + fsync the data, atomic rename,
+    # then fsync the parent dir. Mirrored by _atomic_write_yml; used directly by
+    # the snapshot-restore path in put_* on render failure.
     tmp = path.parent / (path.name + ".tmp")
-    tmp.write_text(
-        yaml.safe_dump(
-            data,
-            default_flow_style=False,
-            sort_keys=False,
-            allow_unicode=False,
-            width=4096,
-        )
-    )
+    with tmp.open("wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, path)
+    _fsync_parent_dir(path)
+
+
+def _atomic_write_yml(path: Path, data: dict) -> None:
+    payload = yaml.safe_dump(
+        data,
+        default_flow_style=False,
+        sort_keys=False,
+        allow_unicode=False,
+        width=4096,
+    )
+    _atomic_write_bytes(path, payload.encode("utf-8"))
 
 
 def _load_config_yml() -> dict:
@@ -626,13 +665,27 @@ def _load_config_yml() -> dict:
         if opts.get(field):
             merged[field] = opts[field]
     if CONFIG_YML.exists():
+        # Corrupt config.yml used to silently fall back to defaults — and the
+        # next save would then overwrite the file with the validated payload,
+        # erasing any stored unknown keys (redirect_seeded,
+        # integration_available_dismissed_for). Refuse instead: surface a
+        # 500 with the parse error and let the user fix the file by hand.
         try:
             data = yaml.safe_load(CONFIG_YML.read_text()) or {}
-            for field in merged:
-                if field in data and data[field] is not None:
-                    merged[field] = data[field]
-        except yaml.YAMLError:
-            pass
+        except yaml.YAMLError as e:
+            raise web.HTTPInternalServerError(
+                text=f"/data/config.yml has invalid YAML and the add-on "
+                     f"refuses to overwrite it. Fix the file by hand before "
+                     f"saving. ({e})"
+            )
+        if not isinstance(data, dict):
+            raise web.HTTPInternalServerError(
+                text="/data/config.yml top level is not a YAML mapping; "
+                     "expected a dict of fields."
+            )
+        for field in merged:
+            if field in data and data[field] is not None:
+                merged[field] = data[field]
     return merged
 
 
@@ -657,7 +710,17 @@ def _validate_config(body):
         raise web.HTTPBadRequest(text="acme_email: invalid format")
     body["acme_email"] = email
     body["domain"] = body["domain"].strip().lower()
-    body["cloudflare_token"] = body["cloudflare_token"].strip()
+    token = body["cloudflare_token"].strip()
+    # Reject embedded whitespace / control chars. .strip() only trims the
+    # edges, so a multi-line paste used to survive validation, get exported
+    # via printf '%s' in cont-init, and silently break Cloudflare auth.
+    # Same character class as _TOKEN_RE used for stderr redaction.
+    if token and not re.fullmatch(r"[A-Za-z0-9_-]{20,256}", token):
+        raise web.HTTPBadRequest(
+            text="cloudflare_token: must be 20-256 chars from "
+                 "[A-Za-z0-9_-] only (no whitespace or newlines)."
+        )
+    body["cloudflare_token"] = token
     body["provider"] = body["provider"].strip().lower()
     # ha_hostname is vestigial (the HA system route owns the subdomain) and the
     # setup wizard omits it; validate only when a client still sends it.
@@ -701,13 +764,18 @@ def _validate_config(body):
 def _read_raw_config() -> dict:
     """Read /data/config.yml verbatim (PyYAML). Unlike _load_config_yml this
     does NOT drop unknown keys — needed so the dismiss marker and redirect_seeded
-    survive a read-modify-write."""
+    survive a read-modify-write. Refuses on corrupt YAML: silently swallowing
+    used to let post_dismiss_integration replace the entire file with a single
+    key when config.yml was unparseable."""
     if not CONFIG_YML.exists():
         return {}
     try:
         data = yaml.safe_load(CONFIG_YML.read_text())
-    except yaml.YAMLError:
-        return {}
+    except yaml.YAMLError as e:
+        raise web.HTTPInternalServerError(
+            text=f"/data/config.yml has invalid YAML and the add-on refuses "
+                 f"to overwrite it. Fix the file by hand before saving. ({e})"
+        )
     return data if isinstance(data, dict) else {}
 
 
@@ -875,6 +943,15 @@ def _do_fix_trusted_proxies() -> None:
 
     tmp = real.with_name(real.name + ".traefik-addon.tmp")
     bak = real.with_name(real.name + ".traefik-addon.bak")
+    # Refuse to overwrite an earlier backup. A previous Fix click left a
+    # known-good copy; clobbering it on a re-run would lose the original.
+    # The user can delete the .bak by hand if they really want a fresh one.
+    if bak.exists():
+        raise _FixBail(
+            f"an earlier backup ({bak.name}) is already present next to "
+            "configuration.yaml. Review or delete it before re-running so "
+            "the original known-good copy isn't overwritten."
+        )
     try:
         shutil.copy2(real, bak)  # preserves mode + mtime
     except OSError as e:
@@ -882,8 +959,14 @@ def _do_fix_trusted_proxies() -> None:
     try:
         with tmp.open("w", encoding="utf-8") as f:
             yaml_rt.dump(data, f)
+            # Crash-safe: persist data + the directory rename to disk so a
+            # power loss between close and writeback can't leave a zero-byte
+            # configuration.yaml in place.
+            f.flush()
+            os.fsync(f.fileno())
         shutil.copystat(real, tmp)
         os.replace(tmp, real)  # atomic; same fs
+        _fsync_parent_dir(real)
     except Exception as e:
         tmp.unlink(missing_ok=True)
         raise _FixBail(f"failed to write configuration.yaml: {e}")
@@ -926,7 +1009,13 @@ def _redact_config(config: dict) -> dict:
 def _load_routes_yml() -> list:
     if not ROUTES_YML.exists():
         return []
-    parsed = yaml.safe_load(ROUTES_YML.read_text()) or {}
+    try:
+        parsed = yaml.safe_load(ROUTES_YML.read_text()) or {}
+    except yaml.YAMLError as e:
+        raise web.HTTPInternalServerError(
+            text=f"/data/routes.yml has invalid YAML and the add-on refuses "
+                 f"to overwrite it. Fix the file by hand before saving. ({e})"
+        )
     return parsed.get("routes") or []
 
 
@@ -980,6 +1069,12 @@ async def put_config(request):
     validated = _validate_config(body)
 
     async with request.app["save_lock"]:
+        # Snapshot prior bytes so we can roll back if render.py fails. Without
+        # this, a bad config persists to /data → next cont-init's render also
+        # fails → addon unbootable. The snapshot is the on-disk file (not the
+        # parsed dict) so the restored content is byte-identical to what was
+        # there before.
+        prior_bytes = CONFIG_YML.read_bytes() if CONFIG_YML.exists() else None
         _atomic_write_yml(CONFIG_YML, validated)
         proc = await asyncio.create_subprocess_exec(
             "python3", RENDER_PY,
@@ -993,12 +1088,24 @@ async def put_config(request):
         except asyncio.TimeoutError:
             proc.kill()
             await proc.communicate()
+            # Render timed out — restore prior content so the next boot's
+            # cont-init render succeeds against the previous known-good config.
+            if prior_bytes is None:
+                CONFIG_YML.unlink(missing_ok=True)
+            else:
+                _atomic_write_bytes(CONFIG_YML, prior_bytes)
             raise web.HTTPGatewayTimeout(
                 text=f"render.py exceeded {RENDER_TIMEOUT}s"
             )
+        if proc.returncode != 0:
+            if prior_bytes is None:
+                CONFIG_YML.unlink(missing_ok=True)
+            else:
+                _atomic_write_bytes(CONFIG_YML, prior_bytes)
+            raise web.HTTPInternalServerError(
+                text=_redact(err.decode(errors="replace"))
+            )
 
-    if proc.returncode != 0:
-        raise web.HTTPInternalServerError(text=err.decode(errors="replace"))
     state = _config_state(validated)
     return web.json_response({
         "saved": True,
@@ -1007,7 +1114,7 @@ async def put_config(request):
         # stale until cont-init re-runs (next addon restart). Surface this
         # so the UI can show a "Restart add-on to apply" banner.
         "restart_required": True,
-        "stderr": err.decode(errors="replace"),
+        "stderr": _redact(err.decode(errors="replace")),
     })
 
 
@@ -1172,6 +1279,7 @@ async def put_routes(request):
         # Persist with system routes at the front so the renderer's file-order
         # iteration matches.
         incoming = sorted(incoming, key=lambda r: 0 if r.get("system") else 1)
+        prior_bytes = ROUTES_YML.read_bytes() if ROUTES_YML.exists() else None
         _atomic_write_yml(ROUTES_YML, {"routes": incoming})
         proc = await asyncio.create_subprocess_exec(
             "python3", RENDER_PY,
@@ -1185,15 +1293,26 @@ async def put_routes(request):
         except asyncio.TimeoutError:
             proc.kill()
             await proc.communicate()
+            if prior_bytes is None:
+                ROUTES_YML.unlink(missing_ok=True)
+            else:
+                _atomic_write_bytes(ROUTES_YML, prior_bytes)
             raise web.HTTPGatewayTimeout(
                 text=f"render.py exceeded {RENDER_TIMEOUT}s"
             )
+        if proc.returncode != 0:
+            # Roll back so cont-init's render succeeds on the next boot.
+            if prior_bytes is None:
+                ROUTES_YML.unlink(missing_ok=True)
+            else:
+                _atomic_write_bytes(ROUTES_YML, prior_bytes)
+            raise web.HTTPInternalServerError(
+                text=_redact(err.decode(errors="replace"))
+            )
 
-    if proc.returncode != 0:
-        # DEBUG-FRIENDLY: returns raw stderr to the (authenticated admin) UI.
-        raise web.HTTPInternalServerError(text=err.decode(errors="replace"))
     return web.json_response(
-        {"saved": len(incoming), "stderr": err.decode(errors="replace")}
+        {"saved": len(incoming),
+         "stderr": _redact(err.decode(errors="replace"))}
     )
 
 
@@ -1217,6 +1336,9 @@ async def put_middlewares(request):
         existing = _load_middlewares_yml()
         defs = await _validate_middlewares(body.get("middlewares", []), existing)
         defs = _reinject_system_middlewares(defs, existing)
+        prior_bytes = (
+            MIDDLEWARES_YML.read_bytes() if MIDDLEWARES_YML.exists() else None
+        )
         _atomic_write_yml(MIDDLEWARES_YML, {"version": 1, "middlewares": defs})
         proc = await asyncio.create_subprocess_exec(
             "python3", RENDER_PY,
@@ -1230,15 +1352,25 @@ async def put_middlewares(request):
         except asyncio.TimeoutError:
             proc.kill()
             await proc.communicate()
+            if prior_bytes is None:
+                MIDDLEWARES_YML.unlink(missing_ok=True)
+            else:
+                _atomic_write_bytes(MIDDLEWARES_YML, prior_bytes)
             raise web.HTTPGatewayTimeout(
                 text=f"render.py exceeded {RENDER_TIMEOUT}s"
             )
+        if proc.returncode != 0:
+            if prior_bytes is None:
+                MIDDLEWARES_YML.unlink(missing_ok=True)
+            else:
+                _atomic_write_bytes(MIDDLEWARES_YML, prior_bytes)
+            raise web.HTTPInternalServerError(
+                text=_redact(err.decode(errors="replace"))
+            )
 
-    if proc.returncode != 0:
-        raise web.HTTPInternalServerError(text=err.decode(errors="replace"))
     return web.json_response({
         "saved": len(defs),
-        "stderr": err.decode(errors="replace"),
+        "stderr": _redact(err.decode(errors="replace")),
     })
 
 
@@ -1421,6 +1553,32 @@ async def proxy_traefik_api(request):
 
 
 # ---------- lifecycle ----------
+@web.middleware
+async def json_error_mw(request, handler):
+    """Wrap every error response as `{"error": "..."}` JSON. Without this:
+    - HTTPException(text=...) returns `Content-Type: text/plain` and the UI
+      shows the bare string in a font-mono red box.
+    - Any unhandled Exception escapes to aiohttp's default handler, which
+      returns a full Python traceback in the body — surfaced to the user.
+
+    Proxy paths (/dashboard/*, /traefik-api/*) pass through on success; only
+    error responses get wrapped.
+    """
+    try:
+        return await handler(request)
+    except web.HTTPException as ex:
+        if ex.content_type == "application/json":
+            raise
+        body = {"error": ex.text or ex.reason or f"HTTP {ex.status}"}
+        return web.json_response(body, status=ex.status)
+    except Exception:
+        # Send the traceback to the add-on log (visible in Settings → Add-ons
+        # → Traefik → Log), NOT to the response body where the user would see
+        # it. Surface a generic message.
+        sys.stderr.write(traceback.format_exc())
+        return web.json_response({"error": "internal error"}, status=500)
+
+
 async def client_session_ctx(app):
     app["client"] = aiohttp.ClientSession()
     app["save_lock"] = asyncio.Lock()
@@ -1429,7 +1587,7 @@ async def client_session_ctx(app):
 
 
 def make_app():
-    app = web.Application()
+    app = web.Application(middlewares=[json_error_mw])
     app.cleanup_ctx.append(client_session_ctx)
     app.router.add_get("/", serve_index)
     app.router.add_static("/static", str(WEB_ROOT / "static"))

@@ -579,9 +579,20 @@ def _atomic_write(target: Path, content: str) -> None:
     # Traefik's file provider filters by extension (.toml/.yaml/.yml) per
     # pkg/provider/file/file.go — the .tmp transient file is ignored during
     # the brief window before os.replace renames it into place.
+    # Crash-safe: flush + fsync the data, atomic rename, then fsync the
+    # parent dir. Mirrors server.py/migrate.py so a kernel crash mid-write
+    # can't leave a zero-byte /etc/traefik/*.yml.
     tmp = target.parent / (target.name + ".tmp")
-    tmp.write_text(content, encoding="utf-8")
+    with tmp.open("w", encoding="utf-8") as f:
+        f.write(content)
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, target)
+    fd = os.open(str(target.parent), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.1.0-alpha.11
+
+- Fixed: a crash or kernel-level interruption mid-save could leave the add-on's
+  stored config corrupted and prevent the add-on from booting. Writes are now
+  fsync'd before the rename, on both `/data/*.yml` and the rendered
+  `/etc/traefik/*.yml` files.
+- Fixed: a save with an invalid route used to persist the bad config to disk
+  before reporting the error, so subsequent restarts would also fail. Saves
+  now roll back to the prior content if the render step fails.
+- Fixed: a corrupt `/data/config.yml` could be silently replaced with defaults
+  on the next save, losing stored markers. The add-on now refuses to save and
+  reports the parse error so you can fix the file by hand.
+- Fixed: backend errors used to return Python tracebacks in plain text;
+  errors now return JSON the UI can render cleanly. Tracebacks still go to the
+  add-on log for debugging.
+- Fixed: pasting a multi-line Cloudflare API token used to silently break
+  Cloudflare authentication. The token is now validated for shape on save.
+- Fixed: clicking "Fix automatically" twice for trusted_proxies would
+  overwrite the original `configuration.yaml.traefik-addon.bak`. The add-on
+  now refuses a second fix when an earlier backup is already present.
+
 ## 0.1.0-alpha.10
 
 - Routes tab: each route now shows a **status dot** to the left of its hostname —

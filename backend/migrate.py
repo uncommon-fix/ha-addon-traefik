@@ -15,6 +15,7 @@ Failure semantics:
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -65,9 +66,26 @@ def _dump(data: dict) -> str:
     )
 
 
+def _atomic_write(target: Path, payload: str) -> None:
+    """Crash-safe YAML write: tmp + flush + fsync + atomic rename + parent fsync.
+    Mirrors server.py's _atomic_write_bytes/_atomic_write_yml so an interrupted
+    migrate.py can't leave a torn /data/*.yml that bricks the next boot."""
+    tmp = target.parent / (target.name + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        f.write(payload)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, target)
+    fd = os.open(str(target.parent), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def _write(target: Path, data: dict, *, label: str) -> int:
     try:
-        target.write_text(_dump(data))
+        _atomic_write(target, _dump(data))
     except OSError as e:
         print(
             f"migrate: REFUSING to continue -- cannot write {target}: {e}",
@@ -165,7 +183,7 @@ def _ensure_ha_system_route() -> None:
         "health_path": None,
     }
     routes.insert(0, system_route)  # system routes at front
-    ROUTES_YML.write_text(_dump({"routes": routes}))
+    _atomic_write(ROUTES_YML, _dump({"routes": routes}))
     print(
         f"migrate: seeded HA system route "
         f"(hostname={ha_hostname!r}, enabled={enabled})",
@@ -179,7 +197,7 @@ def _ensure_middlewares_file() -> None:
     and the renderer's _load_middlewares has a parseable file to read."""
     if MIDDLEWARES_YML.exists():
         return
-    MIDDLEWARES_YML.write_text(_dump({"version": 1, "middlewares": []}))
+    _atomic_write(MIDDLEWARES_YML, _dump({"version": 1, "middlewares": []}))
     print("migrate: wrote empty /data/middlewares.yml", file=sys.stderr)
 
 
@@ -218,7 +236,7 @@ def _ensure_builtin_middlewares() -> None:
     if changed:
         doc["middlewares"] = mws
         doc.setdefault("version", 1)
-        MIDDLEWARES_YML.write_text(_dump(doc))
+        _atomic_write(MIDDLEWARES_YML, _dump(doc))
 
 
 def _ensure_redirect_middleware() -> None:
@@ -241,7 +259,7 @@ def _ensure_redirect_middleware() -> None:
     if not any(m.get("name") == REDIRECT_MW_NAME for m in mws):
         mws.append(dict(REDIRECT_MW))
         mw_doc["middlewares"] = mws
-        MIDDLEWARES_YML.write_text(_dump(mw_doc))
+        _atomic_write(MIDDLEWARES_YML, _dump(mw_doc))
         print(f"migrate: seeded {REDIRECT_MW_NAME!r} middleware", file=sys.stderr)
 
     # 2. Attach it to the HA system route only (never user routes).
@@ -258,7 +276,7 @@ def _ensure_redirect_middleware() -> None:
                     changed = True
         if changed:
             routes_doc["routes"] = routes
-            ROUTES_YML.write_text(_dump(routes_doc))
+            _atomic_write(ROUTES_YML, _dump(routes_doc))
             print(
                 "migrate: attached redirect-to-https to HA system route",
                 file=sys.stderr,
@@ -266,7 +284,7 @@ def _ensure_redirect_middleware() -> None:
 
     # 3. One-shot marker (config.yml already exists by this point in main()).
     cfg["redirect_seeded"] = True
-    CONFIG_YML.write_text(_dump(cfg))
+    _atomic_write(CONFIG_YML, _dump(cfg))
 
 
 def main() -> int:
