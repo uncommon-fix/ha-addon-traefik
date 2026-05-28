@@ -53,6 +53,31 @@ The addon ships a small HA integration that publishes `binary_sensor.traefik_rou
 - **Remove**: deleting a route does NOT delete its sensor (that would break dashboards/automations). The sensor goes `unavailable` and persists. To clean up a sensor you're truly done with, delete its device from Settings → Devices & services → Traefik.
 - **Version coupling**: the integration ships *inside the addon image*. The "updated — restart" banner is keyed on the integration's actual content, not the add-on version — so an add-on release that doesn't change the integration won't ask you to restart. There is no separate update path.
 
+## Editor sessions (one writer at a time)
+
+The add-on UI lets one tab/browser hold the **edit session** at a time so two
+people (or two of your own tabs) can't silently clobber each other's saves.
+
+- **Opening the UI** claims the session automatically. You see "Read-only"
+  state only when something else is already editing.
+- **If another session is active**, you'll see a prompt: **Take over** (the
+  other session is then disabled — its next save shows "Your session was
+  taken over" with a Reload button) or **View read-only** (you can navigate
+  and inspect, but every Save/Restart/Fix button is disabled).
+- **Sessions expire after 60 s of inactivity** (no polling = no heartbeat).
+  Reload the page to claim a new one.
+
+## Notifications + load failures
+
+- **Success and info notifications** appear top-right and auto-fade after a
+  few seconds. **Error notifications** stay until you dismiss them.
+- **If a section can't load** (network glitch, backend restart mid-poll), you
+  see a "Couldn't load …" panel with a **Reload** button INSTEAD of the form,
+  and the Save button is disabled. This prevents a stale-load → empty-save →
+  silent-clobber loop.
+- **Form validation** runs as you type (entry-point names, Cloudflare token
+  shape, email, domain). Save is disabled until visible errors clear.
+
 ## Security notes
 
 - `/data/acme.json` is included in HA snapshots. The LE rate-limit on restore-reissue makes excluding it worse than the snapshot-leak risk for a LAN deployment. Encrypt your snapshots if this matters.

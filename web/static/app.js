@@ -145,6 +145,23 @@ function traefikAppData() {
         tab: 'routes',
         dashboardLoaded: false,
 
+        // alpha.12: session takeover. The backend allows ONE active editor at
+        // a time. On load() the UI POSTs /api/session/claim; a 409 surfaces a
+        // takeover prompt (or "View read-only" → viewMode='ro' disables every
+        // mutation). The SID is included as X-Session-Id on every mutating
+        // request; a 423 from the backend means our session was taken over
+        // from elsewhere — the UI shows a sticky toast with a Reload button.
+        sid: '',
+        viewMode: 'rw',                  // 'rw' = primary editor; 'ro' = read-only observer
+        takeoverPrompt: { visible: false, age: 0 },
+        sessionLost: false,              // true after a 423 from any mutation
+
+        // alpha.12: unified toast/notification queue. Success/info auto-fade
+        // after 4s; errors stick until the user dismisses them. Migrated from
+        // the six ad-hoc *Error / four *Ok state slots that used to live here.
+        toasts: [],
+        _toastUid: 0,
+
         // Configuration tab + wizard overlay share the same config object.
         // wizardOpen is shown on first-load when !configured, or when the
         // user clicks "Re-run setup wizard" on the Configuration page.
@@ -152,38 +169,36 @@ function traefikAppData() {
         state: blankState(),
         wizardOpen: false,
         savingConfig: false,
-        setupError: '',
-        setupOk: '',
         restartRequired: false,
         restarting: false,
-        restartError: '',
 
         // Phase 4 (0.9.0): HA Core restart triggered from the integration-
         // deploy banner. Distinct state from the addon-self-restart above so
         // both flows can run independently without UI confusion.
         restartingCore: false,
-        restartCoreError: '',
 
         // alpha.6: trusted_proxies quick-fix banner.
         fixingTrustedProxies: false,
-        trustedProxiesError: '',
         trustedProxiesFixed: false,
         showTpSnippet: false,
         // alpha.6: dismiss the "integration available" (State B) banner.
         dismissingIntegration: false,
 
+        // alpha.12: per-section load failure marker. When a loadX() fails, its
+        // key is set to the error message; the section renders a "Couldn't
+        // load — Reload to retry" panel and its Save button is disabled. This
+        // kills the C1 data-loss bug: a load failure can't slip into the save
+        // error slot and trick the user into clicking Save and clobbering the
+        // real config with an empty payload.
+        loadFailed: { config: '', routes: '', middlewares: '' },
+
         // Routes tab
         routes: [],
         saving: false,
-        saveError: '',
-        saveOk: '',
-        lastSavedAt: '',
 
         // Phase F: Middlewares tab
         middlewares: [],
         savingMw: false,
-        mwError: '',
-        mwOk: '',
 
         // Dashboard / status badge
         status: {},
@@ -191,6 +206,108 @@ function traefikAppData() {
         // alpha.10: per-route backend reachability (hostname -> up|down|unknown|
         // disabled), refreshed by pollStatus; drives the status dot per route.
         routeHealth: {},
+        // alpha.12: track consecutive backend poll failures so the UI can
+        // surface a sticky "backend unreachable" toast after 3 in a row (15s)
+        // and stop the status dots from lying green when /api/route-health
+        // can't actually be reached.
+        _pollFailCount: 0,
+        _pollFailToastId: 0,
+
+        // alpha.12: client-side validators mirroring the server (kept in one
+        // block so they stay trivially in sync with backend regexes). Each
+        // getter returns an error message string or '' when valid; bound from
+        // the template via x-text and used to gate Save buttons.
+        get cloudflareTokenError() {
+            const t = (this.config.cloudflare_token || '').trim();
+            // Empty = "keep existing" (backend honors this); not an error.
+            if (!t) return '';
+            return /^[A-Za-z0-9_-]{20,256}$/.test(t)
+                ? ''
+                : 'Must be 20–256 chars from A–Z, a–z, 0–9, _, - (no whitespace or newlines).';
+        },
+        get acmeEmailError() {
+            const e = (this.config.acme_email || '').trim();
+            if (!e) return 'Required.';
+            return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)
+                ? ''
+                : 'Looks like an invalid email address.';
+        },
+        get domainError() {
+            const d = (this.config.domain || '').trim().toLowerCase();
+            if (!d) return 'Required.';
+            return /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$/.test(d)
+                ? ''
+                : 'Looks like an invalid domain (use lowercase a–z, 0–9, -, and dots).';
+        },
+        _entrypointError(value) {
+            const v = (value || '').trim().toLowerCase();
+            if (!v) return 'Required.';
+            if (v === 'traefik') return '"traefik" is reserved.';
+            return /^[a-z][a-z0-9_-]{0,30}$/.test(v)
+                ? ''
+                : 'Must start with a–z, then up to 30 of a–z, 0–9, _, -.';
+        },
+        get entrypointHttpError() { return this._entrypointError(this.config.entrypoint_http); },
+        get entrypointHttpsError() { return this._entrypointError(this.config.entrypoint_https); },
+        get entrypointConflictError() {
+            return (this.config.entrypoint_http || '').trim().toLowerCase() ===
+                   (this.config.entrypoint_https || '').trim().toLowerCase()
+                ? 'HTTP and HTTPS entry-point names must differ.' : '';
+        },
+        // Aggregated guards — Configuration save and Wizard save use distinct
+        // field sets, so each has its own valid getter.
+        get configFormValid() {
+            return !this.entrypointHttpError && !this.entrypointHttpsError &&
+                   !this.entrypointConflictError && !this.cloudflareTokenError;
+        },
+        get wizardFormValid() {
+            // Wizard doesn't expose entry points or log level; just the four
+            // initial-config fields. Token may be blank only if one is already
+            // stored (preserve-existing) — backend tolerates blank on PUT.
+            const tokenOk = !this.cloudflareTokenError &&
+                            (this.config.cloudflare_token.trim() ||
+                             this.state.cloudflare_token_present);
+            return tokenOk && !this.acmeEmailError && !this.domainError;
+        },
+        // Auto-lowercase entry-point names on blur so the typed value matches
+        // what the server normalises to (avoids "I typed Web, why does it now
+        // say web?" confusion).
+        normalizeEntrypoint(field) {
+            const v = (this.config[field] || '').trim().toLowerCase();
+            if (this.config[field] !== v) this.config[field] = v;
+        },
+
+        // alpha.12: composite list of "HA Core restart needed" reasons,
+        // collapsing the previously-stacked three amber/sky banners into one
+        // banner with bullet points. Each reason carries a stable `key` (used
+        // as the x-for :key) and an optional `dismissable` flag for the
+        // "integration available" case which is a soft suggestion.
+        get coreRestartReasons() {
+            const reasons = [];
+            if (this.state.integration_pending_restart) {
+                reasons.push({
+                    key: 'integration-update',
+                    text: 'Reachability integration was updated.',
+                });
+            }
+            if (this.trustedProxiesFixed) {
+                reasons.push({
+                    key: 'trusted-proxies',
+                    text: 'configuration.yaml was updated (trusted_proxies).',
+                });
+            }
+            if (this.state.integration_available) {
+                reasons.push({
+                    key: 'integration-available',
+                    text: 'Reachability sensors are available to add (optional).',
+                    dismissable: true,
+                });
+            }
+            return reasons;
+        },
+        get coreRestartNeeded() {
+            return this.coreRestartReasons.length > 0;
+        },
 
         // Phase F: system routes render first in the table (and a colliding
         // user route would lose; see render.py for the matching invariant).
@@ -208,7 +325,140 @@ function traefikAppData() {
             );
         },
 
+        // ---------- alpha.12: toast queue ----------
+        // Lightweight notification API. Success/info auto-fade after `ttl` ms;
+        // errors are sticky by default (caller can override). Each toast has a
+        // stable _uid for the x-for :key so the DOM survives reorderings.
+        _pushToast({ kind, text, sticky = false, ttl = 4000 }) {
+            const id = ++this._toastUid;
+            const toast = { id, kind, text, sticky };
+            this.toasts.push(toast);
+            if (!sticky) {
+                setTimeout(() => this._dismissToast(id), ttl);
+            }
+            return id;
+        },
+        _dismissToast(id) {
+            const i = this.toasts.findIndex(t => t.id === id);
+            if (i >= 0) this.toasts.splice(i, 1);
+        },
+        get toast() {
+            return {
+                success: (text, opts = {}) => this._pushToast({ kind: 'success', text, ...opts }),
+                info:    (text, opts = {}) => this._pushToast({ kind: 'info',    text, ...opts }),
+                // Errors stick by default; the user explicitly dismisses.
+                error:   (text, opts = {}) => this._pushToast({ kind: 'error',   text, sticky: true, ...opts }),
+                dismiss: (id) => this._dismissToast(id),
+            };
+        },
+
+        // ---------- alpha.12: fetch wrapper ----------
+        // Auto-injects X-Session-Id on mutations so the backend's
+        // session_gate_mw doesn't 423 our own saves. Raises a tagged
+        // SessionLost-class Error on 423 so the caller can switch to the
+        // takeover toast instead of a generic save-failed message.
+        async api(method, path, body) {
+            const headers = {};
+            if (body !== undefined) headers['Content-Type'] = 'application/json';
+            if (this.sid && method !== 'GET') headers['X-Session-Id'] = this.sid;
+            const r = await fetch(this.url(path), {
+                method,
+                headers,
+                body: body !== undefined ? JSON.stringify(body) : undefined,
+            });
+            if (r.status === 423) {
+                const err = new Error('Your session was taken over from another tab or browser.');
+                err.code = 'SESSION_LOST';
+                this.onSessionLost();
+                throw err;
+            }
+            if (!r.ok) {
+                // alpha.11+ backend returns {"error": "..."} JSON for every error;
+                // fall back to the bare status if for some reason the body isn't JSON.
+                const j = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
+                throw new Error(j.error || `${method} ${path} -> ${r.status}`);
+            }
+            // 204 No Content would lack a body; aiohttp endpoints here always
+            // return JSON on success, but guard for future-proofing.
+            const ct = r.headers.get('Content-Type') || '';
+            if (ct.includes('application/json')) return await r.json();
+            return null;
+        },
+
+        // ---------- alpha.12: session ----------
+        async claimSession() {
+            // Best-effort: a failure here lets the user see "backend unreachable"
+            // via the toast / polling indicator rather than a hard error before
+            // anything else loads.
+            try {
+                const r = await fetch(this.url('/api/session/claim'), { method: 'POST' });
+                if (r.status === 409) {
+                    const j = await r.json().catch(() => ({}));
+                    this.takeoverPrompt = {
+                        visible: true,
+                        age: Math.max(0, Math.round(j.current_age_s || 0)),
+                    };
+                    return false;
+                }
+                if (!r.ok) {
+                    this.toast.error(`Couldn't claim editor session: HTTP ${r.status}. ` +
+                                     `Some saves may be rejected.`);
+                    return false;
+                }
+                const j = await r.json();
+                this.sid = j.sid || '';
+                this.viewMode = 'rw';
+                return true;
+            } catch (e) {
+                this.toast.error(`Couldn't reach add-on backend: ${e.message}`);
+                return false;
+            }
+        },
+        async takeover() {
+            // Force-become the active editor. The previous session's next
+            // mutation will 423 → its UI shows the SessionLost toast.
+            try {
+                const r = await fetch(this.url('/api/session/takeover'), { method: 'POST' });
+                if (!r.ok) throw new Error(`HTTP ${r.status}`);
+                const j = await r.json();
+                this.sid = j.sid || '';
+                this.viewMode = 'rw';
+                this.takeoverPrompt = { visible: false, age: 0 };
+                this.sessionLost = false;
+                this.toast.success('Session taken over; you are now the active editor.');
+                // Reload data with the new SID in case the prior editor saved
+                // mid-flight before we took over.
+                await this.loadConfig();
+                await this.loadRoutes();
+                await this.loadMiddlewares();
+            } catch (e) {
+                this.toast.error(`Take-over failed: ${e.message}`);
+            }
+        },
+        viewReadOnly() {
+            this.viewMode = 'ro';
+            this.takeoverPrompt = { visible: false, age: 0 };
+            this.toast.info('Read-only mode: another session is editing. Take over to make changes.');
+        },
+        onSessionLost() {
+            // Idempotent: only push the sticky toast once per session-loss event.
+            if (this.sessionLost) return;
+            this.sessionLost = true;
+            this.sid = '';
+            this.viewMode = 'ro';
+            this.toast.error(
+                'Your session was taken over from another tab or browser. ' +
+                'Reload to continue editing.',
+                { sticky: true }
+            );
+        },
+
         async load() {
+            // alpha.12: claim the editor session FIRST. If 409, the takeover
+            // modal appears; we still poll status so the user sees Traefik
+            // state, and we still load read data so the read-only view is
+            // populated.
+            await this.claimSession();
             // Always load config first so we can decide what to show.
             await this.loadConfig();
             // First-run UX: not configured -> open wizard. Underneath, put
@@ -226,9 +476,27 @@ function traefikAppData() {
             }
         },
 
+        // alpha.12: simple Tab/Shift+Tab cycle inside a modal panel. Bound
+        // on the wizard via @keydown.tab; cheaper than the Alpine focus plugin
+        // and covers the only modal we have today.
+        trapFocus(e, container) {
+            if (e.key !== 'Tab' || !container) return;
+            const focusables = container.querySelectorAll(
+                'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+            );
+            if (focusables.length === 0) return;
+            const first = focusables[0];
+            const last = focusables[focusables.length - 1];
+            if (e.shiftKey && document.activeElement === first) {
+                e.preventDefault();
+                last.focus();
+            } else if (!e.shiftKey && document.activeElement === last) {
+                e.preventDefault();
+                first.focus();
+            }
+        },
+
         openWizard() {
-            this.setupError = '';
-            this.setupOk = '';
             this.wizardOpen = true;
         },
 
@@ -237,20 +505,23 @@ function traefikAppData() {
         },
 
         async saveWizard() {
-            await this.saveConfig();
-            // saveConfig sets setupError on failure; only close the wizard
-            // when the save actually succeeded.
-            if (!this.setupError) {
-                this.wizardOpen = false;
-            }
+            // saveConfig returns true on success, false on failure (toast already
+            // shown). Only close the wizard on a real save.
+            const ok = await this.saveConfig();
+            if (ok) this.wizardOpen = false;
         },
 
         async loadConfig() {
-            this.setupError = '';
-            this.setupOk = '';
+            // alpha.12: failures land in loadFailed.config (NOT a shared
+            // save-error slot), so a stale load can't be "fixed" by clicking
+            // Save and overwriting the real config.
+            this.loadFailed.config = '';
             try {
                 const r = await fetch(this.url('/api/config'));
-                if (!r.ok) throw new Error(`GET /api/config -> ${r.status}`);
+                if (!r.ok) {
+                    const j = await r.json().catch(() => ({}));
+                    throw new Error(j.error || `GET /api/config -> ${r.status}`);
+                }
                 const j = await r.json();
                 // cloudflare_token always comes back empty; client treats the
                 // input as write-only (placeholder shows ••••• when set).
@@ -267,29 +538,40 @@ function traefikAppData() {
                 };
                 this.state = j.state || blankState();
             } catch (e) {
-                this.setupError = `Failed to load config: ${e}`;
+                this.loadFailed.config = e.message || String(e);
             }
         },
 
         async loadRoutes() {
-            this.saveError = '';
-            this.saveOk = '';
+            this.loadFailed.routes = '';
             try {
                 const r = await fetch(this.url('/api/routes'));
-                if (!r.ok) throw new Error(`GET /api/routes -> ${r.status}`);
+                if (!r.ok) {
+                    const j = await r.json().catch(() => ({}));
+                    throw new Error(j.error || `GET /api/routes -> ${r.status}`);
+                }
                 const j = await r.json();
                 if (j.domain && !this.config.domain) {
                     this.config.domain = j.domain;
                 }
                 this.routes = normalizeRoutes(j.routes);
             } catch (e) {
-                this.saveError = `Failed to load routes: ${e}`;
+                this.loadFailed.routes = e.message || String(e);
             }
         },
 
         async pollStatus() {
+            // alpha.12: every request carrying X-Session-Id refreshes the
+            // server-side heartbeat. We hit /api/status (Traefik check) and
+            // /api/state separately; both echo the header so a polling tab
+            // keeps its session alive without a dedicated heartbeat endpoint.
+            const sidHeader = this.sid ? { 'X-Session-Id': this.sid } : {};
+            // alpha.12: track backend reachability via /api/state (our own
+            // process, not Traefik). After 3 consecutive failures (15s), surface
+            // a sticky "backend unreachable" toast and clear the status dots.
+            let backendUp = false;
             try {
-                const r = await fetch(this.url('/api/status'));
+                const r = await fetch(this.url('/api/status'), { headers: sidHeader });
                 if (r.ok) {
                     this.status = await r.json();
                     this.status.traefik_up = true;
@@ -300,14 +582,46 @@ function traefikAppData() {
             } catch (_) {
                 this.status = { traefik_up: false };
             }
+            // /api/state isn't UI-visible from here but refreshes server-side
+            // last_seen and surfaces banner state changes (integration_pending,
+            // trusted_proxies_pending).
+            try {
+                const rs = await fetch(this.url('/api/state'), { headers: sidHeader });
+                if (rs.ok) {
+                    this.state = await rs.json();
+                    backendUp = true;
+                }
+            } catch (_) { /* ignore; backendUp stays false */ }
             // alpha.10: per-route backend reachability for the status dots.
             try {
-                const rh = await fetch(this.url('/api/route-health'));
+                const rh = await fetch(this.url('/api/route-health'), { headers: sidHeader });
                 if (rh.ok) {
                     const j = await rh.json();
                     this.routeHealth = j.health || {};
                 }
             } catch (_) { /* keep last-known on a blip */ }
+
+            // Backend-reachability bookkeeping.
+            if (backendUp) {
+                this._pollFailCount = 0;
+                if (this._pollFailToastId) {
+                    this.toast.dismiss(this._pollFailToastId);
+                    this._pollFailToastId = 0;
+                }
+            } else {
+                this._pollFailCount++;
+                if (this._pollFailCount >= 3) {
+                    // Reset routeHealth so the dots don't lie green when we
+                    // can't actually check.
+                    this.routeHealth = {};
+                    if (!this._pollFailToastId) {
+                        this._pollFailToastId = this.toast.error(
+                            'Cannot reach the add-on backend. Status indicators are stale.',
+                            { sticky: true }
+                        );
+                    }
+                }
+            }
         },
 
         // alpha.10: reachability of a route's backend, keyed by raw hostname.
@@ -334,9 +648,6 @@ function traefikAppData() {
 
         async saveConfig() {
             this.savingConfig = true;
-            this.setupError = '';
-            this.setupOk = '';
-            this.restartRequired = false;
             const payload = {
                 provider: this.config.provider,
                 // Empty token = "keep existing" (backend preserves the
@@ -352,24 +663,19 @@ function traefikAppData() {
                 force_ssl: !!this.config.force_ssl,
             };
             try {
-                const r = await fetch(this.url('/api/config'), {
-                    method: 'PUT',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload),
-                });
-                if (!r.ok) {
-                    const text = await r.text();
-                    throw new Error(`PUT /api/config -> ${r.status}: ${text}`);
-                }
-                const j = await r.json();
+                const j = await this.api('PUT', '/api/config', payload);
                 this.state = j.state || blankState();
                 this.restartRequired = !!j.restart_required;
                 // Wipe the token input back to empty: it's been saved
                 // (or preserved); the placeholder switches to ••••• now.
                 this.config.cloudflare_token = '';
-                this.setupOk = 'Configuration saved.';
+                this.toast.success('Configuration saved.');
+                return true;
             } catch (e) {
-                this.setupError = String(e);
+                if (e.code !== 'SESSION_LOST') {
+                    this.toast.error(`Couldn't save configuration: ${e.message}`);
+                }
+                return false;
             } finally {
                 this.savingConfig = false;
             }
@@ -388,12 +694,15 @@ function traefikAppData() {
             // the old "exit when !integration_pending_restart" condition fired on
             // the first poll (before Core even went down) and reloaded too early.
             this.restartingCore = true;
-            this.restartCoreError = '';
             try {
-                const r = await fetch(this.url('/api/restart-core'), { method: 'POST' });
+                const r = await fetch(this.url('/api/restart-core'), {
+                    method: 'POST',
+                    headers: this.sid ? { 'X-Session-Id': this.sid } : {},
+                });
+                if (r.status === 423) { this.onSessionLost(); return; }
                 if (!r.ok) {
-                    const text = await r.text();
-                    throw new Error(`POST /api/restart-core -> ${r.status}: ${text}`);
+                    const j = await r.json().catch(() => ({}));
+                    throw new Error(j.error || `POST /api/restart-core -> ${r.status}`);
                 }
                 const start = Date.now();
                 let sawDown = false;
@@ -412,9 +721,9 @@ function traefikAppData() {
                         return;
                     }
                 }
-                this.restartCoreError = 'Restart timed out after 120s. Refresh the page manually.';
+                this.toast.error('Restart timed out after 120s. Refresh the page manually.');
             } catch (e) {
-                this.restartCoreError = String(e);
+                this.toast.error(`Restart failed: ${e.message}`);
             } finally {
                 this.restartingCore = false;
             }
@@ -422,22 +731,26 @@ function traefikAppData() {
 
         async fixTrustedProxies() {
             // alpha.6: POST /api/fix-trusted-proxies. On success the backend has
-            // edited configuration.yaml; surface the "restart to apply" banner.
-            // On a 4xx bail the body carries the reason + manual snippet.
+            // edited configuration.yaml; the trustedProxiesFixed banner stays
+            // until the user clicks Restart HA Core.
             this.fixingTrustedProxies = true;
-            this.trustedProxiesError = '';
             this.trustedProxiesFixed = false;
             try {
-                const r = await fetch(this.url('/api/fix-trusted-proxies'), { method: 'POST' });
+                const r = await fetch(this.url('/api/fix-trusted-proxies'), {
+                    method: 'POST',
+                    headers: this.sid ? { 'X-Session-Id': this.sid } : {},
+                });
+                if (r.status === 423) { this.onSessionLost(); return; }
                 if (!r.ok) {
-                    const text = await r.text();
-                    throw new Error(text || `POST /api/fix-trusted-proxies -> ${r.status}`);
+                    const j = await r.json().catch(() => ({}));
+                    throw new Error(j.error || `POST /api/fix-trusted-proxies -> ${r.status}`);
                 }
                 this.trustedProxiesFixed = true;
                 // Detection re-reads the file; the pending banner clears on next poll.
                 this.state.trusted_proxies_pending = false;
+                this.toast.success('configuration.yaml updated; restart HA Core to apply.');
             } catch (e) {
-                this.trustedProxiesError = String(e);
+                this.toast.error(`Couldn't update configuration.yaml: ${e.message}`);
             } finally {
                 this.fixingTrustedProxies = false;
             }
@@ -449,11 +762,22 @@ function traefikAppData() {
             // so a future integration version re-surfaces it.
             this.dismissingIntegration = true;
             try {
-                const r = await fetch(this.url('/api/dismiss-integration'), { method: 'POST' });
-                if (r.ok) {
+                const r = await fetch(this.url('/api/dismiss-integration'), {
+                    method: 'POST',
+                    headers: this.sid ? { 'X-Session-Id': this.sid } : {},
+                });
+                if (r.status === 423) {
+                    this.onSessionLost();
+                } else if (r.ok) {
                     this.state.integration_available = false;
+                } else {
+                    // alpha.12: dismiss no longer silently swallows non-2xx.
+                    const j = await r.json().catch(() => ({}));
+                    this.toast.error(j.error || `Couldn't dismiss banner: HTTP ${r.status}`);
                 }
-            } catch (_) { /* best-effort; banner returns on next load if it failed */ }
+            } catch (e) {
+                this.toast.error(`Couldn't dismiss banner: ${e.message}`);
+            }
             finally {
                 this.dismissingIntegration = false;
             }
@@ -461,12 +785,13 @@ function traefikAppData() {
 
         async restartAddon() {
             this.restarting = true;
-            this.restartError = '';
             try {
                 // The supervisor may kill our backend mid-flight; treat
                 // network errors as the success path (request was sent).
-                await fetch(this.url('/api/restart'), { method: 'POST' })
-                    .catch(() => null);
+                await fetch(this.url('/api/restart'), {
+                    method: 'POST',
+                    headers: this.sid ? { 'X-Session-Id': this.sid } : {},
+                }).catch(() => null);
                 // Poll /api/status every 1s until the backend comes back.
                 // ~5-15s typical; bail at 60s.
                 const start = Date.now();
@@ -482,9 +807,9 @@ function traefikAppData() {
                         }
                     } catch (_) { /* still down; keep polling */ }
                 }
-                this.restartError = 'Restart timed out after 60s. Refresh the page manually.';
+                this.toast.error('Restart timed out after 60s. Refresh the page manually.');
             } catch (e) {
-                this.restartError = `Restart failed: ${e}`;
+                this.toast.error(`Restart failed: ${e.message}`);
             } finally {
                 this.restarting = false;
             }
@@ -505,12 +830,10 @@ function traefikAppData() {
 
         async save() {
             if (this.systemRowInvalid) {
-                this.saveError = 'HA system route has empty hostname; type one before saving (or disable it).';
+                this.toast.error('HA system route has empty hostname; type one before saving (or disable it).');
                 return;
             }
             this.saving = true;
-            this.saveError = '';
-            this.saveOk = '';
             const payload = {
                 routes: this.routes.map(r => {
                     const out = {
@@ -535,20 +858,12 @@ function traefikAppData() {
                 }),
             };
             try {
-                const r = await fetch(this.url('/api/routes'), {
-                    method: 'PUT',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload),
-                });
-                if (!r.ok) {
-                    const text = await r.text();
-                    throw new Error(`PUT /api/routes -> ${r.status}: ${text}`);
-                }
-                const j = await r.json();
-                this.saveOk = `Saved ${j.saved} route(s); Traefik reloaded.`;
-                this.lastSavedAt = new Date().toLocaleTimeString();
+                const j = await this.api('PUT', '/api/routes', payload);
+                this.toast.success(`Saved ${j.saved} route(s); Traefik reloaded.`);
             } catch (e) {
-                this.saveError = String(e);
+                if (e.code !== 'SESSION_LOST') {
+                    this.toast.error(`Couldn't save routes: ${e.message}`);
+                }
             } finally {
                 this.saving = false;
             }
@@ -556,15 +871,17 @@ function traefikAppData() {
 
         // ---------- Phase F: middlewares CRUD ----------
         async loadMiddlewares() {
-            this.mwError = '';
-            this.mwOk = '';
+            this.loadFailed.middlewares = '';
             try {
                 const r = await fetch(this.url('/api/middlewares'));
-                if (!r.ok) throw new Error(`GET /api/middlewares -> ${r.status}`);
+                if (!r.ok) {
+                    const j = await r.json().catch(() => ({}));
+                    throw new Error(j.error || `GET /api/middlewares -> ${r.status}`);
+                }
                 const j = await r.json();
                 this.middlewares = normalizeMiddlewares(j.middlewares);
             } catch (e) {
-                this.mwError = `Failed to load middlewares: ${e}`;
+                this.loadFailed.middlewares = e.message || String(e);
             }
         },
 
@@ -596,10 +913,15 @@ function traefikAppData() {
         },
 
         // alpha.9: skip-tls-verify only applies to https backends; drop it when
-        // the route's scheme is changed away from https.
+        // the route's scheme is changed away from https. alpha.12: surface a
+        // toast when the middleware is auto-removed so the user can see WHY
+        // their checkbox state changed.
         onRouteSchemeChange(route) {
-            if (route.scheme !== 'https') {
+            if (route.scheme !== 'https' &&
+                Array.isArray(route.middlewares) &&
+                route.middlewares.includes('skip-tls-verify')) {
                 this.toggleRouteMiddleware(route, 'skip-tls-verify', false);
+                this.toast.info('skip-tls-verify removed — it only applies to https backends.');
             }
         },
 
@@ -613,18 +935,29 @@ function traefikAppData() {
             if (i >= 0) this.middlewares.splice(i, 1);
         },
 
+        // alpha.12: replace the native confirm() with an inline confirmation
+        // step rendered inside the middleware card. confirm() blocks the event
+        // loop, looks alien inside the HA frontend, and isn't keyboard-friendly.
+        // The card now stores `_pendingType` while awaiting the user's choice.
         changeMiddlewareType(m, newType) {
             if (m.system) return;  // built-in type is locked
             if (newType === m.type) return;
-            // If the user has typed anything into the current config, confirm
-            // before discarding. Use a heuristic: any populated array OR any
-            // non-default scalar.
             const hasContent = JSON.stringify(m.config) !== JSON.stringify(emptyConfigFor(m.type));
-            if (hasContent && !confirm(
-                'Changing middleware type will discard the current configuration. Continue?'
-            )) {
+            if (hasContent) {
+                m._pendingType = newType;     // template renders the inline confirm strip
                 return;
             }
+            this._applyTypeChange(m, newType);
+        },
+        confirmTypeChange(m) {
+            if (!m._pendingType) return;
+            this._applyTypeChange(m, m._pendingType);
+            m._pendingType = null;
+        },
+        cancelTypeChange(m) {
+            m._pendingType = null;
+        },
+        _applyTypeChange(m, newType) {
             m.type = newType;
             // For basicAuth the empty shape is {users: []}; the UI's per-user
             // local state (_orig_username etc.) is set on add-user, not here.
@@ -667,8 +1000,6 @@ function traefikAppData() {
 
         async saveMiddlewares() {
             this.savingMw = true;
-            this.mwError = '';
-            this.mwOk = '';
             const payload = {
                 middlewares: this.middlewares.map(m => {
                     const out = { name: m.name, type: m.type };
@@ -710,22 +1041,15 @@ function traefikAppData() {
                 }),
             };
             try {
-                const r = await fetch(this.url('/api/middlewares'), {
-                    method: 'PUT',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload),
-                });
-                if (!r.ok) {
-                    const text = await r.text();
-                    throw new Error(`PUT /api/middlewares -> ${r.status}: ${text}`);
-                }
-                const j = await r.json();
-                this.mwOk = `Saved ${j.saved} middleware(s); Traefik reloaded.`;
+                const j = await this.api('PUT', '/api/middlewares', payload);
+                this.toast.success(`Saved ${j.saved} middleware(s); Traefik reloaded.`);
                 // Re-load to pick up server-side normalisations (CIDR rewrite,
                 // hashed passwords, _orig_username refresh).
                 await this.loadMiddlewares();
             } catch (e) {
-                this.mwError = String(e);
+                if (e.code !== 'SESSION_LOST') {
+                    this.toast.error(`Couldn't save middlewares: ${e.message}`);
+                }
             } finally {
                 this.savingMw = false;
             }

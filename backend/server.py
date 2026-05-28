@@ -21,9 +21,12 @@ import ipaddress
 import json
 import os
 import re
+import secrets
 import shutil
 import sys
+import time
 import traceback
+from dataclasses import dataclass
 from pathlib import Path
 
 import aiohttp
@@ -1552,6 +1555,131 @@ async def proxy_traefik_api(request):
     return await _proxy(request, f"{TRAEFIK_URL}/api/{tail}{qs}")
 
 
+# ---------- session (alpha.12) ----------
+# Single-writer concurrent-edit guard. The UI has multiple tabs/browsers; the
+# server allows ONE active edit session at a time. Mutating endpoints require
+# the caller's X-Session-Id to match the current session's SID; otherwise 423.
+# A second tab is prompted to "Take over" (which invalidates the current
+# session) or "View read-only" (no SID, all mutations forbidden).
+#
+# Heartbeat: any request carrying X-Session-Id refreshes last_seen if the SID
+# matches. The frontend's existing /api/state poll (every 5s) keeps the
+# session alive; no separate heartbeat endpoint needed. After SESSION_TTL of
+# no heartbeat, the session expires server-side and a new claim succeeds.
+SESSION_TTL = 60.0
+
+
+@dataclass
+class EditSession:
+    sid: str
+    last_seen: float
+
+
+class SessionManager:
+    def __init__(self) -> None:
+        self._current: EditSession | None = None
+
+    def _expire_if_stale(self, now: float) -> None:
+        if self._current and now - self._current.last_seen > SESSION_TTL:
+            self._current = None
+
+    def claim(self) -> tuple[bool, str | None, float]:
+        """Try to become the active editor. Returns (ok, sid, current_age_s).
+        ok=True: claim succeeded; `sid` is the new session id.
+        ok=False: another session is active; `sid` is None, current_age_s is
+                  how stale the current session looks (drives the UI prompt)."""
+        now = time.time()
+        self._expire_if_stale(now)
+        if self._current is None:
+            sid = secrets.token_urlsafe(24)
+            self._current = EditSession(sid=sid, last_seen=now)
+            return True, sid, 0.0
+        return False, None, now - self._current.last_seen
+
+    def takeover(self) -> str:
+        """Forcibly become the active editor; invalidates any prior session."""
+        now = time.time()
+        sid = secrets.token_urlsafe(24)
+        self._current = EditSession(sid=sid, last_seen=now)
+        return sid
+
+    def heartbeat(self, sid: str) -> bool:
+        """Refresh last_seen on match. Returns True if the SID was current."""
+        now = time.time()
+        self._expire_if_stale(now)
+        if self._current and self._current.sid == sid:
+            self._current.last_seen = now
+            return True
+        return False
+
+    def is_current(self, sid: str) -> bool:
+        now = time.time()
+        self._expire_if_stale(now)
+        return self._current is not None and self._current.sid == sid
+
+
+class _HTTPLocked(web.HTTPException):
+    """423 Locked: returned for mutating endpoints when X-Session-Id does not
+    match the current session. aiohttp 3.9 doesn't ship a built-in HTTPLocked,
+    so we subclass HTTPException directly. The json_error_mw wraps this as
+    JSON like any other HTTPException."""
+    status_code = 423
+
+
+# (method, path) of endpoints that REQUIRE X-Session-Id to match the current
+# session. Read endpoints, the session/claim/takeover endpoints themselves,
+# the SPA at /, the /static/ assets, and the dashboard proxy paths are all
+# UNGATED — multiple readers are fine; only writers need serializing.
+GATED_MUTATIONS: set[tuple[str, str]] = {
+    ("PUT", "/api/config"),
+    ("PUT", "/api/routes"),
+    ("PUT", "/api/middlewares"),
+    ("POST", "/api/fix-trusted-proxies"),
+    ("POST", "/api/dismiss-integration"),
+    ("POST", "/api/restart"),
+    ("POST", "/api/restart-core"),
+}
+
+
+@web.middleware
+async def session_gate_mw(request, handler):
+    """Heartbeat on every request carrying X-Session-Id; gate mutating
+    endpoints to the current session.
+
+    Registration order matters: this middleware runs INSIDE json_error_mw so
+    the _HTTPLocked we raise here gets wrapped as a JSON 423 response by the
+    outer middleware (single JSON-shape contract for the UI)."""
+    mgr: SessionManager = request.app["session_mgr"]
+    sid_header = request.headers.get("X-Session-Id", "")
+    if sid_header:
+        mgr.heartbeat(sid_header)
+    if (request.method, request.path) in GATED_MUTATIONS:
+        if not mgr.is_current(sid_header):
+            raise _HTTPLocked(
+                text="Session not current. Another tab or browser is editing; "
+                     "reload to claim a new session or take over."
+            )
+    return await handler(request)
+
+
+async def post_session_claim(request):
+    mgr: SessionManager = request.app["session_mgr"]
+    ok, sid, age = mgr.claim()
+    if ok:
+        return web.json_response({"sid": sid})
+    return web.json_response({"current_age_s": age}, status=409)
+
+
+async def post_session_takeover(request):
+    """Forcibly become the active session. UNGATED by design: a freshly
+    opened second tab has no current SID and still needs to be able to take
+    over. The UI surfaces this as an explicit 'Take over' button on the
+    "another session active" modal."""
+    mgr: SessionManager = request.app["session_mgr"]
+    sid = mgr.takeover()
+    return web.json_response({"sid": sid})
+
+
 # ---------- lifecycle ----------
 @web.middleware
 async def json_error_mw(request, handler):
@@ -1582,12 +1710,16 @@ async def json_error_mw(request, handler):
 async def client_session_ctx(app):
     app["client"] = aiohttp.ClientSession()
     app["save_lock"] = asyncio.Lock()
+    app["session_mgr"] = SessionManager()
     yield
     await app["client"].close()
 
 
 def make_app():
-    app = web.Application(middlewares=[json_error_mw])
+    # Middleware order: outermost first. json_error_mw wraps ALL responses
+    # (including the _HTTPLocked from session_gate_mw) as JSON; session_gate_mw
+    # then runs inside that wrap so its 423 flows through the JSON shape.
+    app = web.Application(middlewares=[json_error_mw, session_gate_mw])
     app.cleanup_ctx.append(client_session_ctx)
     app.router.add_get("/", serve_index)
     app.router.add_static("/static", str(WEB_ROOT / "static"))
@@ -1604,6 +1736,8 @@ def make_app():
     app.router.add_post("/api/restart-core", post_restart_core)
     app.router.add_post("/api/fix-trusted-proxies", post_fix_trusted_proxies)
     app.router.add_post("/api/dismiss-integration", post_dismiss_integration)
+    app.router.add_post("/api/session/claim", post_session_claim)
+    app.router.add_post("/api/session/takeover", post_session_takeover)
     # NOTE: /dashboard/api/* must register BEFORE /dashboard/* so it wins
     # the route match (aiohttp resolves in registration order). It catches
     # the dashboard SPA's monkey-patched API fetches and forwards to

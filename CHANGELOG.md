@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.1.0-alpha.12
+
+- New: unified notification system. Success and info messages auto-disappear
+  after a few seconds; errors stay until you dismiss them. Replaces the six
+  ad-hoc inline error/success panels.
+- New: concurrent-edit protection. If two tabs or browsers try to edit at the
+  same time, the second sees a "Take over | View read-only" prompt. Sessions
+  auto-expire after 60 s of inactivity.
+- New: "Couldn't load …" panel per section. If a section's data fails to
+  load, the form is hidden and Save is disabled until you reload — preventing
+  a stale load from being "fixed" by clicking Save and overwriting the real
+  config with an empty one. (This used to be a silent one-click data-loss
+  path on the Middlewares tab.)
+- New: composite "Home Assistant Core restart needed" banner that lists each
+  pending reason as a bullet. Replaces the previously-stacked three banners
+  (integration update, trusted-proxies fix, integration available).
+- New: full keyboard + screen-reader support on the setup wizard and the
+  route-middlewares dropdown. The wizard traps focus, closes on Escape,
+  and announces itself as a dialog; the multiselect is a proper ARIA
+  combobox (Arrow keys navigate, Space/Enter toggle, Escape closes).
+- New: inline form validation for entry-point names, Cloudflare token,
+  ACME email, and domain. Save is disabled until visible errors clear.
+- New: routes table now scrolls horizontally on narrow viewports (HA
+  Companion-friendly) instead of overflowing the page.
+- Improved: the middleware type-change confirmation is now an inline strip
+  inside the card instead of a native browser alert that blocks the page.
+- Improved: status dots and icon-only buttons now announce their meaning
+  to screen readers.
+- Improved: when the add-on backend can't be reached for 15 s, route status
+  dots fade to "unknown" (rather than lying green) and a sticky
+  "backend unreachable" notification appears.
+
 ## 0.1.0-alpha.11
 
 - Fixed: a crash or kernel-level interruption mid-save could leave the add-on's
