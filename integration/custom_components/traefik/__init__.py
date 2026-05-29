@@ -70,7 +70,13 @@ async def async_remove_config_entry_device(
 
     Returns True so HA always permits removal — a stale "Traefik route:
     <slug>" device (e.g. a route deleted while HA was down) can be cleaned up
-    by the user. A still-live route re-materialises its device on the next
-    coordinator cycle anyway.
+    by the user. We also drop the slug from known_slugs so a still-live route
+    can re-materialise on the next coordinator cycle; without this the
+    add-only reconcile would see slug ∈ known_slugs and skip re-adding,
+    leaving the user unable to bring the device back without an HA restart.
     """
+    data = entry.runtime_data
+    for domain, slug in device.identifiers:
+        if domain == DOMAIN:
+            data.known_slugs.discard(slug)
     return True

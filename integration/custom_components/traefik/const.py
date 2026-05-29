@@ -45,6 +45,18 @@ def get_loaded_content_hash() -> str | None:
     return _loaded_hash
 
 
+def loaded_content_hash_cached() -> tuple[bool, str | None]:
+    """Non-blocking peek at the snapshotted hash.
+
+    Returns (captured, value). When `captured` is True, callers may use
+    `value` directly on the event loop without dispatching an executor job
+    (saves one per coordinator poll once the first capture has happened).
+    When False, the caller must still go through get_loaded_content_hash()
+    in an executor to perform the first file read.
+    """
+    return _loaded_hash_captured, _loaded_hash
+
+
 def write_loaded_content_hash() -> None:
     """Persist the snapshotted loaded hash so the add-on banner can compare it
     against the deployed `.content_hash` (blocking; call via the executor)."""

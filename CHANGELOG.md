@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.0-alpha.13
+
+- Fixed: deleting a route's device from Home Assistant could leave the
+  sensor missing until next HA restart, even if the route was still live.
+  The integration now drops its internal record on device delete so the
+  sensor re-materialises on the next 30 s coordinator poll.
+- Fixed: a narrow race during add-on startup could log
+  "duplicate unique_id" warnings for reachability sensors. The setup path
+  now records known routes before wiring the entity-add callback.
+- Improved: the Repairs fix-flow now dispatches on `issue_id` (futureproofs
+  for additional issue kinds), and the coordinator skips a per-poll
+  executor dispatch for the already-snapshotted loaded content hash.
+
 ## 0.1.0-alpha.12
 
 - New: unified notification system. Success and info messages auto-disappear

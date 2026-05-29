@@ -21,6 +21,7 @@ from .const import (
     ISSUE_RESTART_REQUIRED,
     UPDATE_INTERVAL,
     get_loaded_content_hash,
+    loaded_content_hash_cached,
     read_content_hash,
 )
 
@@ -63,7 +64,13 @@ class TraefikCoordinator(DataUpdateCoordinator[dict[str, ServiceState]]):
         failure here must never break the reachability poll.
         """
         try:
-            loaded = await self.hass.async_add_executor_job(get_loaded_content_hash)
+            # After the first successful capture (during async_setup_entry's
+            # write_loaded_content_hash), the snapshot is a frozen module global —
+            # readable on the event loop without an executor dispatch. Skip the
+            # job in that hot path; only the deployed-hash read needs the executor.
+            captured, loaded = loaded_content_hash_cached()
+            if not captured:
+                loaded = await self.hass.async_add_executor_job(get_loaded_content_hash)
             deployed = await self.hass.async_add_executor_job(read_content_hash)
         except Exception as err:  # noqa: BLE001 - never let this break the poll
             _LOGGER.debug("restart-required check skipped: %s", err)

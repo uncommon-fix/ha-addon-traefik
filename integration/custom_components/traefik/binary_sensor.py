@@ -25,14 +25,17 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     data = entry.runtime_data
+    initial_slugs = sorted(data.coordinator.data or {})
+    # Populate known_slugs BEFORE wiring add_entities_cb. The coordinator's
+    # add-only reconcile reads (known_slugs, add_entities_cb) together — if a
+    # poll lands between assigning the callback and updating known_slugs, it
+    # would re-add the same slugs and HA logs duplicate-unique_id warnings.
+    data.known_slugs.update(initial_slugs)
     data.add_entities_cb = async_add_entities
-    initial = [
-        TraefikRouteReachable(data.coordinator, slug)
-        for slug in sorted(data.coordinator.data or {})
-    ]
-    if initial:
-        async_add_entities(initial)
-        data.known_slugs.update(s for s in data.coordinator.data or {})
+    if initial_slugs:
+        async_add_entities(
+            TraefikRouteReachable(data.coordinator, slug) for slug in initial_slugs
+        )
 
 
 class TraefikRouteReachable(CoordinatorEntity[TraefikCoordinator], BinarySensorEntity):
