@@ -6,7 +6,9 @@
   <meta name="ingress-path" content="{{INGRESS_PATH}}">
   <title>Traefik</title>
   <script src="{{INGRESS_PATH}}/static/tailwindcss-3.4.17.min.js"></script>
-  <script src="{{INGRESS_PATH}}/static/app.js"></script>
+  <!-- alpha.14: ?v=<addon-version> cache-buster so the browser fetches the
+       new bundle on every release without forcing a hard-refresh. -->
+  <script src="{{INGRESS_PATH}}/static/app.js?v={{APP_VERSION}}"></script>
   <script defer src="{{INGRESS_PATH}}/static/alpinejs-3.15.12.min.js"></script>
 </head>
 <body class="h-full bg-gray-50 text-gray-900 antialiased" x-data="traefikApp" x-init="load()" x-cloak>
@@ -399,13 +401,11 @@
                       <option value="http">http</option>
                       <option value="https">https</option>
                     </select>
-                    <!-- alpha.9: skip backend TLS verification (self-signed HTTPS
-                         backend). Toggles the skip-tls-verify built-in on this route. -->
+                    <!-- alpha.14: per-route skip-TLS-verify bool. Replaces the
+                         pre-alpha.14 magic-string middleware attachment. -->
                     <label x-show="r.scheme === 'https'"
                            class="flex items-center gap-1 text-[11px] text-gray-600">
-                      <input type="checkbox"
-                             :checked="(r.middlewares || []).includes('skip-tls-verify')"
-                             @change="toggleRouteMiddleware(r, 'skip-tls-verify', $event.target.checked)">
+                      <input type="checkbox" x-model="r.skip_tls_verify">
                       Skip TLS verify
                     </label>
                   </div>
@@ -497,7 +497,7 @@
                         </template>
                         <!-- Orphan refs: deleted middleware still attached; keep
                              visible (checked) so saving doesn't silently drop it. -->
-                        <template x-for="mw in (r.middlewares || []).filter(n => n !== 'skip-tls-verify' && !middlewares.some(m => m.name === n))" :key="'orphan-'+mw">
+                        <template x-for="mw in (r.middlewares || []).filter(n => !middlewares.some(m => m.name === n))" :key="'orphan-'+mw">
                           <li role="option" aria-selected="true"
                               @click="toggleRouteMiddleware(r, mw, false)"
                               class="flex items-center gap-1.5 py-0.5 px-1 cursor-pointer hover:bg-gray-50 rounded">
@@ -571,14 +571,16 @@
         </button>
       </div>
 
-      <div x-show="!loadFailed.middlewares && middlewares.length === 0" class="p-8 text-center text-gray-400 border border-dashed rounded">
+      <div x-show="!loadFailed.middlewares && visibleMiddlewares.length === 0" class="p-8 text-center text-gray-400 border border-dashed rounded">
         No middlewares yet. Click <span class="font-medium">Add middleware</span> to create one.
       </div>
 
       <div x-show="!loadFailed.middlewares" class="space-y-4">
-        <template x-for="m in middlewares" :key="m._uid">
-          <div class="border rounded p-4 bg-white"
-               x-show="!(config.force_ssl && m.name === 'redirect-to-https')">
+        <!-- alpha.14: list visibleMiddlewares (drops every entry that's
+             owned by a feature toggle elsewhere — see FEATURE_MANAGED_MIDDLEWARES
+             in app.js). One filter rule, one source of truth. -->
+        <template x-for="m in visibleMiddlewares" :key="m._uid">
+          <div class="border rounded p-4 bg-white">
             <div class="flex items-start gap-3 mb-3">
               <div class="flex-1">
                 <label class="block text-xs font-medium text-gray-600 mb-1">
@@ -704,15 +706,6 @@
               </label>
               <p class="text-xs text-gray-500">
                 Common use: attach to an HTTP route to force browsers to upgrade to HTTPS.
-              </p>
-            </div>
-
-            <!-- skipTlsVerify editor (built-in; no config) -->
-            <div x-show="m.type === 'skipTlsVerify'" class="border-t pt-3 mt-2">
-              <p class="text-xs text-gray-500">
-                No configuration. Attach <span class="font-mono">skip-tls-verify</span>
-                to a route to skip TLS verification of that route's HTTPS backend —
-                useful for backends with a self-signed certificate on the LAN.
               </p>
             </div>
 

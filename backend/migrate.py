@@ -41,19 +41,16 @@ REDIRECT_MW = {
     "config": {"scheme": "https", "permanent": True},
 }
 
-# alpha.7: a second built-in. `skip-tls-verify` (synthetic type skipTlsVerify,
-# no config) is attachable to a route; render.py translates it into a
-# serversTransport (insecureSkipVerify) so the route can front a self-signed
-# HTTPS backend. Unlike redirect-to-https it is NOT auto-attached anywhere — it's
-# a tool the user adds to a route on demand.
-SKIP_TLS_MW_NAME = "skip-tls-verify"
-SKIP_TLS_MW = {
-    "name": SKIP_TLS_MW_NAME,
-    "type": "skipTlsVerify",
-    "config": {},
-}
+# alpha.14: skip-tls-verify is no longer a middleware. It lives on the route
+# as a bool (`skip_tls_verify`); render.py reads it directly to apply the
+# service-level insecureSkipVerify transport. The one-shot strip migration
+# (_strip_skip_tls_middleware) cleans up pre-alpha.14 state on first boot.
+
+# Pre-alpha.14 name of the synthetic middleware that this release demotes.
+LEGACY_SKIP_TLS_MW_NAME = "skip-tls-verify"
+
 # name -> canonical type for every add-on-managed built-in.
-BUILTIN_MIDDLEWARES = [REDIRECT_MW, SKIP_TLS_MW]
+BUILTIN_MIDDLEWARES = [REDIRECT_MW]
 
 
 def _dump(data: dict) -> str:
@@ -202,13 +199,17 @@ def _ensure_middlewares_file() -> None:
 
 
 def _ensure_builtin_middlewares() -> None:
-    """alpha.7: reconcile-always — ensure every add-on-managed built-in exists in
-    /data/middlewares.yml with its canonical type. Idempotent and runs on every
-    start (no one-shot marker): built-ins are tools the add-on owns, so a missing
-    one (fresh install, or a pre-alpha.7 install lacking skip-tls-verify) is
-    seeded, and a wrong-typed one is fixed in place (user config preserved). Does
-    NOT attach anything to a route — redirect-to-https's one-time ha_self
-    attachment stays in _ensure_redirect_middleware()."""
+    """alpha.7 / alpha.14: reconcile-always — ensure every add-on-managed
+    built-in exists in /data/middlewares.yml with its canonical type.
+    Idempotent and runs on every start (no one-shot marker): built-ins are
+    tools the add-on owns, so a missing one (fresh install, or a pre-alpha.7
+    install) is seeded, and a wrong-typed one is fixed in place (user config
+    preserved). Does NOT attach anything to a route — redirect-to-https's
+    one-time ha_self attachment stays in _ensure_redirect_middleware().
+
+    alpha.14: list collapsed to redirect-to-https only; skip-tls-verify was
+    demoted to a per-route bool. _strip_skip_tls_middleware handles the
+    one-shot data migration."""
     if MIDDLEWARES_YML.exists():
         doc = yaml.safe_load(MIDDLEWARES_YML.read_text()) or {}
     else:
@@ -287,6 +288,74 @@ def _ensure_redirect_middleware() -> None:
     _atomic_write(CONFIG_YML, _dump(cfg))
 
 
+def _strip_skip_tls_middleware() -> None:
+    """alpha.14: demote `skip-tls-verify` from a synthetic middleware to a
+    per-route bool. Two steps, both atomic and idempotent:
+
+    1. Walk /data/routes.yml: for every route with `'skip-tls-verify'` in
+       middlewares, set `skip_tls_verify=True` and strip the magic string
+       from the list. Also backfill `skip_tls_verify: False` on every route
+       missing the key. Without this backfill the LOCKED-set check in
+       `_enforce_system_route_protection` compares `None` (on-disk missing
+       key) vs `False` (UI-sent default) and rejects every system-route PUT.
+    2. Walk /data/middlewares.yml: drop the `skip-tls-verify` entry.
+
+    No marker: the steady-state cost on a clean install is two yaml loads
+    that find nothing to change (no write, no log). The previous one-shot
+    marker design was over-engineering — and risky, because if alpha.13→14
+    set the marker BEFORE the backfill landed (as happened during dev), real
+    upgraders would have routes missing the bool and the LOCKED check would
+    bite them. Always running ensures convergence.
+    """
+    # Step 1: routes.yml — set the bool, strip the string, backfill defaults.
+    if ROUTES_YML.exists():
+        routes_doc = yaml.safe_load(ROUTES_YML.read_text()) or {}
+        routes = routes_doc.get("routes") or []
+        routes_changed = False
+        stripped = 0
+        for r in routes:
+            mws = r.get("middlewares") or []
+            had_legacy = LEGACY_SKIP_TLS_MW_NAME in mws
+            if had_legacy:
+                r["middlewares"] = [m for m in mws if m != LEGACY_SKIP_TLS_MW_NAME]
+                r["skip_tls_verify"] = True
+                routes_changed = True
+                stripped += 1
+            elif "skip_tls_verify" not in r:
+                r["skip_tls_verify"] = False
+                routes_changed = True
+        if routes_changed:
+            routes_doc["routes"] = routes
+            _atomic_write(ROUTES_YML, _dump(routes_doc))
+            if stripped:
+                print(
+                    f"migrate: alpha.14 — moved skip-tls-verify to "
+                    f"route.skip_tls_verify on {stripped} route(s); "
+                    "backfilled the field on the rest",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    "migrate: alpha.14 — backfilled "
+                    "route.skip_tls_verify=False on routes missing the field",
+                    file=sys.stderr,
+                )
+
+    # Step 2: middlewares.yml — drop the entry if present.
+    if MIDDLEWARES_YML.exists():
+        mw_doc = yaml.safe_load(MIDDLEWARES_YML.read_text()) or {}
+        mws = mw_doc.get("middlewares") or []
+        new_mws = [m for m in mws if m.get("name") != LEGACY_SKIP_TLS_MW_NAME]
+        if len(new_mws) != len(mws):
+            mw_doc["middlewares"] = new_mws
+            _atomic_write(MIDDLEWARES_YML, _dump(mw_doc))
+            print(
+                "migrate: alpha.14 — removed skip-tls-verify from "
+                "/data/middlewares.yml (now a per-route bool)",
+                file=sys.stderr,
+            )
+
+
 def main() -> int:
     # Phase A-E bootstrap: routes + config from options.json (or empty defaults).
     bootstrap_rc = 0
@@ -336,6 +405,11 @@ def main() -> int:
         _ensure_redirect_middleware()
     except Exception as e:
         print(f"migrate: redirect middleware step failed: {e}", file=sys.stderr)
+        bootstrap_step_rc = 1
+    try:
+        _strip_skip_tls_middleware()
+    except Exception as e:
+        print(f"migrate: skip-tls-verify migration failed: {e}", file=sys.stderr)
         bootstrap_step_rc = 1
 
     return bootstrap_rc or bootstrap_step_rc

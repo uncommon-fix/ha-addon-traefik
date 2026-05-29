@@ -42,6 +42,11 @@ WEB_ROOT = Path("/usr/share/traefik-web")
 RENDER_PY = "/usr/local/bin/render.py"
 TRAEFIK_URL = "http://127.0.0.1:8090"
 RENDER_TIMEOUT = 10.0
+# alpha.14: addon version, exported by the Dockerfile (ENV ADDON_VERSION=${BUILD_VERSION}).
+# Used as a query-string cache-buster on the app.js <script src> so users get the
+# new bundle on every release without hard-refresh. Fail-fast at import: a
+# misconfigured build is louder than a literal "{{APP_VERSION}}" rendered to HTML.
+ADDON_VERSION = os.environ["ADDON_VERSION"]
 # "Restart required" is content-based: cont-init writes .content_hash (the
 # deployed integration content) and the integration writes .loaded_content_hash
 # (what it actually loaded) — both under /config. Pending == they differ (or
@@ -148,6 +153,12 @@ ROUTE_TYPES = {
     # Phase E: per-route healthCheck.path override. Optional; renderer
     # defaults to "/" when absent or empty.
     "health_path": (str, type(None)),
+    # alpha.14: per-route "skip TLS verification on the backend" flag. Replaces
+    # the alpha.7 model where this was a magic-string middleware attachment;
+    # `skip-tls-verify` was never a real Traefik middleware (render translates
+    # it into a service-level serversTransport), so it now lives where it
+    # belongs — on the route. Optional; renderer defaults to False when absent.
+    "skip_tls_verify": bool,
     # Phase F: marks routes seeded/managed by the add-on (currently only
     # "ha_self"). Absent on user routes. User PUTs that try to set or change
     # this field on existing system routes are rejected; only the hostname
@@ -156,20 +167,16 @@ ROUTE_TYPES = {
 }
 
 # Phase F (0.7.0): middleware definitions surface.
-# alpha.7: skipTlsVerify is a synthetic type — it carries no Traefik middleware;
-# the renderer translates a route's skipTlsVerify middleware into a service-level
-# serversTransport (insecureSkipVerify) so a route can front a self-signed HTTPS
-# backend. It has no config.
 ALLOWED_MIDDLEWARE_TYPES = {
-    "basicAuth", "ipAllowList", "redirectScheme", "headers", "skipTlsVerify",
+    "basicAuth", "ipAllowList", "redirectScheme", "headers",
 }
 # alpha.7: add-on-managed built-ins. Server is the source of truth for
 # "system-ness" (never trust a client flag): these names map to their canonical
 # type, cannot be deleted or retyped via the UI/API, and are reconciled on every
 # start by migrate.py. Their config is still user-editable where the type allows.
+# alpha.14: skip-tls-verify removed (moved to route.skip_tls_verify bool).
 SYSTEM_MIDDLEWARE_NAMES = {
     "redirect-to-https": "redirectScheme",
-    "skip-tls-verify": "skipTlsVerify",
 }
 MIDDLEWARE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,30}$")
 # Reserved as a UX choice (not a Traefik correctness requirement -- bare names
@@ -278,8 +285,12 @@ def _enforce_system_route_protection(incoming: list, existing: list) -> None:
                      "system routes are managed by the add-on"
             )
     # No new system routes via the UI; locked fields must match on-disk.
+    # alpha.14: skip_tls_verify added — toggling skip-TLS on the HA backend
+    # would be both nonsensical (it's not an HTTPS backend) and a trust-boundary
+    # issue if a client could mutate it.
     LOCKED = {"system", "backend_kind", "backend_host", "backend_port",
-              "scheme", "tls", "enabled", "middlewares", "health_path"}
+              "scheme", "tls", "enabled", "middlewares", "health_path",
+              "skip_tls_verify"}
     for kind, new in incoming_systems.items():
         if kind not in existing_systems:
             raise web.HTTPBadRequest(
@@ -504,14 +515,6 @@ async def _validate_middlewares(body, existing_defs: list) -> list:
             raise web.HTTPBadRequest(
                 text=f"middleware[{i}].type: must be one of {sorted(ALLOWED_MIDDLEWARE_TYPES)}"
             )
-        # skipTlsVerify is a built-in-only synthetic type (renders to a service
-        # serversTransport, not a Traefik middleware). Don't let users mint new
-        # ones under arbitrary names.
-        if typ == "skipTlsVerify" and name not in SYSTEM_MIDDLEWARE_NAMES:
-            raise web.HTTPBadRequest(
-                text=f"middleware[{i}].type: skipTlsVerify is reserved for the "
-                     "built-in 'skip-tls-verify' middleware"
-            )
         cfg = mw.get("config")
         if typ == "basicAuth":
             existing_users = _existing_basicauth_users_by_name(existing_defs, name)
@@ -522,8 +525,6 @@ async def _validate_middlewares(body, existing_defs: list) -> list:
             cfg_out = _validate_redirectScheme(cfg, i)
         elif typ == "headers":
             cfg_out = _validate_headers(cfg, i)
-        elif typ == "skipTlsVerify":
-            cfg_out = {}  # no configuration
         else:
             raise web.HTTPInternalServerError(text="unreachable")
         out.append({"name": name, "type": typ, "config": cfg_out})
@@ -576,7 +577,7 @@ def _load_middlewares_yml() -> list:
 def _system_default_config(name: str) -> dict:
     if name == "redirect-to-https":
         return {"scheme": "https", "permanent": True}
-    return {}  # skip-tls-verify and any future no-config built-in
+    return {}
 
 
 def _reinject_system_middlewares(defs: list, existing: list) -> list:
@@ -1031,8 +1032,10 @@ async def serve_index(request):
     raw = request.headers.get("X-Ingress-Path", "")
     ingress_path = raw if INGRESS_RE.match(raw) else ""
     ingress_path = _html.escape(ingress_path.rstrip("/"), quote=True)
-    html_text = (WEB_ROOT / "index.html").read_text().replace(
-        "{{INGRESS_PATH}}", ingress_path
+    html_text = (
+        (WEB_ROOT / "index.html").read_text()
+        .replace("{{INGRESS_PATH}}", ingress_path)
+        .replace("{{APP_VERSION}}", ADDON_VERSION)
     )
     resp = web.Response(text=html_text, content_type="text/html")
     # Same-origin iframe lock (HA ingress is same-origin to our SPA).

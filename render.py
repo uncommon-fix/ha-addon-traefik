@@ -35,8 +35,9 @@ ROUTES_OUT = DYNAMIC_DIR / "routes.yml"
 HA_INTERNAL_HOST = "homeassistant"
 HA_INTERNAL_PORT = 8123
 
-# alpha.7: shared serversTransport for routes carrying the skip-tls-verify
-# built-in. SERVERS_TRANSPORT_REF must be @file-qualified — a bare name resolves
+# alpha.7 / alpha.14: shared serversTransport for routes with skip_tls_verify
+# set (was a magic-string middleware attachment pre-alpha.14; now a per-route
+# bool). SERVERS_TRANSPORT_REF must be @file-qualified — a bare name resolves
 # to @internal and Traefik errors. The map KEY under http.serversTransports is
 # the bare name; only the service's reference is qualified.
 SERVERS_TRANSPORT_NAME = "insecure-skip-verify"
@@ -395,20 +396,15 @@ def _build_dynamic(opts: dict[str, Any]) -> tuple[dict[str, Any], int, int]:
             skipped += 1
             continue
         route_mws = [m for m in (route.get("middlewares") or []) if m]
-        # Split by resolved type (order-preserving), three ways:
+        # Split by resolved type (order-preserving), two ways:
         #  - redirectScheme: drives a separate web-entrypoint redirect router
         #    (keeping redirect OFF the websecure router avoids an https->https
         #    308 loop);
-        #  - skipTlsVerify (alpha.7): NOT a Traefik middleware — translated into
-        #    the service's serversTransport below; excluded from the router here
-        #    so Traefik never sees it as an (undefined) router middleware;
         #  - everything else stays on the main router, in order.
+        # alpha.14: skip-TLS-verify is no longer a middleware — read the bool
+        # at route level and apply directly to the service transport below.
         redirect_mws = [m for m in route_mws if mw_type.get(m) == "redirectScheme"]
-        skip_mws = [m for m in route_mws if mw_type.get(m) == "skipTlsVerify"]
-        other_mws = [
-            m for m in route_mws
-            if mw_type.get(m) not in ("redirectScheme", "skipTlsVerify")
-        ]
+        other_mws = [m for m in route_mws if mw_type.get(m) != "redirectScheme"]
 
         router: dict[str, Any] = {
             "rule": f"Host(`{hostname}`)",
@@ -461,10 +457,11 @@ def _build_dynamic(opts: dict[str, Any]) -> tuple[dict[str, Any], int, int]:
                 "timeout": "5s",
             },
         }
-        # alpha.7: skip-tls-verify built-in -> service serversTransport that
-        # disables backend cert verification (lets a route front a self-signed
-        # HTTPS backend). No-op on http backends. Coexists with healthCheck.
-        if skip_mws:
+        # alpha.14: per-route skip-TLS-verify bool -> service serversTransport
+        # that disables backend cert verification (lets a route front a
+        # self-signed HTTPS backend). No-op on http backends. Coexists with
+        # healthCheck. (Was a magic-string middleware attachment pre-alpha.14.)
+        if bool(route.get("skip_tls_verify")):
             load_balancer["serversTransport"] = SERVERS_TRANSPORT_REF
             uses_skip_transport = True
         services[slug] = {"loadBalancer": load_balancer}

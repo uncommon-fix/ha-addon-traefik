@@ -29,10 +29,30 @@ function makeBlankRoute() {
         middlewares: [],
         // Phase E: per-route healthCheck.path override; null = renderer default ("/").
         health_path: null,
+        // alpha.14: skip-TLS-verify on the backend (used to be a magic-string
+        // middleware attachment; now an honest per-route bool). Drives the
+        // service-level insecureSkipVerify transport in render.py.
+        skip_tls_verify: false,
         // makeBlankRoute does NOT set `system` -- user routes only.
         // The HA system route is seeded by migrate.py and persisted in routes.yml.
     };
 }
+
+// alpha.14: single source of truth for "this middleware is owned by a
+// feature toggle, hide it from the relevant UI surface." Both filter sites
+// (route dropdown + Middlewares tab list) consult this table. Adding a future
+// feature-managed middleware = one entry here, no scattered edits.
+const FEATURE_MANAGED_MIDDLEWARES = {
+    'redirect-to-https': {
+        // Hide from the Middlewares tab always: its two params
+        // (scheme=https, permanent=true) are not user-knobs in practice;
+        // migrate.py sets the canonical defaults.
+        hideFromTab: () => true,
+        // Hide from the per-route dropdown when force_ssl is on
+        // (force_ssl globalises redirection at the entrypoint level).
+        hideFromDropdown: (config) => !!(config && config.force_ssl),
+    },
+};
 
 function normalizeRoutes(routes) {
     return (routes || []).map(r => Object.assign(makeBlankRoute(), r, {
@@ -99,8 +119,9 @@ function normalizeMiddlewares(defs) {
             cfg = { sourceRange: (cfg.sourceRange || []).slice() };
         }
         // redirectScheme: shape is already flat {scheme, permanent}.
-        // skipTlsVerify: no config ({}). system flag (add-on built-in) is
-        // server-derived; the UI uses it to gray/lock the card.
+        // alpha.14: skipTlsVerify no longer exists as a middleware type.
+        // system flag (add-on built-in) is server-derived; the UI uses it to
+        // gray/lock the card.
         return { _uid: ++_mwUid, name: m.name, type, config: cfg, system: !!m.system };
     });
 }
@@ -894,34 +915,42 @@ function traefikAppData() {
             else if (!checked && i !== -1) route.middlewares.splice(i, 1);
         },
 
-        // alpha.9: middlewares selectable in a route's dropdown. Excludes
-        // skip-tls-verify (its own per-route checkbox when scheme=https) and
-        // redirect-to-https when Force SSL is on (applied globally instead).
+        // alpha.14: middlewares selectable in a route's dropdown — drops every
+        // FEATURE_MANAGED_MIDDLEWARES entry whose hideFromDropdown predicate
+        // returns true for the current config (currently: redirect-to-https
+        // when force_ssl is on; the entrypoint-level redirect supersedes it).
         eligibleRouteMiddlewares() {
             return this.middlewares.filter(m => {
-                if (m.name === 'skip-tls-verify') return false;
-                if (m.name === 'redirect-to-https' && this.config.force_ssl) return false;
-                return true;
+                const rule = FEATURE_MANAGED_MIDDLEWARES[m.name];
+                return !(rule && rule.hideFromDropdown(this.config));
             });
         },
 
-        // alpha.9: summary text for the compact route-middlewares dropdown
-        // (skip-tls-verify is shown via the scheme checkbox, not here).
+        // alpha.14: middlewares shown in the Middlewares tab list — drops
+        // every entry whose hideFromTab predicate returns true (currently:
+        // redirect-to-https unconditionally; user-managed via route dropdown +
+        // force_ssl toggle, not a Tab row). The migration step also removes
+        // skip-tls-verify entirely so it never reaches the UI.
+        get visibleMiddlewares() {
+            return this.middlewares.filter(m => {
+                const rule = FEATURE_MANAGED_MIDDLEWARES[m.name];
+                return !(rule && rule.hideFromTab(this.config));
+            });
+        },
+
+        // Summary text for the compact route-middlewares dropdown trigger.
         routeMwSummary(route) {
-            const names = (route.middlewares || []).filter(n => n !== 'skip-tls-verify');
+            const names = route.middlewares || [];
             return names.length ? names.join(', ') : 'No middlewares';
         },
 
-        // alpha.9: skip-tls-verify only applies to https backends; drop it when
-        // the route's scheme is changed away from https. alpha.12: surface a
-        // toast when the middleware is auto-removed so the user can see WHY
-        // their checkbox state changed.
+        // alpha.14: skip-TLS-verify only applies to https backends; clear the
+        // bool when the route's scheme is changed away from https, and surface
+        // a toast so the user can see WHY their checkbox state changed.
         onRouteSchemeChange(route) {
-            if (route.scheme !== 'https' &&
-                Array.isArray(route.middlewares) &&
-                route.middlewares.includes('skip-tls-verify')) {
-                this.toggleRouteMiddleware(route, 'skip-tls-verify', false);
-                this.toast.info('skip-tls-verify removed — it only applies to https backends.');
+            if (route.scheme !== 'https' && route.skip_tls_verify) {
+                route.skip_tls_verify = false;
+                this.toast.info('Skip TLS verify turned off — it only applies to https backends.');
             }
         },
 

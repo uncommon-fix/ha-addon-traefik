@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.1.0-alpha.14
+
+- Changed: **Skip TLS verify** is now a per-route property, not a middleware.
+  The checkbox under each route's scheme (visible when scheme is `https`)
+  is the only place that controls it. The old "Built-in" `skip-tls-verify`
+  row has been removed from the Middlewares tab — there was nothing to
+  configure there. Existing routes are migrated automatically on first boot;
+  no action required.
+- Changed: the `redirect-to-https` "Built-in" row no longer appears on the
+  Middlewares tab either. Its two parameters (`scheme: https`, `permanent:
+  true`) aren't user-knobs in practice — the add-on sets the canonical
+  defaults — and it's still toggled per route via the route middlewares
+  dropdown (and superseded globally by **Force SSL**).
+- Fixed: the browser used to keep the previous release's `app.js` cached
+  across updates, so the UI looked broken until you hard-refreshed.
+  Each release now busts the cache automatically.
+- Internal: removed the "system middleware" / "synthetic middleware-type"
+  scaffolding that backed the previous skip-tls-verify model. The route
+  schema's new `skip_tls_verify: bool` field is the single source of truth;
+  the renderer reads it directly.
+
 ## 0.1.0-alpha.13
 
 - Fixed: deleting a route's device from Home Assistant could leave the
