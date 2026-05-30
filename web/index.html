@@ -591,12 +591,24 @@
                         </template>
                         <input type="text"
                                @keydown="onTagInputKey(item.r, $event)"
-                               placeholder="add tag, Enter to commit"
+                               @input="if (_tagErrors[item.r._uid]) _tagErrors[item.r._uid] = ''"
+                               placeholder="add tag, Enter or comma to commit"
                                maxlength="32"
-                               class="border rounded px-2 py-0.5 text-xs w-44 font-mono bg-white">
+                               :class="_tagErrors[item.r._uid] ? 'border-red-400 bg-red-50' : 'bg-white'"
+                               class="border rounded px-2 py-0.5 text-xs w-56 font-mono">
                       </div>
-                      <p class="text-[10px] text-gray-400 mt-0.5">
-                        A–Z, 0–9, dot, underscore, hyphen, space. ≤32 chars per tag.
+                      <!-- alpha.17: inline rejection feedback. Set by
+                           onTagInputKey when input fails validation (too long /
+                           illegal chars / duplicate / empty) — replaces the
+                           alpha.16 silent no-op that left users wondering why
+                           their tag didn't appear. -->
+                      <p x-show="_tagErrors[item.r._uid]" x-transition
+                         class="text-[10px] text-red-700 mt-0.5"
+                         x-text="_tagErrors[item.r._uid]"></p>
+                      <p x-show="!_tagErrors[item.r._uid]"
+                         class="text-[10px] text-gray-400 mt-0.5">
+                        A–Z, 0–9, dot, underscore, hyphen, space. ≤32 chars per
+                        tag. Comma-separate to add multiple.
                       </p>
                     </div>
 

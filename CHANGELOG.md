@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.0-alpha.17
+
+- Fixed: the tag editor silently swallowed invalid input — typing a tag
+  with disallowed characters (or pasting `foo,bar` expecting two tags)
+  produced zero chips and no feedback. The editor now shows an inline
+  red error explaining what was rejected and why, and `foo,bar` correctly
+  becomes two tags.
+- Fixed: the Home Assistant system route could get visually demoted
+  below a freshly-added (still-unnamed) user route when the group sorted
+  alphabetically by hostname. System rows now pin to the top of their
+  group regardless of name.
+- Changed: external routes with no host set group under "External
+  backend (no host set)" instead of the terse "(no host)".
+
 ## 0.1.0-alpha.16
 
 - **Routes tab redesigned.** Every route now renders as a one-line compact

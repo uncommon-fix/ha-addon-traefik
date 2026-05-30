@@ -237,10 +237,13 @@ function traefikAppData() {
         // _saveUiPref so the user's view sticks across reloads.
         groupBy: 'externalTarget',
         collapsedGroups: new Set(),
-        // alpha.16: per-route in-progress tag-input buffer, keyed by route
-        // _uid. Held outside the route object so it doesn't leak into the
-        // save() payload. addTag()/onTagInputKey clear the buffer on commit.
-        _tagInputs: {},
+        // alpha.17: per-route tag-editor error message, keyed by route _uid.
+        // Set by onTagInputKey when an add fails (empty / too long / bad
+        // chars / duplicate); rendered inline beneath the tag input so the
+        // user sees WHY their input was rejected. Cleared on the next
+        // successful add or when the input is cleared. Held outside the
+        // route object so it doesn't leak into the save() payload.
+        _tagErrors: {},
 
         // Phase F: Middlewares tab
         middlewares: [],
@@ -387,7 +390,14 @@ function traefikAppData() {
                 }
                 if (this.groupBy === 'externalTarget') {
                     if (r.backend_kind === 'external') {
-                        const host = (r.backend_host || '').trim() || '(no host)';
+                        const host = (r.backend_host || '').trim();
+                        // alpha.17: nicer empty-host label (was "(no host)
+                        // (1)", terse and ugly). The key stays distinct so
+                        // multiple empty-host routes still co-group.
+                        if (!host) {
+                            return { key: 'ext:_empty',
+                                     label: 'External backend (no host set)' };
+                        }
                         return { key: 'ext:' + host, label: host };
                     }
                     return { key: 'ha', label: 'Home Assistant' };
@@ -410,11 +420,17 @@ function traefikAppData() {
                 g.routes.push(r);
                 g.count++;
             }
-            // Sort routes within each group: alphabetical by hostname.
+            // Sort routes within each group: system routes pinned to top,
+            // then alphabetical by hostname. alpha.17: without the system
+            // pin, a freshly-added user route with an empty hostname sorts
+            // BEFORE "hass" alphabetically and the HA self-route gets
+            // shoved down.
             for (const g of groups.values()) {
-                g.routes.sort((a, b) =>
-                    (a.hostname || '').localeCompare(b.hostname || '')
-                );
+                g.routes.sort((a, b) => {
+                    if (a.system && !b.system) return -1;
+                    if (!a.system && b.system) return 1;
+                    return (a.hostname || '').localeCompare(b.hostname || '');
+                });
             }
             // Order the groups: HA pinned to top, then alphabetical by label.
             // "Untagged" sinks to the bottom (least interesting bucket).
@@ -510,38 +526,69 @@ function traefikAppData() {
             r._expanded = !r._expanded;
         },
 
-        // alpha.16: tag editor commit. Trim, lowercase-dedupe against existing,
-        // validate against ROUTE_TAG_RE shape (mirrors server). Empty / invalid
-        // / duplicate inputs are silent no-ops at the client; the server still
-        // enforces the same rules on Save so a hand-PUT can't bypass them.
+        // alpha.16 / alpha.17: tag editor commit. Trim, lowercase-dedupe
+        // against existing, validate against ROUTE_TAG_RE shape (mirrors
+        // server). Returns '' on success or a human-readable error string —
+        // onTagInputKey surfaces the error inline so users see WHY a tag
+        // was rejected (alpha.16's silent no-op was a UX bug). Server
+        // still enforces the same rules so a hand-PUT can't bypass them.
         addTag(r, raw) {
             const t = (raw || '').trim();
-            if (!t) return false;
-            if (t.length > 32) return false;
-            if (!/^[A-Za-z0-9._ -]+$/.test(t)) return false;
+            if (!t) return 'empty';
+            if (t.length > 32) return `too long (max 32 chars; got ${t.length})`;
+            if (!/^[A-Za-z0-9._ -]+$/.test(t)) {
+                return 'must be letters, digits, dot, underscore, hyphen, or space';
+            }
             if (!Array.isArray(r.tags)) r.tags = [];
-            if (r.tags.some(x => x.toLowerCase() === t.toLowerCase())) return false;
+            if (r.tags.some(x => x.toLowerCase() === t.toLowerCase())) {
+                return `already tagged "${t}"`;
+            }
             r.tags.push(t);
-            return true;
+            return '';
         },
         removeTag(r, tag) {
             if (!Array.isArray(r.tags)) return;
             const i = r.tags.indexOf(tag);
             if (i >= 0) r.tags.splice(i, 1);
         },
+        // alpha.17: tag-editor input handler. Commits on Enter or comma.
+        // Comma-splits the buffer so users can paste/type `foo,bar,baz` and
+        // get three tags (alpha.16 fed the whole string to addTag and the
+        // commas tripped the regex, so the input rejected everything).
         onTagInputKey(r, event) {
-            // Commit on Enter or comma; otherwise let the event pass through
-            // so the input keeps typing.
             const key = event.key;
             if (key !== 'Enter' && key !== ',') return;
             event.preventDefault();
             const input = event.target;
-            if (this.addTag(r, input.value)) {
+            const parts = input.value
+                .split(',').map(s => s.trim()).filter(Boolean);
+            if (!parts.length) {
+                // Empty / whitespace-only: clear input + clear any prior
+                // error (the user hit Enter intending to commit nothing).
                 input.value = '';
+                this._tagErrors[r._uid] = '';
+                return;
+            }
+            const errors = [];
+            let anyAdded = false;
+            for (const part of parts) {
+                const err = this.addTag(r, part);
+                if (err) errors.push(`"${part}": ${err}`);
+                else anyAdded = true;
+            }
+            if (!errors.length) {
+                input.value = '';
+                this._tagErrors[r._uid] = '';
             } else {
-                // Invalid: brief visual nudge via CSS class the template
-                // can opt into. Simplest signal — clear the input only on
-                // success so the user can see what was rejected.
+                // Drop the parts that succeeded so the input only contains
+                // what still needs the user's attention. If everything
+                // failed, leave the input intact.
+                if (anyAdded) {
+                    input.value = errors
+                        .map(e => e.match(/^"([^"]+)":/)?.[1] || '')
+                        .filter(Boolean).join(', ');
+                }
+                this._tagErrors[r._uid] = errors.join('; ');
             }
         },
 
