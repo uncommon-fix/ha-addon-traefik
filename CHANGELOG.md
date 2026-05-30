@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.1.0-alpha.16
+
+- **Routes tab redesigned.** Every route now renders as a one-line compact
+  row by default — hostname, backend, scheme, tags, actions. Click the
+  chevron on the left of a row to expand the full editor inline; click
+  again (or open another row) to collapse it. New routes from "Add route"
+  open expanded by default.
+- **Routes are grouped.** A "Group by" dropdown next to "Add route"
+  controls the layout. Default: **External target** — routes pointing
+  at the same backend host (port ignored) collapse into one group; the
+  HA self-route gets its own pinned "Home Assistant" group at the top.
+  Pick a tag to group by it, or "None" for a flat list. Your selection
+  + which groups you've collapsed both persist in the browser across
+  reloads.
+- **Free-form tags per route.** Each route can carry any number of
+  organisational tags (e.g. `proxmox`, `lan-only`, `prod.web`). Tags are
+  edited via a chip-list in the expanded panel and surface as chips in
+  the compact row (max 3 visible + "+N more"). Tags drive the "Group by"
+  dropdown — define a tag on a route and it immediately becomes an
+  option. They are purely organisational; Traefik never sees them.
+- **System row UX normalised.** The "System" pill now sits in the
+  actions column (right side) where Remove lives for user routes —
+  system rows can't be deleted, so the slot is free. The leftmost cell
+  is now the expand chevron, consistent with user rows.
+- Internal: backend gains an optional `tags: list[str]` field per route
+  with content rules `^[A-Za-z0-9._ -]+$` and ≤32 chars; migration
+  backfills `tags: []` on every existing route. `tags` is NOT in the
+  system-route locked set, so you can tag the HA self-route for your own
+  grouping.
+
 ## 0.1.0-alpha.15
 
 - Fixed: every Save on the Routes tab failed with "system route field

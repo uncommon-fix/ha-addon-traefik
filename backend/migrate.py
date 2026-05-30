@@ -356,6 +356,41 @@ def _strip_skip_tls_middleware() -> None:
             )
 
 
+def _backfill_route_tags() -> None:
+    """alpha.16: introduce `tags: list[str]` on each route as an optional
+    organizational field driving the Routes-tab "Group by" view. This walk
+    backfills `tags: []` on every route missing the key so on-disk shape
+    is uniform after the upgrade — the server's _validate_routes accepts
+    routes lacking the field (it's optional), but a uniform shape makes
+    the wire payload's `tags: []` match disk exactly.
+
+    Idempotent + cheap on steady state: one yaml load, possibly no write.
+    Mirrors the no-marker design of _strip_skip_tls_middleware (alpha.14)
+    — the previous one-shot-marker pattern was over-engineering and a
+    foot-gun (if the marker landed before the backfill matured, upgraders
+    would carry weird shapes that LOCKED-set checks would reject).
+    """
+    if not ROUTES_YML.exists():
+        return
+    routes_doc = yaml.safe_load(ROUTES_YML.read_text()) or {}
+    routes = routes_doc.get("routes") or []
+    changed = False
+    backfilled = 0
+    for r in routes:
+        if "tags" not in r:
+            r["tags"] = []
+            changed = True
+            backfilled += 1
+    if changed:
+        routes_doc["routes"] = routes
+        _atomic_write(ROUTES_YML, _dump(routes_doc))
+        print(
+            f"migrate: alpha.16 — backfilled route.tags=[] on {backfilled} "
+            "route(s) missing the field",
+            file=sys.stderr,
+        )
+
+
 def main() -> int:
     # Phase A-E bootstrap: routes + config from options.json (or empty defaults).
     bootstrap_rc = 0
@@ -410,6 +445,11 @@ def main() -> int:
         _strip_skip_tls_middleware()
     except Exception as e:
         print(f"migrate: skip-tls-verify migration failed: {e}", file=sys.stderr)
+        bootstrap_step_rc = 1
+    try:
+        _backfill_route_tags()
+    except Exception as e:
+        print(f"migrate: route-tags backfill failed: {e}", file=sys.stderr)
         bootstrap_step_rc = 1
 
     return bootstrap_rc or bootstrap_step_rc

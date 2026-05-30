@@ -33,6 +33,15 @@ function makeBlankRoute() {
         // middleware attachment; now an honest per-route bool). Drives the
         // service-level insecureSkipVerify transport in render.py.
         skip_tls_verify: false,
+        // alpha.16: free-form organizational tags. Drives the Routes-tab
+        // "Group by" view; render.py doesn't read this field.
+        tags: [],
+        // alpha.16: client-only UI state — controls inline expand/collapse of
+        // the editor panel in the compact Routes view. Stripped by save()
+        // (the wire payload only sends fields the server schema knows about).
+        // Fresh routes start expanded so the user can edit the blank form;
+        // existing routes load collapsed.
+        _expanded: true,
         // makeBlankRoute does NOT set `system` -- user routes only.
         // The HA system route is seeded by migrate.py and persisted in routes.yml.
     };
@@ -58,6 +67,11 @@ function normalizeRoutes(routes) {
     return (routes || []).map(r => Object.assign(makeBlankRoute(), r, {
         _uid: ++_routeUid,                 // fresh uid every load
         middlewares: Array.isArray(r.middlewares) ? r.middlewares : [],
+        // alpha.16: coerce inbound tags to array (handles `null` from a
+        // pre-migration shape that still has tag-missing) + start collapsed
+        // on load (makeBlankRoute defaults to expanded for fresh routes).
+        tags: Array.isArray(r.tags) ? r.tags.slice() : [],
+        _expanded: false,
     }));
 }
 
@@ -216,6 +230,17 @@ function traefikAppData() {
         // Routes tab
         routes: [],
         saving: false,
+        // alpha.16: Routes-tab grouping state. groupBy: 'externalTarget' |
+        // 'none' | 'tag:<name>'. collapsedGroups: Set of currently-collapsed
+        // group keys (interned with the same key shape groupedRoutes emits).
+        // Both load from localStorage in load() via _loadUiPref; setters call
+        // _saveUiPref so the user's view sticks across reloads.
+        groupBy: 'externalTarget',
+        collapsedGroups: new Set(),
+        // alpha.16: per-route in-progress tag-input buffer, keyed by route
+        // _uid. Held outside the route object so it doesn't leak into the
+        // save() payload. addTag()/onTagInputKey clear the buffer on commit.
+        _tagInputs: {},
 
         // Phase F: Middlewares tab
         middlewares: [],
@@ -330,12 +355,212 @@ function traefikAppData() {
             return this.coreRestartReasons.length > 0;
         },
 
-        // Phase F: system routes render first in the table (and a colliding
-        // user route would lose; see render.py for the matching invariant).
-        get sortedRoutes() {
-            const sys = this.routes.filter(r => r.system);
-            const usr = this.routes.filter(r => !r.system);
-            return [...sys, ...usr];
+        // alpha.16: Routes-tab grouping. Returns
+        //   [{key, label, count, routes: [...]}, ...]
+        // The template iterates this; each group renders a clickable header
+        // (collapse toggle) followed by its routes as compact rows.
+        //
+        // groupBy values:
+        //   - 'externalTarget' (default): group by route.backend_host for
+        //     external; "Home Assistant" for home_assistant kind. Port is
+        //     ignored on purpose so e.g. 10.0.0.20:443 and 10.0.0.20:8006
+        //     share a group.
+        //   - 'tag:<name>': routes whose tags include <name> join that
+        //     group; all others fall under "Untagged".
+        //   - 'none': single flat group containing everything (keeps the
+        //     template shape uniform regardless of grouping choice).
+        //
+        // Group order: "Home Assistant" pinned to top (system route is
+        // always visible), then alphabetical by label. Within a group:
+        // alphabetical by hostname.
+        get groupedRoutes() {
+            const groups = new Map();      // key -> {key, label, count, routes}
+            const ensure = (key, label) => {
+                if (!groups.has(key)) {
+                    groups.set(key, { key, label, count: 0, routes: [] });
+                }
+                return groups.get(key);
+            };
+            const keyFor = (r) => {
+                if (this.groupBy === 'none') {
+                    return { key: 'all', label: 'All routes' };
+                }
+                if (this.groupBy === 'externalTarget') {
+                    if (r.backend_kind === 'external') {
+                        const host = (r.backend_host || '').trim() || '(no host)';
+                        return { key: 'ext:' + host, label: host };
+                    }
+                    return { key: 'ha', label: 'Home Assistant' };
+                }
+                if (this.groupBy.startsWith('tag:')) {
+                    const wanted = this.groupBy.slice(4);
+                    const has = (r.tags || []).some(
+                        t => t.toLowerCase() === wanted.toLowerCase()
+                    );
+                    return has
+                        ? { key: 'tagged', label: wanted }
+                        : { key: 'untagged', label: 'Untagged' };
+                }
+                // Defensive: unknown groupBy → flat list.
+                return { key: 'all', label: 'All routes' };
+            };
+            for (const r of this.routes) {
+                const { key, label } = keyFor(r);
+                const g = ensure(key, label);
+                g.routes.push(r);
+                g.count++;
+            }
+            // Sort routes within each group: alphabetical by hostname.
+            for (const g of groups.values()) {
+                g.routes.sort((a, b) =>
+                    (a.hostname || '').localeCompare(b.hostname || '')
+                );
+            }
+            // Order the groups: HA pinned to top, then alphabetical by label.
+            // "Untagged" sinks to the bottom (least interesting bucket).
+            return [...groups.values()].sort((a, b) => {
+                if (a.key === 'ha') return -1;
+                if (b.key === 'ha') return 1;
+                if (a.key === 'untagged') return 1;
+                if (b.key === 'untagged') return -1;
+                return a.label.localeCompare(b.label);
+            });
+        },
+
+        // alpha.16: flat list the Routes table template iterates over.
+        //   - {type: 'header', _key, key, label, count}
+        //   - {type: 'route',  _key, r}
+        // One <tbody> per item in the rendered table — that's the only
+        // shape Alpine's x-for permits when we need to emit two <tr>s per
+        // route (compact + expanded). Collapsed groups emit just their
+        // header item; their routes are absent from the list entirely.
+        get routesTableItems() {
+            const items = [];
+            for (const grp of this.groupedRoutes) {
+                items.push({
+                    type: 'header',
+                    _key: 'h:' + grp.key,
+                    key: grp.key,
+                    label: grp.label,
+                    count: grp.count,
+                });
+                if (this.isGroupCollapsed(grp.key)) continue;
+                for (const r of grp.routes) {
+                    items.push({ type: 'route', _key: 'r:' + r._uid, r });
+                }
+            }
+            return items;
+        },
+
+        // alpha.16: backend summary text for the compact row. Centralised so
+        // the cell + the screen-reader label can share one source of truth.
+        compactBackendLabel(r) {
+            if (r.backend_kind === 'home_assistant') return 'Home Assistant';
+            const host = r.backend_host || '';
+            const port = r.backend_port ? (':' + r.backend_port) : '';
+            return host || port ? (host + port) : '(unset)';
+        },
+
+        // alpha.16: dropdown options for the "Group by" selector. Always
+        // includes the two built-in modes; appends one option per distinct
+        // tag currently present on any route so users can group by a tag
+        // without leaving the page to predefine it.
+        get groupByOptions() {
+            const out = [
+                { value: 'externalTarget', label: 'External target (default)' },
+                { value: 'none', label: 'None (flat list)' },
+            ];
+            const seen = new Set();
+            for (const r of this.routes) {
+                for (const t of (r.tags || [])) {
+                    const k = t.toLowerCase();
+                    if (!seen.has(k)) {
+                        seen.add(k);
+                        out.push({ value: 'tag:' + t, label: 'Tag: ' + t });
+                    }
+                }
+            }
+            // Stable order: built-ins first, then tag options alphabetically.
+            const head = out.slice(0, 2);
+            const tags = out.slice(2).sort((a, b) =>
+                a.label.localeCompare(b.label)
+            );
+            return [...head, ...tags];
+        },
+
+        // alpha.16: group + route ui-state helpers. Each is a no-op when the
+        // input doesn't match (defensive; the template binds these to user
+        // clicks but a stale ref or race could miss). _saveUiPref persists.
+        isGroupCollapsed(key) {
+            return this.collapsedGroups.has(key);
+        },
+        toggleGroupCollapsed(key) {
+            if (this.collapsedGroups.has(key)) this.collapsedGroups.delete(key);
+            else this.collapsedGroups.add(key);
+            this._saveUiPref(
+                'traefik-addon:routes-collapsed',
+                JSON.stringify([...this.collapsedGroups])
+            );
+        },
+        setGroupBy(value) {
+            this.groupBy = value || 'externalTarget';
+            this._saveUiPref('traefik-addon:routes-groupby', this.groupBy);
+        },
+        toggleRouteExpanded(r) {
+            r._expanded = !r._expanded;
+        },
+
+        // alpha.16: tag editor commit. Trim, lowercase-dedupe against existing,
+        // validate against ROUTE_TAG_RE shape (mirrors server). Empty / invalid
+        // / duplicate inputs are silent no-ops at the client; the server still
+        // enforces the same rules on Save so a hand-PUT can't bypass them.
+        addTag(r, raw) {
+            const t = (raw || '').trim();
+            if (!t) return false;
+            if (t.length > 32) return false;
+            if (!/^[A-Za-z0-9._ -]+$/.test(t)) return false;
+            if (!Array.isArray(r.tags)) r.tags = [];
+            if (r.tags.some(x => x.toLowerCase() === t.toLowerCase())) return false;
+            r.tags.push(t);
+            return true;
+        },
+        removeTag(r, tag) {
+            if (!Array.isArray(r.tags)) return;
+            const i = r.tags.indexOf(tag);
+            if (i >= 0) r.tags.splice(i, 1);
+        },
+        onTagInputKey(r, event) {
+            // Commit on Enter or comma; otherwise let the event pass through
+            // so the input keeps typing.
+            const key = event.key;
+            if (key !== 'Enter' && key !== ',') return;
+            event.preventDefault();
+            const input = event.target;
+            if (this.addTag(r, input.value)) {
+                input.value = '';
+            } else {
+                // Invalid: brief visual nudge via CSS class the template
+                // can opt into. Simplest signal — clear the input only on
+                // success so the user can see what was rejected.
+            }
+        },
+
+        // alpha.16: localStorage helpers. No prior usage in this codebase —
+        // this establishes the pattern. Both wrap try/catch so a private-mode
+        // browser (storage disabled) silently falls back to in-memory state
+        // without console noise. Keys are namespaced under 'traefik-addon:'.
+        _loadUiPref(key, fallback) {
+            try {
+                const v = window.localStorage.getItem(key);
+                return v === null ? fallback : v;
+            } catch (_) {
+                return fallback;
+            }
+        },
+        _saveUiPref(key, value) {
+            try {
+                window.localStorage.setItem(key, value);
+            } catch (_) { /* private mode / quota — drop quietly */ }
         },
 
         // Phase F: block Save when an enabled system route has empty hostname
@@ -482,6 +707,25 @@ function traefikAppData() {
         },
 
         async load() {
+            // alpha.16: hydrate Routes-tab UI preferences from localStorage
+            // BEFORE the first render so the user's view sticks across
+            // reloads. groupBy falls back to the default; collapsedGroups
+            // tolerates a malformed JSON string (treat as empty set).
+            this.groupBy = this._loadUiPref(
+                'traefik-addon:routes-groupby', 'externalTarget'
+            );
+            try {
+                const raw = this._loadUiPref(
+                    'traefik-addon:routes-collapsed', '[]'
+                );
+                const arr = JSON.parse(raw);
+                this.collapsedGroups = new Set(
+                    Array.isArray(arr) ? arr : []
+                );
+            } catch (_) {
+                this.collapsedGroups = new Set();
+            }
+
             // alpha.12: claim the editor session FIRST. If 409, the takeover
             // modal appears; we still poll status so the user sees Traefik
             // state, and we still load read data so the read-only view is
@@ -881,6 +1125,12 @@ function traefikAppData() {
                         // `None != False` → reject every Routes-tab Save with
                         // "system route field 'skip_tls_verify' is locked".
                         skip_tls_verify: !!r.skip_tls_verify,
+                        // alpha.16: include organizational tags. tags is NOT
+                        // in the LOCKED set so it round-trips even for the
+                        // system row (unlike skip_tls_verify which is locked).
+                        // Always send an array — never undefined — so the
+                        // server gets a stable shape regardless of UI state.
+                        tags: Array.isArray(r.tags) ? r.tags.slice() : [],
                     };
                     // Phase F: preserve system tag so backend's protection
                     // check matches; user routes omit the field entirely

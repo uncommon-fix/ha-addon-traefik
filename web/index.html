@@ -278,7 +278,8 @@
 
     <!-- ============ ROUTES TAB ============ -->
     <section x-show="tab==='routes'" x-transition>
-      <div class="flex items-center justify-between mb-4">
+      <!-- alpha.16: toolbar = heading | Group-by dropdown | Add route button. -->
+      <div class="flex items-center justify-between mb-4 flex-wrap gap-3">
         <div>
           <h2 class="text-base font-semibold">Routes</h2>
           <p class="text-sm text-gray-500" x-show="config.domain">
@@ -286,10 +287,22 @@
             use <span class="font-mono">@</span> or empty for the apex.
           </p>
         </div>
-        <button @click="addRoute()"
-                class="px-3 py-1.5 rounded bg-blue-600 text-white text-sm font-medium hover:bg-blue-700">
-          Add route
-        </button>
+        <div class="flex items-center gap-3">
+          <label class="text-xs text-gray-600 flex items-center gap-1.5">
+            Group by:
+            <select :value="groupBy"
+                    @change="setGroupBy($event.target.value)"
+                    class="border rounded px-2 py-1 bg-white text-xs">
+              <template x-for="opt in groupByOptions" :key="opt.value">
+                <option :value="opt.value" :selected="groupBy === opt.value" x-text="opt.label"></option>
+              </template>
+            </select>
+          </label>
+          <button @click="addRoute()"
+                  class="px-3 py-1.5 rounded bg-blue-600 text-white text-sm font-medium hover:bg-blue-700">
+            Add route
+          </button>
+        </div>
       </div>
 
       <!-- alpha.12: per-section load-failure panel. Render INSTEAD of the
@@ -315,225 +328,291 @@
         The Home Assistant system route has no hostname. Type one (or disable it) before saving.
       </div>
 
-      <!-- alpha.12: wrap the routes table in an overflow-x container so the
-           fixed-width columns stay readable on narrow viewports (HA Companion
-           ~360px) without overlapping the page chrome. A full card-style
-           reflow under sm: would be cleaner but isn't required for this pass. -->
+      <!-- alpha.16: compact rows by default with inline-expandable editor.
+           Each item in routesTableItems is rendered as its own <tbody>:
+           - {type:'header'} → group header row (collapsible)
+           - {type:'route'} → compact row + optional expanded editor row
+           Per-tbody iteration is the only Alpine pattern that emits two
+           <tr>s per route inside a single x-for body. -->
       <div x-show="!loadFailed.routes && routes.length > 0" class="overflow-x-auto">
-      <table class="w-full min-w-[640px] border-collapse text-sm">
+      <table class="w-full min-w-[720px] border-collapse text-sm">
         <thead>
-          <tr class="text-left border-b">
-            <th class="py-2 pr-2 w-16"></th>
-            <th class="py-2 pr-3">Enabled</th>
+          <tr class="text-left border-b text-[11px] uppercase tracking-wide text-gray-500">
+            <th class="py-2 pr-1 w-8"></th>                <!-- chevron -->
+            <th class="py-2 pr-2 w-12">On</th>             <!-- enabled -->
             <th class="py-2 pr-3">Hostname</th>
             <th class="py-2 pr-3">Backend</th>
-            <th class="py-2 pr-3">Scheme</th>
-            <th class="py-2 pr-3">TLS</th>
-            <th class="py-2 pr-3">Middlewares</th>
-            <th class="py-2"></th>
+            <th class="py-2 pr-3 w-24">Scheme</th>
+            <th class="py-2 pr-3">Tags</th>
+            <th class="py-2 w-20"></th>                    <!-- actions / System pill -->
           </tr>
         </thead>
-        <tbody>
-          <template x-for="r in sortedRoutes" :key="r._uid">
-            <tr :class="r.system ? 'bg-blue-50 border-b border-blue-200' : 'border-b hover:bg-gray-50'">
-              <!-- System badge column -->
-              <td class="py-2 pr-2">
-                <template x-if="r.system">
-                  <span class="inline-block px-1.5 py-0.5 text-[10px] font-semibold rounded bg-blue-200 text-blue-900 uppercase tracking-wide">System</span>
-                </template>
-              </td>
-              <!-- Enabled: static label for system rows; checkbox for user routes -->
-              <td class="py-2 pr-3">
-                <template x-if="r.system">
-                  <span class="text-xs text-gray-700" x-text="r.enabled ? 'Enabled' : 'Disabled'"></span>
-                </template>
-                <template x-if="!r.system">
-                  <input type="checkbox" x-model="r.enabled">
-                </template>
-              </td>
-              <!-- Hostname: editable on BOTH system and user rows. A status dot
-                   to the left reflects backend reachability (alpha.10). -->
-              <td class="py-2 pr-3">
-                <div class="flex items-center gap-2">
-                  <!-- alpha.12: color-only dots are inaccessible. The sr-only
-                       sibling carries the same meaning for screen readers, and
-                       aria-label on the dot itself surfaces the value when
-                       focused/inspected. -->
-                  <span class="shrink-0 w-2.5 h-2.5 rounded-full"
-                        :class="routeStatusColor(r)"
-                        :title="routeStatusTitle(r)"
-                        :aria-label="routeStatusTitle(r)"
-                        role="img"></span>
-                  <span class="sr-only" x-text="routeStatusTitle(r)"></span>
-                  <input type="text" x-model="r.hostname"
-                         class="font-mono border rounded px-2 py-1 w-44 bg-white"
-                         :placeholder="r.system ? 'hass' : 'cloud or cloud.example.com'">
-                </div>
-              </td>
-              <!-- Backend: static label for system rows -->
-              <td class="py-2 pr-3">
-                <template x-if="r.system">
-                  <span class="text-xs text-gray-700">
-                    Home Assistant<br>
-                    <span class="font-mono text-gray-500">homeassistant:8123</span>
-                  </span>
-                </template>
-                <template x-if="!r.system">
-                  <div>
-                    <select x-model="r.backend_kind" class="border rounded px-2 py-1">
-                      <option value="home_assistant">Home Assistant</option>
-                      <option value="external">External</option>
-                    </select>
-                    <div x-show="r.backend_kind === 'external'" class="mt-1 flex gap-1">
-                      <input type="text" x-model="r.backend_host" placeholder="host"
-                             class="font-mono border rounded px-2 py-1 w-32">
-                      <input type="number" x-model.number="r.backend_port" placeholder="port"
-                             min="1" max="65535"
-                             class="font-mono border rounded px-2 py-1 w-20">
+        <template x-for="item in routesTableItems" :key="item._key">
+          <tbody>
+            <!-- ============ GROUP HEADER ============ -->
+            <template x-if="item.type === 'header'">
+              <tr class="bg-gray-100 border-b cursor-pointer hover:bg-gray-200 select-none"
+                  @click="toggleGroupCollapsed(item.key)">
+                <td colspan="7" class="py-1.5 px-2 text-xs">
+                  <span class="inline-block w-4 text-gray-500" aria-hidden="true"
+                        x-text="isGroupCollapsed(item.key) ? '▶' : '▼'"></span>
+                  <span class="font-semibold text-gray-700" x-text="item.label"></span>
+                  <span class="text-gray-500 ml-1" x-text="'(' + item.count + ')'"></span>
+                </td>
+              </tr>
+            </template>
+
+            <!-- ============ COMPACT ROUTE ROW ============ -->
+            <template x-if="item.type === 'route'">
+              <tr :class="item.r.system ? 'bg-blue-50 border-b border-blue-200' : 'border-b hover:bg-gray-50'">
+                <!-- Chevron: expand/collapse the editor below -->
+                <td class="py-2 pr-1 text-center">
+                  <button type="button"
+                          @click="toggleRouteExpanded(item.r)"
+                          :aria-expanded="item.r._expanded"
+                          :aria-label="(item.r._expanded ? 'Collapse' : 'Expand') + ' editor for route ' + (item.r.hostname || 'unnamed')"
+                          class="text-gray-500 hover:text-gray-900 text-xs leading-none"
+                          x-text="item.r._expanded ? '▼' : '▶'"></button>
+                </td>
+                <!-- Enabled: checkbox for user, static for system -->
+                <td class="py-2 pr-2">
+                  <template x-if="item.r.system">
+                    <span class="text-xs text-gray-700" x-text="item.r.enabled ? 'On' : 'Off'"></span>
+                  </template>
+                  <template x-if="!item.r.system">
+                    <input type="checkbox" x-model="item.r.enabled">
+                  </template>
+                </td>
+                <!-- Hostname (read-only display in compact view) + status dot -->
+                <td class="py-2 pr-3">
+                  <div class="flex items-center gap-2">
+                    <span class="shrink-0 w-2.5 h-2.5 rounded-full"
+                          :class="routeStatusColor(item.r)"
+                          :title="routeStatusTitle(item.r)"
+                          :aria-label="routeStatusTitle(item.r)"
+                          role="img"></span>
+                    <span class="sr-only" x-text="routeStatusTitle(item.r)"></span>
+                    <span class="font-mono text-sm" x-text="item.r.hostname || '(unnamed)'"></span>
+                  </div>
+                </td>
+                <!-- Backend summary -->
+                <td class="py-2 pr-3 text-xs text-gray-700">
+                  <span class="font-mono" x-text="compactBackendLabel(item.r)"></span>
+                </td>
+                <!-- Scheme + TLS + Skip TLS marker, all inline -->
+                <td class="py-2 pr-3 text-xs">
+                  <span class="font-mono" x-text="item.r.scheme"></span>
+                  <span x-show="item.r.tls" class="text-gray-500 ml-1" aria-label="TLS enabled" title="TLS">&#x1F512;</span>
+                  <span x-show="item.r.skip_tls_verify && item.r.scheme === 'https'"
+                        class="text-amber-600 ml-1 font-mono text-[10px]"
+                        title="Skip TLS verify on backend">skip-tls</span>
+                </td>
+                <!-- Tags chips (max 3 + "+N more") -->
+                <td class="py-2 pr-3">
+                  <div class="flex flex-wrap gap-1 items-center">
+                    <template x-for="tag in (item.r.tags || []).slice(0, 3)" :key="tag">
+                      <span class="inline-block px-1.5 py-0.5 rounded bg-gray-200 text-gray-700 text-[10px] font-mono"
+                            x-text="tag"></span>
+                    </template>
+                    <span x-show="(item.r.tags || []).length > 3"
+                          class="text-[10px] text-gray-500"
+                          x-text="'+' + ((item.r.tags || []).length - 3) + ' more'"></span>
+                    <span x-show="!(item.r.tags || []).length" class="text-[10px] text-gray-400">—</span>
+                  </div>
+                </td>
+                <!-- Actions: System pill for system rows, Remove button for user rows -->
+                <td class="py-2 text-right pr-2">
+                  <template x-if="item.r.system">
+                    <span class="inline-block px-1.5 py-0.5 text-[10px] font-semibold rounded bg-blue-200 text-blue-900 uppercase tracking-wide">System</span>
+                  </template>
+                  <template x-if="!item.r.system">
+                    <button @click="removeRoute(item.r)"
+                            :aria-label="'Remove route ' + (item.r.hostname || 'unnamed')"
+                            class="text-red-600 hover:text-red-800 text-sm" title="Remove">
+                      Remove
+                    </button>
+                  </template>
+                </td>
+              </tr>
+            </template>
+
+            <!-- ============ EXPANDED EDITOR ROW ============ -->
+            <template x-if="item.type === 'route' && item.r._expanded">
+              <tr :class="item.r.system ? 'bg-blue-50 border-b border-blue-200' : 'border-b bg-gray-50'">
+                <td></td>
+                <td colspan="6" class="py-3 pr-3 pl-1">
+                  <div class="space-y-3 max-w-3xl">
+                    <!-- Hostname (always editable; system route allows hostname change) -->
+                    <div>
+                      <label class="block text-xs text-gray-600 mb-0.5">Hostname</label>
+                      <input type="text" x-model="item.r.hostname"
+                             class="font-mono border rounded px-2 py-1 w-64 bg-white"
+                             :placeholder="item.r.system ? 'hass' : 'cloud or cloud.example.com'">
                     </div>
-                  </div>
-                </template>
-              </td>
-              <!-- Scheme: static for system rows -->
-              <td class="py-2 pr-3">
-                <template x-if="r.system">
-                  <span class="font-mono text-xs text-gray-500">http</span>
-                </template>
-                <template x-if="!r.system">
-                  <div class="flex flex-col gap-1">
-                    <select x-model="r.scheme" @change="onRouteSchemeChange(r)"
-                            class="border rounded px-2 py-1"
-                            :disabled="r.backend_kind === 'home_assistant'">
-                      <option value="http">http</option>
-                      <option value="https">https</option>
-                    </select>
-                    <!-- alpha.14: per-route skip-TLS-verify bool. Replaces the
-                         pre-alpha.14 magic-string middleware attachment. -->
-                    <label x-show="r.scheme === 'https'"
-                           class="flex items-center gap-1 text-[11px] text-gray-600">
-                      <input type="checkbox" x-model="r.skip_tls_verify">
-                      Skip TLS verify
-                    </label>
-                  </div>
-                </template>
-              </td>
-              <!-- TLS: static for system rows -->
-              <td class="py-2 pr-3">
-                <template x-if="r.system">
-                  <span class="text-xs text-gray-700" x-text="r.tls ? 'TLS on' : 'TLS off'"></span>
-                </template>
-                <template x-if="!r.system">
-                  <input type="checkbox" x-model="r.tls">
-                </template>
-              </td>
-              <!-- Middlewares + Health path: stacked. System rows show static markers
-                   (locked); user rows have two stacked inputs in the same cell width. -->
-              <td class="py-2 pr-3">
-                <!-- System row: middlewares are add-on-managed; LIST them read-only.
-                     alpha.15: filter through systemRowVisibleMiddlewares so
-                     feature-managed entries (currently: redirect-to-https when
-                     force_ssl is on) don't render a misleading chip — the
-                     redirect actually happens at the entrypoint level when
-                     force_ssl is on, not via the per-route middleware. -->
-                <template x-if="r.system">
-                  <div>
-                    <template x-if="systemRowVisibleMiddlewares(r).length">
-                      <div class="flex flex-wrap gap-1">
-                        <template x-for="mw in systemRowVisibleMiddlewares(r)" :key="mw">
-                          <span class="inline-block px-1.5 py-0.5 rounded bg-gray-100 text-gray-600 text-[10px] font-mono"
-                                x-text="mw"></span>
-                        </template>
+
+                    <!-- Backend, Scheme, TLS, Middlewares, Health: user routes only.
+                         System row: those fields are server-locked. -->
+                    <template x-if="!item.r.system">
+                      <div class="space-y-3">
+                        <!-- Backend kind + host/port -->
+                        <div class="flex gap-3 items-end flex-wrap">
+                          <div>
+                            <label class="block text-xs text-gray-600 mb-0.5">Backend</label>
+                            <select x-model="item.r.backend_kind" class="border rounded px-2 py-1 bg-white">
+                              <option value="home_assistant">Home Assistant</option>
+                              <option value="external">External</option>
+                            </select>
+                          </div>
+                          <div x-show="item.r.backend_kind === 'external'" class="flex gap-1 items-end">
+                            <div>
+                              <label class="block text-[10px] text-gray-500 mb-0.5">host</label>
+                              <input type="text" x-model="item.r.backend_host" placeholder="10.0.0.20"
+                                     class="font-mono border rounded px-2 py-1 w-40">
+                            </div>
+                            <div>
+                              <label class="block text-[10px] text-gray-500 mb-0.5">port</label>
+                              <input type="number" x-model.number="item.r.backend_port" placeholder="443"
+                                     min="1" max="65535"
+                                     class="font-mono border rounded px-2 py-1 w-24">
+                            </div>
+                          </div>
+                        </div>
+
+                        <!-- Scheme + TLS + Skip TLS verify -->
+                        <div class="flex gap-4 items-end flex-wrap">
+                          <div>
+                            <label class="block text-xs text-gray-600 mb-0.5">Scheme</label>
+                            <select x-model="item.r.scheme" @change="onRouteSchemeChange(item.r)"
+                                    class="border rounded px-2 py-1 bg-white"
+                                    :disabled="item.r.backend_kind === 'home_assistant'">
+                              <option value="http">http</option>
+                              <option value="https">https</option>
+                            </select>
+                          </div>
+                          <label class="flex items-center gap-1.5 text-sm pb-1.5">
+                            <input type="checkbox" x-model="item.r.tls">
+                            TLS on (front-side)
+                          </label>
+                          <label x-show="item.r.scheme === 'https'" class="flex items-center gap-1.5 text-sm pb-1.5">
+                            <input type="checkbox" x-model="item.r.skip_tls_verify">
+                            Skip TLS verify on backend
+                          </label>
+                        </div>
+
+                        <!-- Middlewares (alpha.12 combobox preserved verbatim) -->
+                        <div>
+                          <label class="block text-xs text-gray-600 mb-0.5">Middlewares</label>
+                          <div class="relative w-64"
+                               x-data="{ open: false, activeIdx: -1 }"
+                               @click.outside="open = false"
+                               @keydown.escape.prevent="if (open) { open = false; $refs.trigger.focus(); }">
+                            <button type="button"
+                                    x-ref="trigger"
+                                    @click="open = !open; activeIdx = open ? 0 : -1"
+                                    @keydown.arrow-down.prevent="if (!open) { open = true; activeIdx = 0; } else { activeIdx = Math.min(eligibleRouteMiddlewares().length - 1, activeIdx + 1); }"
+                                    @keydown.arrow-up.prevent="if (open) activeIdx = Math.max(0, activeIdx - 1);"
+                                    @keydown.home.prevent="if (open) activeIdx = 0"
+                                    @keydown.end.prevent="if (open) activeIdx = eligibleRouteMiddlewares().length - 1"
+                                    @keydown.enter.prevent="if (open && activeIdx >= 0) { const mw = eligibleRouteMiddlewares()[activeIdx]; if (mw) toggleRouteMiddleware(item.r, mw.name, !(item.r.middlewares || []).includes(mw.name)); }"
+                                    @keydown.space.prevent="if (!open) { open = true; activeIdx = 0; } else if (activeIdx >= 0) { const mw = eligibleRouteMiddlewares()[activeIdx]; if (mw) toggleRouteMiddleware(item.r, mw.name, !(item.r.middlewares || []).includes(mw.name)); }"
+                                    @keydown.tab="open = false"
+                                    role="combobox"
+                                    aria-haspopup="listbox"
+                                    :aria-expanded="open"
+                                    :aria-controls="'lb-route-' + item.r._uid"
+                                    :aria-activedescendant="open && activeIdx >= 0 ? 'opt-route-' + item.r._uid + '-' + activeIdx : null"
+                                    :aria-label="'Middlewares: ' + routeMwSummary(item.r)"
+                                    class="border rounded px-2 py-1 w-full text-sm flex justify-between items-center gap-1 hover:bg-gray-50 bg-white">
+                              <span class="font-mono truncate" x-text="routeMwSummary(item.r)"></span>
+                              <span class="text-gray-400" aria-hidden="true">&#9662;</span>
+                            </button>
+                            <ul x-show="open" x-transition
+                                role="listbox"
+                                aria-multiselectable="true"
+                                :id="'lb-route-' + item.r._uid"
+                                class="absolute z-10 mt-1 w-full bg-white border rounded shadow-lg p-1 max-h-40 overflow-y-auto">
+                              <template x-if="!eligibleRouteMiddlewares().length">
+                                <li role="presentation" class="text-gray-400 text-xs px-1 py-0.5">No middlewares defined</li>
+                              </template>
+                              <template x-for="(mw, i) in eligibleRouteMiddlewares()" :key="mw.name">
+                                <li role="option"
+                                    :id="'opt-route-' + item.r._uid + '-' + i"
+                                    :aria-selected="(item.r.middlewares || []).includes(mw.name)"
+                                    @click="toggleRouteMiddleware(item.r, mw.name, !(item.r.middlewares || []).includes(mw.name))"
+                                    @mouseenter="activeIdx = i"
+                                    :class="activeIdx === i ? 'bg-blue-50' : 'hover:bg-gray-50'"
+                                    class="flex items-center gap-1.5 py-0.5 px-1 cursor-pointer rounded">
+                                  <input type="checkbox"
+                                         :checked="(item.r.middlewares || []).includes(mw.name)"
+                                         tabindex="-1"
+                                         @click.stop="toggleRouteMiddleware(item.r, mw.name, $event.target.checked)">
+                                  <span class="font-mono text-xs" x-text="mw.name"></span>
+                                </li>
+                              </template>
+                              <template x-for="mw in (item.r.middlewares || []).filter(n => !middlewares.some(m => m.name === n))" :key="'orphan-'+mw">
+                                <li role="option" aria-selected="true"
+                                    @click="toggleRouteMiddleware(item.r, mw, false)"
+                                    class="flex items-center gap-1.5 py-0.5 px-1 cursor-pointer hover:bg-gray-50 rounded">
+                                  <input type="checkbox" checked tabindex="-1"
+                                         @click.stop="toggleRouteMiddleware(item.r, mw, $event.target.checked)">
+                                  <span class="font-mono text-xs text-amber-700" x-text="mw + ' (missing)'"></span>
+                                </li>
+                              </template>
+                            </ul>
+                          </div>
+                        </div>
+
+                        <!-- Health check path -->
+                        <div>
+                          <label class="block text-xs text-gray-600 mb-0.5">Backend health check path</label>
+                          <input type="text" :value="item.r.health_path || ''"
+                                 @input="item.r.health_path = $event.target.value || null"
+                                 placeholder="/"
+                                 class="font-mono border rounded px-2 py-1 w-40">
+                        </div>
                       </div>
                     </template>
-                    <template x-if="!systemRowVisibleMiddlewares(r).length">
-                      <span class="text-xs text-gray-500">—</span>
-                    </template>
-                    <div class="font-mono text-[10px] text-gray-400 mt-0.5">health: /</div>
-                  </div>
-                </template>
-                <!-- User row: compact middlewares dropdown + health path. -->
-                <template x-if="!r.system">
-                  <div class="flex flex-col gap-1">
-                    <!-- alpha.12: ARIA combobox pattern with full keyboard model.
-                         ArrowDown/Up navigate (aria-activedescendant), Enter/Space
-                         toggle, Escape closes + returns focus to trigger, Tab
-                         closes and moves focus naturally.  Hover sets activeIdx
-                         so mouse + keyboard track the same option. -->
-                    <div class="relative"
-                         x-data="{ open: false, activeIdx: -1 }"
-                         @click.outside="open = false"
-                         @keydown.escape.prevent="if (open) { open = false; $refs.trigger.focus(); }">
-                      <button type="button"
-                              x-ref="trigger"
-                              @click="open = !open; activeIdx = open ? 0 : -1"
-                              @keydown.arrow-down.prevent="if (!open) { open = true; activeIdx = 0; } else { activeIdx = Math.min(eligibleRouteMiddlewares().length - 1, activeIdx + 1); }"
-                              @keydown.arrow-up.prevent="if (open) activeIdx = Math.max(0, activeIdx - 1);"
-                              @keydown.home.prevent="if (open) activeIdx = 0"
-                              @keydown.end.prevent="if (open) activeIdx = eligibleRouteMiddlewares().length - 1"
-                              @keydown.enter.prevent="if (open && activeIdx >= 0) { const mw = eligibleRouteMiddlewares()[activeIdx]; if (mw) toggleRouteMiddleware(r, mw.name, !(r.middlewares || []).includes(mw.name)); }"
-                              @keydown.space.prevent="if (!open) { open = true; activeIdx = 0; } else if (activeIdx >= 0) { const mw = eligibleRouteMiddlewares()[activeIdx]; if (mw) toggleRouteMiddleware(r, mw.name, !(r.middlewares || []).includes(mw.name)); }"
-                              @keydown.tab="open = false"
-                              role="combobox"
-                              aria-haspopup="listbox"
-                              :aria-expanded="open"
-                              :aria-controls="'lb-route-' + r._uid"
-                              :aria-activedescendant="open && activeIdx >= 0 ? 'opt-route-' + r._uid + '-' + activeIdx : null"
-                              :aria-label="'Middlewares: ' + routeMwSummary(r)"
-                              class="border rounded px-2 py-1 w-44 text-[11px] flex justify-between items-center gap-1 hover:bg-gray-50">
-                        <span class="font-mono truncate" x-text="routeMwSummary(r)"></span>
-                        <span class="text-gray-400" aria-hidden="true">&#9662;</span>
-                      </button>
-                      <ul x-show="open" x-transition
-                          role="listbox"
-                          aria-multiselectable="true"
-                          :id="'lb-route-' + r._uid"
-                          class="absolute z-10 mt-1 w-48 bg-white border rounded shadow-lg p-1 max-h-40 overflow-y-auto">
-                        <template x-if="!eligibleRouteMiddlewares().length">
-                          <li role="presentation" class="text-gray-400 text-[11px] px-1 py-0.5">No middlewares defined</li>
+
+                    <!-- Tags (ALL routes including system) -->
+                    <div>
+                      <label class="block text-xs text-gray-600 mb-0.5">
+                        Tags
+                        <span class="text-gray-400">— organisational; used by "Group by" in the Routes view</span>
+                      </label>
+                      <div class="flex flex-wrap gap-1 items-center">
+                        <template x-for="(tag, ti) in (item.r.tags || [])" :key="tag + '-' + ti">
+                          <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-gray-200 text-gray-800 text-xs font-mono">
+                            <span x-text="tag"></span>
+                            <button type="button"
+                                    @click="removeTag(item.r, tag)"
+                                    class="text-gray-500 hover:text-red-700 leading-none"
+                                    :aria-label="'Remove tag ' + tag">&times;</button>
+                          </span>
                         </template>
-                        <template x-for="(mw, i) in eligibleRouteMiddlewares()" :key="mw.name">
-                          <li role="option"
-                              :id="'opt-route-' + r._uid + '-' + i"
-                              :aria-selected="(r.middlewares || []).includes(mw.name)"
-                              @click="toggleRouteMiddleware(r, mw.name, !(r.middlewares || []).includes(mw.name))"
-                              @mouseenter="activeIdx = i"
-                              :class="activeIdx === i ? 'bg-blue-50' : 'hover:bg-gray-50'"
-                              class="flex items-center gap-1.5 py-0.5 px-1 cursor-pointer rounded">
-                            <input type="checkbox"
-                                   :checked="(r.middlewares || []).includes(mw.name)"
-                                   tabindex="-1"
-                                   @click.stop="toggleRouteMiddleware(r, mw.name, $event.target.checked)">
-                            <span class="font-mono text-[11px]" x-text="mw.name"></span>
-                          </li>
-                        </template>
-                        <!-- Orphan refs: deleted middleware still attached; keep
-                             visible (checked) so saving doesn't silently drop it. -->
-                        <template x-for="mw in (r.middlewares || []).filter(n => !middlewares.some(m => m.name === n))" :key="'orphan-'+mw">
-                          <li role="option" aria-selected="true"
-                              @click="toggleRouteMiddleware(r, mw, false)"
-                              class="flex items-center gap-1.5 py-0.5 px-1 cursor-pointer hover:bg-gray-50 rounded">
-                            <input type="checkbox" checked tabindex="-1"
-                                   @click.stop="toggleRouteMiddleware(r, mw, $event.target.checked)">
-                            <span class="font-mono text-[11px] text-amber-700" x-text="mw + ' (missing)'"></span>
-                          </li>
-                        </template>
-                      </ul>
+                        <input type="text"
+                               @keydown="onTagInputKey(item.r, $event)"
+                               placeholder="add tag, Enter to commit"
+                               maxlength="32"
+                               class="border rounded px-2 py-0.5 text-xs w-44 font-mono bg-white">
+                      </div>
+                      <p class="text-[10px] text-gray-400 mt-0.5">
+                        A–Z, 0–9, dot, underscore, hyphen, space. ≤32 chars per tag.
+                      </p>
                     </div>
-                    <input type="text" :value="r.health_path || ''"
-                           @input="r.health_path = $event.target.value || null"
-                           placeholder="health: /"
-                           class="font-mono border rounded px-2 py-1 w-44 text-[11px] text-gray-700">
+
+                    <!-- System-route footer hint -->
+                    <template x-if="item.r.system">
+                      <div class="text-xs text-gray-600 border-t border-blue-200 pt-2">
+                        <strong>System route.</strong> Backend, scheme, TLS, middlewares, and Skip-TLS are
+                        add-on-managed; only the hostname (and optionally tags) can be edited here.
+                      </div>
+                    </template>
                   </div>
-                </template>
-              </td>
-              <!-- Remove button: hidden for system rows -->
-              <td class="py-2 text-right">
-                <button x-show="!r.system" @click="removeRoute(r)"
-                        class="text-red-600 hover:text-red-800 text-sm">Remove</button>
-              </td>
-            </tr>
-          </template>
-        </tbody>
+                </td>
+              </tr>
+            </template>
+          </tbody>
+        </template>
       </table>
       </div>
 
