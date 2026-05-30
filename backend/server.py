@@ -1586,17 +1586,32 @@ class SessionManager:
         if self._current and now - self._current.last_seen > SESSION_TTL:
             self._current = None
 
-    def claim(self) -> tuple[bool, str | None, float]:
+    def claim(self, incoming_sid: str | None = None) -> tuple[bool, str | None, float]:
         """Try to become the active editor. Returns (ok, sid, current_age_s).
-        ok=True: claim succeeded; `sid` is the new session id.
+        ok=True: claim succeeded; `sid` is the new session id (or the existing
+                 one if `incoming_sid` already matches the current session).
         ok=False: another session is active; `sid` is None, current_age_s is
-                  how stale the current session looks (drives the UI prompt)."""
+                  how stale the current session looks (drives the UI prompt).
+
+        alpha.15: when `incoming_sid` matches the current session's SID, treat
+        the call as a no-op refresh and return success with the same sid. This
+        prevents the same browser from 409-ing itself when a code path re-runs
+        claim while already owning the session (e.g. the Routes-tab "Discard
+        changes" button calls load(), which calls claimSession() again).
+        Belt-and-braces with the client-side switch to call loadRoutes()
+        directly — protects any future caller that re-claims while holding.
+        SID collisions are negligible (24-byte secrets.token_urlsafe), so a
+        stale `incoming_sid` matching a fresh `self._current.sid` by accident
+        won't happen in practice."""
         now = time.time()
         self._expire_if_stale(now)
         if self._current is None:
             sid = secrets.token_urlsafe(24)
             self._current = EditSession(sid=sid, last_seen=now)
             return True, sid, 0.0
+        if incoming_sid and incoming_sid == self._current.sid:
+            self._current.last_seen = now
+            return True, self._current.sid, 0.0
         return False, None, now - self._current.last_seen
 
     def takeover(self) -> str:
@@ -1667,7 +1682,12 @@ async def session_gate_mw(request, handler):
 
 async def post_session_claim(request):
     mgr: SessionManager = request.app["session_mgr"]
-    ok, sid, age = mgr.claim()
+    # alpha.15: pass the requester's X-Session-Id through to claim() so a
+    # caller already holding the active session gets a no-op refresh instead
+    # of 409-ing itself. (session_gate_mw at the outer level also heartbeats
+    # on any matching SID — claim() then short-circuits to success.)
+    incoming_sid = request.headers.get("X-Session-Id") or None
+    ok, sid, age = mgr.claim(incoming_sid)
     if ok:
         return web.json_response({"sid": sid})
     return web.json_response({"current_age_s": age}, status=409)

@@ -30,23 +30,25 @@ RUN apk add --no-cache python3 py3-yaml py3-aiohttp py3-bcrypt py3-ruamel.yaml c
  && /usr/local/bin/traefik version \
  && python3 -c "import bcrypt; assert bcrypt.checkpw(b'x', bcrypt.hashpw(b'x', bcrypt.gensalt(4)))"
 
-# Phase D — vendor Alpine.js + Tailwind Play CDN with SHA256 pinning into the
-# image. CDN-at-build (NOT runtime), so the user's HA host doesn't need outbound
-# internet for the UI to load. Versions and SHAs verified at audit time.
-# Tailwind Play CDN 3.4.18+ does NOT exist on cdn.tailwindcss.com (would 200
-# with a console.error payload); 3.4.17 is the highest valid pin.
+# Phase D — vendor Alpine.js at build time with SHA256 pinning into the image.
+# CDN-at-build (NOT runtime), so the user's HA host doesn't need outbound
+# internet for the UI to load.
+#
+# alpha.15: Tailwind 3.4.17 moved from CDN-at-build to in-repo (committed to
+# `web/static/tailwindcss-3.4.17.min.js`, ~400 KB). Drops the network-at-build
+# requirement entirely for Tailwind, eliminates the production-mode deprecation
+# console.error logged on every page load when the Play CDN serves the
+# minified bundle, and protects against the Play CDN going away (it's been in
+# maintenance since Tailwind v4 shipped; 3.4.18+ already 200s with a console.error
+# payload). Alpine.js's jsdelivr CDN is healthy, so it stays build-time-fetched
+# for now. The `COPY web/` step below picks up the vendored Tailwind file.
 ARG ALPINEJS_VERSION=3.15.12
 ARG ALPINEJS_SHA256=57b37d7cae9a27d965fdae4adcc844245dfdc407e655aee85dcfff3a08036a3f
-ARG TAILWIND_VERSION=3.4.17
-ARG TAILWIND_SHA256=176e894661aa9cdc9a5cba6c720044cbbf7b8bd80d1c9a142a7c24b1b6c50d15
 
 RUN mkdir -p /usr/share/traefik-web/static \
  && wget -q "https://cdn.jsdelivr.net/npm/alpinejs@${ALPINEJS_VERSION}/dist/cdn.min.js" \
         -O "/usr/share/traefik-web/static/alpinejs-${ALPINEJS_VERSION}.min.js" \
- && echo "${ALPINEJS_SHA256}  /usr/share/traefik-web/static/alpinejs-${ALPINEJS_VERSION}.min.js" | sha256sum -c - \
- && wget -q "https://cdn.tailwindcss.com/${TAILWIND_VERSION}" \
-        -O "/usr/share/traefik-web/static/tailwindcss-${TAILWIND_VERSION}.min.js" \
- && echo "${TAILWIND_SHA256}  /usr/share/traefik-web/static/tailwindcss-${TAILWIND_VERSION}.min.js" | sha256sum -c -
+ && echo "${ALPINEJS_SHA256}  /usr/share/traefik-web/static/alpinejs-${ALPINEJS_VERSION}.min.js" | sha256sum -c -
 
 # COPY order: static-est first (rootfs + renderer rarely change; backend + web
 # iterate). This keeps the cache hot during Phase D execute / follow-up iter.
@@ -80,7 +82,7 @@ COPY web/ /usr/share/traefik-web/
 # differs from what's already deployed. BUILD_VERSION is auto-injected by the
 # home-assistant/builder CI action (= config.yaml's version:); the default
 # below covers local builds — keep it in sync with config.yaml's version: field.
-ARG BUILD_VERSION=0.1.0-alpha.14
+ARG BUILD_VERSION=0.1.0-alpha.15
 # alpha.14: also export BUILD_VERSION as a runtime env var so the backend can
 # read it for the app.js cache-buster query string. The integration's
 # .bundled_version file already gives cont-init's deploy step a version to

@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.1.0-alpha.15
+
+- Fixed: every Save on the Routes tab failed with "system route field
+  'skip_tls_verify' is locked" — the alpha.14 per-route bool was being
+  edited correctly but dropped from the save payload, which then mismatched
+  what's on disk. Save round-trips cleanly now.
+- Fixed: "Discard changes" on the Routes tab popped up a confusing
+  "Another session is editing — opened 2s ago" prompt against your own
+  session. The discard now just re-fetches routes (matching the Middlewares
+  tab pattern); separately, the server's claim endpoint now recognizes a
+  matching session header and returns a no-op refresh instead of 409.
+- Fixed: after another tab took over your editor session, the persistent
+  "Session was taken over" toast covered the read-only banner's "Take over"
+  button on narrow viewports, making it un-clickable. The toast now slides
+  down when the read-only banner is visible.
+- Changed: the HA system route's middlewares list no longer shows the
+  `redirect-to-https` chip while Force SSL is on. Force SSL handles the
+  redirect at the entry-point level — showing the per-route chip implied a
+  different mechanism than what actually runs.
+- Changed: the Force SSL help text was rewritten to drop a confusing
+  parenthetical about middleware visibility.
+- Internal: Tailwind 3.4.17 moved from build-time CDN fetch to a vendored
+  file in the repo. Removes a build-time network dependency and protects
+  against the Play CDN (in maintenance since Tailwind v4) going away.
+  The script's runtime production-mode console warning is unchanged —
+  Tailwind itself emits it regardless of where the bundle was loaded from;
+  silencing it requires migrating off the Play CDN model (CLI or v4), out
+  of scope here. (Alpine.js still build-time-fetched; its CDN is healthy.)
+
 ## 0.1.0-alpha.14
 
 - Changed: **Skip TLS verify** is now a per-route property, not a middleware.

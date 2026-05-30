@@ -411,8 +411,15 @@ function traefikAppData() {
             // Best-effort: a failure here lets the user see "backend unreachable"
             // via the toast / polling indicator rather than a hard error before
             // anything else loads.
+            // alpha.15: include X-Session-Id when we already have one so the
+            // server can short-circuit a re-claim to success (same browser,
+            // same session). Without this, any code path that re-calls
+            // claimSession would 409 against its own existing session.
             try {
-                const r = await fetch(this.url('/api/session/claim'), { method: 'POST' });
+                const headers = this.sid ? { 'X-Session-Id': this.sid } : {};
+                const r = await fetch(this.url('/api/session/claim'), {
+                    method: 'POST', headers,
+                });
                 if (r.status === 409) {
                     const j = await r.json().catch(() => ({}));
                     this.takeoverPrompt = {
@@ -869,6 +876,11 @@ function traefikAppData() {
                         // Phase E: preserve hand-edited health_path through the UI round-trip.
                         // No input control in v1; this just keeps the field from being stripped.
                         health_path: r.health_path || null,
+                        // alpha.15: include the per-route bool. Omitting it had the
+                        // server's LOCKED-set check on the HA system route compare
+                        // `None != False` → reject every Routes-tab Save with
+                        // "system route field 'skip_tls_verify' is locked".
+                        skip_tls_verify: !!r.skip_tls_verify,
                     };
                     // Phase F: preserve system tag so backend's protection
                     // check matches; user routes omit the field entirely
@@ -904,6 +916,21 @@ function traefikAppData() {
             } catch (e) {
                 this.loadFailed.middlewares = e.message || String(e);
             }
+        },
+
+        // alpha.15: middlewares to render as chips on the HA system row
+        // (read-only). Filters out any middleware whose feature-managed
+        // hideFromDropdown predicate matches the current config — currently:
+        // redirect-to-https when force_ssl is on (render uses an
+        // entrypoint-level redirect, so the chip is misleading). Same
+        // FEATURE_MANAGED_MIDDLEWARES predicate as the user-route dropdown,
+        // one source of truth for "this middleware is owned by a feature
+        // toggle elsewhere; don't surface it here."
+        systemRowVisibleMiddlewares(route) {
+            return (route.middlewares || []).filter(name => {
+                const rule = FEATURE_MANAGED_MIDDLEWARES[name];
+                return !(rule && rule.hideFromDropdown(this.config));
+            });
         },
 
         // alpha.7: toggle a middleware on/off for a user route (multiselect).
