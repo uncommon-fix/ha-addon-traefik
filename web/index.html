@@ -337,13 +337,52 @@
       <div x-show="!loadFailed.routes && routes.length > 0" class="overflow-x-auto">
       <table class="w-full min-w-[720px] border-collapse text-sm">
         <thead>
+          <!-- alpha.19: column headers are click-to-sort buttons. asc → desc →
+               clear cycle; chevron-up/-down indicator on the active column.
+               System rows still pin to the top of their group (see
+               _sortRoutes). Tags column removed. -->
           <tr class="text-left border-b text-[11px] uppercase tracking-wide text-gray-500">
             <th class="py-2 pr-1 w-8"></th>                <!-- chevron -->
-            <th class="py-2 pr-2 w-12">On</th>             <!-- enabled -->
-            <th class="py-2 pr-3">Hostname</th>
-            <th class="py-2 pr-3">Backend</th>
-            <th class="py-2 pr-3 w-24">Scheme</th>
-            <th class="py-2 pr-3">Tags</th>
+            <th class="py-2 pr-2 w-12">
+              <button type="button"
+                      class="uppercase tracking-wide hover:text-gray-900 flex items-center gap-0.5"
+                      :aria-sort="sortKey === 'enabled' ? (sortDir === 'desc' ? 'descending' : 'ascending') : 'none'"
+                      @click="toggleSort('enabled')">
+                <span>On</span>
+                <span x-show="sortKey === 'enabled'"
+                      x-html="icon(sortIndicator('enabled'), 'w-3 h-3 inline-block')"></span>
+              </button>
+            </th>
+            <th class="py-2 pr-3">
+              <button type="button"
+                      class="uppercase tracking-wide hover:text-gray-900 flex items-center gap-0.5"
+                      :aria-sort="sortKey === 'hostname' ? (sortDir === 'desc' ? 'descending' : 'ascending') : 'none'"
+                      @click="toggleSort('hostname')">
+                <span>Hostname</span>
+                <span x-show="sortKey === 'hostname'"
+                      x-html="icon(sortIndicator('hostname'), 'w-3 h-3 inline-block')"></span>
+              </button>
+            </th>
+            <th class="py-2 pr-3">
+              <button type="button"
+                      class="uppercase tracking-wide hover:text-gray-900 flex items-center gap-0.5"
+                      :aria-sort="sortKey === 'backend' ? (sortDir === 'desc' ? 'descending' : 'ascending') : 'none'"
+                      @click="toggleSort('backend')">
+                <span>Backend</span>
+                <span x-show="sortKey === 'backend'"
+                      x-html="icon(sortIndicator('backend'), 'w-3 h-3 inline-block')"></span>
+              </button>
+            </th>
+            <th class="py-2 pr-3 w-24">
+              <button type="button"
+                      class="uppercase tracking-wide hover:text-gray-900 flex items-center gap-0.5"
+                      :aria-sort="sortKey === 'scheme' ? (sortDir === 'desc' ? 'descending' : 'ascending') : 'none'"
+                      @click="toggleSort('scheme')">
+                <span>Scheme</span>
+                <span x-show="sortKey === 'scheme'"
+                      x-html="icon(sortIndicator('scheme'), 'w-3 h-3 inline-block')"></span>
+              </button>
+            </th>
             <th class="py-2 w-20"></th>                    <!-- actions / System pill -->
           </tr>
         </thead>
@@ -353,7 +392,7 @@
             <template x-if="item.type === 'header'">
               <tr class="bg-gray-100 border-b cursor-pointer hover:bg-gray-200 select-none"
                   @click="toggleGroupCollapsed(item.key)">
-                <td colspan="7" class="py-1.5 px-2 text-xs">
+                <td colspan="6" class="py-1.5 px-2 text-xs">
                   <span class="inline-block text-gray-500 align-middle mr-0.5"
                         x-html="icon(isGroupCollapsed(item.key) ? 'chevron-right' : 'chevron-down', 'w-4 h-4 inline-block')"></span>
                   <span class="font-semibold text-gray-700" x-text="item.label"></span>
@@ -413,19 +452,6 @@
                         aria-label="Skip TLS verify on backend"
                         title="Skip TLS verify on backend"
                         x-html="icon('shield-alert', 'w-3.5 h-3.5 inline-block')"></span>
-                </td>
-                <!-- Tags chips (max 3 + "+N more") -->
-                <td class="py-2 pr-3">
-                  <div class="flex flex-wrap gap-1 items-center">
-                    <template x-for="tag in (item.r.tags || []).slice(0, 3)" :key="tag">
-                      <span class="inline-block px-1.5 py-0.5 rounded bg-gray-200 text-gray-700 text-[10px] font-mono"
-                            x-text="tag"></span>
-                    </template>
-                    <span x-show="(item.r.tags || []).length > 3"
-                          class="text-[10px] text-gray-500"
-                          x-text="'+' + ((item.r.tags || []).length - 3) + ' more'"></span>
-                    <span x-show="!(item.r.tags || []).length" class="text-[10px] text-gray-400">—</span>
-                  </div>
                 </td>
                 <!-- Actions: System pill for system rows, Remove button for user rows -->
                 <td class="py-2 text-right pr-2">
@@ -580,50 +606,11 @@
                       </div>
                     </template>
 
-                    <!-- Tags (ALL routes including system) -->
-                    <div>
-                      <label class="block text-xs text-gray-600 mb-0.5">
-                        Tags
-                        <span class="text-gray-400">— organisational; used by "Group by" in the Routes view</span>
-                      </label>
-                      <div class="flex flex-wrap gap-1 items-center">
-                        <template x-for="(tag, ti) in (item.r.tags || [])" :key="tag + '-' + ti">
-                          <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-gray-200 text-gray-800 text-xs font-mono">
-                            <span x-text="tag"></span>
-                            <button type="button"
-                                    @click="removeTag(item.r, tag)"
-                                    class="text-gray-500 hover:text-red-700 leading-none"
-                                    :aria-label="'Remove tag ' + tag">&times;</button>
-                          </span>
-                        </template>
-                        <input type="text"
-                               @keydown="onTagInputKey(item.r, $event)"
-                               @input="if (_tagErrors[item.r._uid]) _tagErrors[item.r._uid] = ''"
-                               placeholder="add tag, Enter or comma to commit"
-                               maxlength="32"
-                               :class="_tagErrors[item.r._uid] ? 'border-red-400 bg-red-50' : 'bg-white'"
-                               class="border rounded px-2 py-0.5 text-xs w-56 font-mono">
-                      </div>
-                      <!-- alpha.17: inline rejection feedback. Set by
-                           onTagInputKey when input fails validation (too long /
-                           illegal chars / duplicate / empty) — replaces the
-                           alpha.16 silent no-op that left users wondering why
-                           their tag didn't appear. -->
-                      <p x-show="_tagErrors[item.r._uid]" x-transition
-                         class="text-[10px] text-red-700 mt-0.5"
-                         x-text="_tagErrors[item.r._uid]"></p>
-                      <p x-show="!_tagErrors[item.r._uid]"
-                         class="text-[10px] text-gray-400 mt-0.5">
-                        A–Z, 0–9, dot, underscore, hyphen, space. ≤32 chars per
-                        tag. Comma-separate to add multiple.
-                      </p>
-                    </div>
-
                     <!-- System-route footer hint -->
                     <template x-if="item.r.system">
                       <div class="text-xs text-gray-600 border-t border-blue-200 pt-2">
                         <strong>System route.</strong> Backend, scheme, TLS, middlewares, and Skip-TLS are
-                        add-on-managed; only the hostname (and optionally tags) can be edited here.
+                        add-on-managed; only the hostname can be edited here.
                       </div>
                     </template>
                   </div>

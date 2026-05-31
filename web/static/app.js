@@ -33,9 +33,6 @@ function makeBlankRoute() {
         // middleware attachment; now an honest per-route bool). Drives the
         // service-level insecureSkipVerify transport in render.py.
         skip_tls_verify: false,
-        // alpha.16: free-form organizational tags. Drives the Routes-tab
-        // "Group by" view; render.py doesn't read this field.
-        tags: [],
         // alpha.16: client-only UI state — controls inline expand/collapse of
         // the editor panel in the compact Routes view. Stripped by save()
         // (the wire payload only sends fields the server schema knows about).
@@ -60,6 +57,7 @@ function makeBlankRoute() {
 const MDI_ICONS = {
     'chevron-down':  'M7.41,8.59L12,13.17L16.59,8.59L18,10L12,16L6,10L7.41,8.59Z',
     'chevron-right': 'M8.59,16.58L13.17,12L8.59,7.41L10,6L16,12L10,18L8.59,16.58Z',
+    'chevron-up':    'M7.41,15.41L12,10.83L16.59,15.41L18,14L12,8L6,14L7.41,15.41Z',
     'lock':          'M12,17A2,2 0 0,0 14,15C14,13.89 13.1,13 12,13A2,2 0 0,0 10,15A2,2 0 0,0 12,17M18,8A2,2 0 0,1 20,10V20A2,2 0 0,1 18,22H6A2,2 0 0,1 4,20V10C4,8.89 4.9,8 6,8H7V6A5,5 0 0,1 12,1A5,5 0 0,1 17,6V8H18M12,3A3,3 0 0,0 9,6V8H15V6A3,3 0 0,0 12,3Z',
     'shield-alert':  'M12,1L3,5V11C3,16.55 6.84,21.74 12,23C17.16,21.74 21,16.55 21,11V5L12,1M11,7H13V13H11V7M11,15H13V17H11V15Z',
 };
@@ -85,10 +83,8 @@ function normalizeRoutes(routes) {
     return (routes || []).map(r => Object.assign(makeBlankRoute(), r, {
         _uid: ++_routeUid,                 // fresh uid every load
         middlewares: Array.isArray(r.middlewares) ? r.middlewares : [],
-        // alpha.16: coerce inbound tags to array (handles `null` from a
-        // pre-migration shape that still has tag-missing) + start collapsed
-        // on load (makeBlankRoute defaults to expanded for fresh routes).
-        tags: Array.isArray(r.tags) ? r.tags.slice() : [],
+        // Start collapsed on load (makeBlankRoute defaults to expanded for
+        // fresh "Add route" rows).
         _expanded: false,
     }));
 }
@@ -254,19 +250,23 @@ function traefikAppData() {
         routes: [],
         saving: false,
         // alpha.16: Routes-tab grouping state. groupBy: 'externalTarget' |
-        // 'none' | 'tag:<name>'. collapsedGroups: Set of currently-collapsed
-        // group keys (interned with the same key shape groupedRoutes emits).
-        // Both load from localStorage in load() via _loadUiPref; setters call
+        // 'none'. collapsedGroups: Set of currently-collapsed group keys
+        // (interned with the same key shape groupedRoutes emits). Both load
+        // from localStorage in load() via _loadUiPref; setters call
         // _saveUiPref so the user's view sticks across reloads.
+        // alpha.19: tags option removed; only externalTarget / none remain.
         groupBy: 'externalTarget',
         collapsedGroups: new Set(),
-        // alpha.17: per-route tag-editor error message, keyed by route _uid.
-        // Set by onTagInputKey when an add fails (empty / too long / bad
-        // chars / duplicate); rendered inline beneath the tag input so the
-        // user sees WHY their input was rejected. Cleared on the next
-        // successful add or when the input is cleared. Held outside the
-        // route object so it doesn't leak into the save() payload.
-        _tagErrors: {},
+        // alpha.19: column sort. Click a sortable column header → cycle
+        // asc → desc → clear. When clear (sortKey === ''), routes fall back
+        // to alphabetical-by-hostname within their group (the alpha.16
+        // default). Sort applies within each group when grouped, across the
+        // flat list when not — the system route stays pinned to the top of
+        // its group regardless (the alpha.17 fix that drove the explicit
+        // pin in the first place). Persisted to localStorage so the user's
+        // sort sticks across reloads + across groupby toggles.
+        sortKey: '',          // '' | 'hostname' | 'backend' | 'scheme' | 'enabled' | 'status'
+        sortDir: 'asc',       // 'asc' | 'desc'
 
         // Phase F: Middlewares tab
         middlewares: [],
@@ -386,19 +386,18 @@ function traefikAppData() {
         // The template iterates this; each group renders a clickable header
         // (collapse toggle) followed by its routes as compact rows.
         //
-        // groupBy values:
+        // groupBy values (alpha.19: tag grouping removed):
         //   - 'externalTarget' (default): group by route.backend_host for
         //     external; "Home Assistant" for home_assistant kind. Port is
         //     ignored on purpose so e.g. 10.0.0.20:443 and 10.0.0.20:8006
         //     share a group.
-        //   - 'tag:<name>': routes whose tags include <name> join that
-        //     group; all others fall under "Untagged".
         //   - 'none': single flat group containing everything (keeps the
         //     template shape uniform regardless of grouping choice).
         //
         // Group order: "Home Assistant" pinned to top (system route is
-        // always visible), then alphabetical by label. Within a group:
-        // alphabetical by hostname.
+        // always visible), then alphabetical by label.
+        // Within a group: _sortRoutes applies the active column sort
+        // (system row always pinned to top of its group).
         get groupedRoutes() {
             const groups = new Map();      // key -> {key, label, count, routes}
             const ensure = (key, label) => {
@@ -425,15 +424,6 @@ function traefikAppData() {
                     }
                     return { key: 'ha', label: 'Home Assistant' };
                 }
-                if (this.groupBy.startsWith('tag:')) {
-                    const wanted = this.groupBy.slice(4);
-                    const has = (r.tags || []).some(
-                        t => t.toLowerCase() === wanted.toLowerCase()
-                    );
-                    return has
-                        ? { key: 'tagged', label: wanted }
-                        : { key: 'untagged', label: 'Untagged' };
-                }
                 // Defensive: unknown groupBy → flat list.
                 return { key: 'all', label: 'All routes' };
             };
@@ -443,27 +433,72 @@ function traefikAppData() {
                 g.routes.push(r);
                 g.count++;
             }
-            // Sort routes within each group: system routes pinned to top,
-            // then alphabetical by hostname. alpha.17: without the system
-            // pin, a freshly-added user route with an empty hostname sorts
-            // BEFORE "hass" alphabetically and the HA self-route gets
-            // shoved down.
             for (const g of groups.values()) {
-                g.routes.sort((a, b) => {
-                    if (a.system && !b.system) return -1;
-                    if (!a.system && b.system) return 1;
-                    return (a.hostname || '').localeCompare(b.hostname || '');
-                });
+                g.routes = this._sortRoutes(g.routes);
             }
             // Order the groups: HA pinned to top, then alphabetical by label.
-            // "Untagged" sinks to the bottom (least interesting bucket).
             return [...groups.values()].sort((a, b) => {
                 if (a.key === 'ha') return -1;
                 if (b.key === 'ha') return 1;
-                if (a.key === 'untagged') return 1;
-                if (b.key === 'untagged') return -1;
                 return a.label.localeCompare(b.label);
             });
+        },
+
+        // alpha.19: sort a routes array per the active sortKey/sortDir, with
+        // the system row pinned to the top regardless (alpha.17 invariant —
+        // the HA self-route must stay anchored so users don't lose track of
+        // it). When sortKey is '' the fallback is alphabetical-by-hostname,
+        // matching the alpha.16-through-alpha.18 default.
+        _sortRoutes(routes) {
+            const key = this.sortKey;
+            const dir = this.sortDir === 'desc' ? -1 : 1;
+            const valueOf = (r) => {
+                switch (key) {
+                    case 'hostname': return (r.hostname || '').toLowerCase();
+                    case 'backend':  return this.compactBackendLabel(r).toLowerCase();
+                    case 'scheme':   return (r.scheme || '').toLowerCase();
+                    case 'enabled':  return r.enabled ? 0 : 1;   // On first when asc
+                    case 'status': {
+                        // Order: up < unknown < down < disabled. Surfaces
+                        // problems near the top when sorted desc.
+                        const rank = { up: 0, unknown: 1, down: 2, disabled: 3 };
+                        const s = this.routeHealth[r.hostname] || 'unknown';
+                        return rank[s] ?? 4;
+                    }
+                    default: return (r.hostname || '').toLowerCase();
+                }
+            };
+            return [...routes].sort((a, b) => {
+                if (a.system && !b.system) return -1;
+                if (!a.system && b.system) return 1;
+                const av = valueOf(a), bv = valueOf(b);
+                if (av < bv) return -1 * dir;
+                if (av > bv) return  1 * dir;
+                // Stable tiebreak by hostname so a clear column doesn't
+                // shuffle rows on every render.
+                return (a.hostname || '').localeCompare(b.hostname || '');
+            });
+        },
+
+        // alpha.19: click a column header to cycle its sort
+        // (asc → desc → clear). Persists to localStorage. UI uses
+        // sortIndicator(key) to draw the active arrow.
+        toggleSort(key) {
+            if (this.sortKey !== key) {
+                this.sortKey = key;
+                this.sortDir = 'asc';
+            } else if (this.sortDir === 'asc') {
+                this.sortDir = 'desc';
+            } else {
+                this.sortKey = '';
+                this.sortDir = 'asc';
+            }
+            this._saveUiPref('traefik-addon:routes-sort',
+                JSON.stringify({ key: this.sortKey, dir: this.sortDir }));
+        },
+        sortIndicator(key) {
+            if (this.sortKey !== key) return '';
+            return this.sortDir === 'desc' ? 'chevron-down' : 'chevron-up';
         },
 
         // alpha.16: flat list the Routes table template iterates over.
@@ -500,31 +535,13 @@ function traefikAppData() {
             return host || port ? (host + port) : '(unset)';
         },
 
-        // alpha.16: dropdown options for the "Group by" selector. Always
-        // includes the two built-in modes; appends one option per distinct
-        // tag currently present on any route so users can group by a tag
-        // without leaving the page to predefine it.
+        // alpha.16: dropdown options for the "Group by" selector.
+        // alpha.19: tag options removed; static two-entry list.
         get groupByOptions() {
-            const out = [
+            return [
                 { value: 'externalTarget', label: 'External target (default)' },
                 { value: 'none', label: 'None (flat list)' },
             ];
-            const seen = new Set();
-            for (const r of this.routes) {
-                for (const t of (r.tags || [])) {
-                    const k = t.toLowerCase();
-                    if (!seen.has(k)) {
-                        seen.add(k);
-                        out.push({ value: 'tag:' + t, label: 'Tag: ' + t });
-                    }
-                }
-            }
-            // Stable order: built-ins first, then tag options alphabetically.
-            const head = out.slice(0, 2);
-            const tags = out.slice(2).sort((a, b) =>
-                a.label.localeCompare(b.label)
-            );
-            return [...head, ...tags];
         },
 
         // alpha.16: group + route ui-state helpers. Each is a no-op when the
@@ -547,72 +564,6 @@ function traefikAppData() {
         },
         toggleRouteExpanded(r) {
             r._expanded = !r._expanded;
-        },
-
-        // alpha.16 / alpha.17: tag editor commit. Trim, lowercase-dedupe
-        // against existing, validate against ROUTE_TAG_RE shape (mirrors
-        // server). Returns '' on success or a human-readable error string —
-        // onTagInputKey surfaces the error inline so users see WHY a tag
-        // was rejected (alpha.16's silent no-op was a UX bug). Server
-        // still enforces the same rules so a hand-PUT can't bypass them.
-        addTag(r, raw) {
-            const t = (raw || '').trim();
-            if (!t) return 'empty';
-            if (t.length > 32) return `too long (max 32 chars; got ${t.length})`;
-            if (!/^[A-Za-z0-9._ -]+$/.test(t)) {
-                return 'must be letters, digits, dot, underscore, hyphen, or space';
-            }
-            if (!Array.isArray(r.tags)) r.tags = [];
-            if (r.tags.some(x => x.toLowerCase() === t.toLowerCase())) {
-                return `already tagged "${t}"`;
-            }
-            r.tags.push(t);
-            return '';
-        },
-        removeTag(r, tag) {
-            if (!Array.isArray(r.tags)) return;
-            const i = r.tags.indexOf(tag);
-            if (i >= 0) r.tags.splice(i, 1);
-        },
-        // alpha.17: tag-editor input handler. Commits on Enter or comma.
-        // Comma-splits the buffer so users can paste/type `foo,bar,baz` and
-        // get three tags (alpha.16 fed the whole string to addTag and the
-        // commas tripped the regex, so the input rejected everything).
-        onTagInputKey(r, event) {
-            const key = event.key;
-            if (key !== 'Enter' && key !== ',') return;
-            event.preventDefault();
-            const input = event.target;
-            const parts = input.value
-                .split(',').map(s => s.trim()).filter(Boolean);
-            if (!parts.length) {
-                // Empty / whitespace-only: clear input + clear any prior
-                // error (the user hit Enter intending to commit nothing).
-                input.value = '';
-                this._tagErrors[r._uid] = '';
-                return;
-            }
-            const errors = [];
-            let anyAdded = false;
-            for (const part of parts) {
-                const err = this.addTag(r, part);
-                if (err) errors.push(`"${part}": ${err}`);
-                else anyAdded = true;
-            }
-            if (!errors.length) {
-                input.value = '';
-                this._tagErrors[r._uid] = '';
-            } else {
-                // Drop the parts that succeeded so the input only contains
-                // what still needs the user's attention. If everything
-                // failed, leave the input intact.
-                if (anyAdded) {
-                    input.value = errors
-                        .map(e => e.match(/^"([^"]+)":/)?.[1] || '')
-                        .filter(Boolean).join(', ');
-                }
-                this._tagErrors[r._uid] = errors.join('; ');
-            }
         },
 
         // alpha.16: localStorage helpers. No prior usage in this codebase —
@@ -781,6 +732,8 @@ function traefikAppData() {
             // BEFORE the first render so the user's view sticks across
             // reloads. groupBy falls back to the default; collapsedGroups
             // tolerates a malformed JSON string (treat as empty set).
+            // alpha.19: alongside groupby/collapsed, hydrate sortKey + sortDir
+            // from the same pref bucket so the user's last sort sticks too.
             this.groupBy = this._loadUiPref(
                 'traefik-addon:routes-groupby', 'externalTarget'
             );
@@ -795,6 +748,19 @@ function traefikAppData() {
             } catch (_) {
                 this.collapsedGroups = new Set();
             }
+            try {
+                const raw = this._loadUiPref('traefik-addon:routes-sort', '');
+                if (raw) {
+                    const s = JSON.parse(raw);
+                    if (s && typeof s === 'object') {
+                        const ALLOWED_KEYS = new Set([
+                            '', 'hostname', 'backend', 'scheme', 'enabled', 'status',
+                        ]);
+                        if (ALLOWED_KEYS.has(s.key)) this.sortKey = s.key;
+                        if (s.dir === 'asc' || s.dir === 'desc') this.sortDir = s.dir;
+                    }
+                }
+            } catch (_) { /* malformed — keep defaults */ }
 
             // alpha.12: claim the editor session FIRST. If 409, the takeover
             // modal appears; we still poll status so the user sees Traefik
@@ -1195,12 +1161,6 @@ function traefikAppData() {
                         // `None != False` → reject every Routes-tab Save with
                         // "system route field 'skip_tls_verify' is locked".
                         skip_tls_verify: !!r.skip_tls_verify,
-                        // alpha.16: include organizational tags. tags is NOT
-                        // in the LOCKED set so it round-trips even for the
-                        // system row (unlike skip_tls_verify which is locked).
-                        // Always send an array — never undefined — so the
-                        // server gets a stable shape regardless of UI state.
-                        tags: Array.isArray(r.tags) ? r.tags.slice() : [],
                     };
                     // Phase F: preserve system tag so backend's protection
                     // check matches; user routes omit the field entirely

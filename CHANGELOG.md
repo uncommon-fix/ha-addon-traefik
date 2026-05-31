@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.0-alpha.19
+
+- **Click-to-sort columns in the Routes tab.** Click **Hostname**,
+  **Backend**, **Scheme**, or **On** in the column header to sort by
+  that field; click again to flip ascending/descending; click a third
+  time to clear back to default (alphabetical hostname). Sorting
+  applies within each group when grouped, or across the whole list
+  when ungrouped. The HA system route stays pinned at the top of its
+  group regardless of sort. Your sort choice persists across reloads
+  and across "Group by" changes.
+- **Tags removed.** The alpha.16 per-route tags feature has been
+  removed entirely: no more tag chips on rows, no tag editor in the
+  expanded panel, and the "Group by" dropdown is back to two options
+  (External target / None). On upgrade, an idempotent migration strips
+  any `tags:` arrays from `/data/routes.yml` so the next save round-trip
+  stays clean -- no data loss for the rest of each route.
+
 ## 0.1.0-alpha.18
 
 - **Proper icons in the Routes tab.** The emoji glyphs (`▶`/`▼` chevrons

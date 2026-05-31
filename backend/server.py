@@ -159,13 +159,6 @@ ROUTE_TYPES = {
     # it into a service-level serversTransport), so it now lives where it
     # belongs — on the route. Optional; renderer defaults to False when absent.
     "skip_tls_verify": bool,
-    # alpha.16: free-form per-route organizational tags. Drive the Routes-tab
-    # "Group by" view and slice the list in different ways without changing
-    # backend semantics — render.py never reads this field. Optional; backend
-    # backfills `[]` on missing keys via migrate._backfill_route_tags. Not
-    # locked on the system route: users may want to tag the HA self-route for
-    # their own grouping. See _validate_routes below for the content rules.
-    "tags": list,
     # Phase F: marks routes seeded/managed by the add-on (currently only
     # "ha_self"). Absent on user routes. User PUTs that try to set or change
     # this field on existing system routes are rejected; only the hostname
@@ -194,14 +187,6 @@ RESERVED_MIDDLEWARE_NAMES = {"chain", "noop", "api", "dashboard"}
 # control chars.
 BASICAUTH_USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 BCRYPT_ROUNDS = 12
-
-# alpha.16: per-route tag content rule. Alphanumerics + dot/underscore/hyphen/
-# space — covers `lan-only`, `prod.web`, `Home Office`. No `<`, `>`, quotes or
-# control chars; tags are echoed back into the HTML chip render, this keeps
-# the surface XSS-safe. ≤32 chars per tag (length checked separately to keep
-# the error message clear).
-ROUTE_TAG_RE = re.compile(r"^[A-Za-z0-9._ -]+$")
-ROUTE_TAG_MAX_LEN = 32
 
 
 # ---------- validation ----------
@@ -252,25 +237,6 @@ def _validate_routes(routes):
             raise web.HTTPBadRequest(
                 text=f"route[{i}].middlewares: not a list of strings"
             )
-        # alpha.16: tags content rule. Validate per-element so the error
-        # points at the offending value, not just "list of strings".
-        tags = r.get("tags") or []
-        for j, t in enumerate(tags):
-            if not isinstance(t, str):
-                raise web.HTTPBadRequest(
-                    text=f"route[{i}].tags[{j}]: not a string"
-                )
-            if len(t) > ROUTE_TAG_MAX_LEN:
-                raise web.HTTPBadRequest(
-                    text=f"route[{i}].tags[{j}]: too long "
-                         f"(max {ROUTE_TAG_MAX_LEN} chars)"
-                )
-            if not ROUTE_TAG_RE.match(t):
-                raise web.HTTPBadRequest(
-                    text=f"route[{i}].tags[{j}]={t!r}: must match "
-                         f"{ROUTE_TAG_RE.pattern} (alphanumerics + "
-                         "dot/underscore/hyphen/space only)"
-                )
         # Phase E: health_path is optional. Belt+braces type check (the
         # ROUTE_TYPES loop above also catches non-str/non-None) for a
         # friendlier error message; semantic check enforces leading "/".
