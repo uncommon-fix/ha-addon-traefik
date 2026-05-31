@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.1.0-alpha.20
+
+- **Draft / live config split + Apply.** Editing the Routes, Middlewares,
+  or Configuration tab no longer pushes changes to Traefik immediately.
+  Every edit auto-saves to a **draft** (debounced; 500ms for routes /
+  middlewares, 1500ms for Configuration's regex-validated fields). A
+  sticky **"N pending changes — Apply / Discard all"** footer appears at
+  the bottom of every tab whenever the draft differs from live. Click
+  **Apply** to atomically commit draft → live and trigger Traefik
+  render; click **Discard all** (with inline confirm) to reset the draft
+  back to live. Per-row amber dot marks routes that differ from live.
+- **Soft delete with Restore.** Clicking Remove on a route marks it as
+  pending deletion — the row stays visible in the table with strike-
+  through styling, sorted to the bottom of its group, with a
+  **Restore** button to undo. Actual deletion happens on Apply.
+- **Crash-safe Apply.** Apply uses a journal-based atomic commit: live
+  files are staged as `*.applying` siblings, a journal marker is
+  written, all three live files are atomically renamed, then the
+  journal is deleted. If the addon is killed mid-Apply, the next boot's
+  cont-init completes the pending rename and runs render. Render
+  failures roll live back to the pre-Apply snapshot.
+- **3-way merge on live drift.** When an addon migration mutates the
+  live config behind the editor's back (e.g. a future migration adds
+  a route or strips a removed field), pending draft edits are PRESERVED
+  via a 3-way merge instead of being silently reset. Only fields the
+  user AND the migration both edited surface as conflicts (with a
+  banner explaining what was reconciled).
+- **Version-skew guard.** Every mutating request now sends an
+  `X-Addon-Version` header; the backend 409s if it doesn't match the
+  running addon, prompting the user to reload after an upgrade rather
+  than sending an old payload shape to a new validator.
+- **`rid` (route uuid) + `mid` (middleware uuid).** Stable per-row
+  identity assigned by a one-shot migration on first alpha.20 boot.
+  Hidden from the UI; used internally so renames (hostname, middleware
+  name) don't show as add+delete in the pending changes summary.
+
 ## 0.1.0-alpha.19
 
 - **Click-to-sort columns in the Routes tab.** Click **Hostname**,

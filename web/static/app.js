@@ -9,6 +9,11 @@
 
 const ingressMeta = document.querySelector('meta[name="ingress-path"]');
 const INGRESS_PATH = (ingressMeta && ingressMeta.content) || '';
+// alpha.20: addon version is rendered into <meta name="app-version"> by
+// serve_index. Sent as X-Addon-Version on every mutating call so the
+// backend can 409 a stale tab after an addon upgrade.
+const appVersionMeta = document.querySelector('meta[name="app-version"]');
+const APP_VERSION = (appVersionMeta && appVersionMeta.content) || '';
 
 // Phase F: stable per-route uid for the routes-table x-for :key. Without
 // this, removeRoute() shifts indexes and Alpine tears down/recreates rows,
@@ -193,6 +198,7 @@ function traefikAppData() {
         icon(name, classes = '') { return mdiSvg(name, classes); },
 
         ingressPath: INGRESS_PATH,
+        appVersion: APP_VERSION,
         // Default 'routes' once configured; load() flips to 'config'
         // (with wizardOpen=true) on first run so a sensible underlay
         // sits behind the wizard overlay.
@@ -249,6 +255,32 @@ function traefikAppData() {
         // Routes tab
         routes: [],
         saving: false,
+        // alpha.20: live caches for per-row diff + soft-delete restore. Set
+        // by loadRoutes/loadMiddlewares/loadConfig (always fetched alongside
+        // the draft view). Refreshed after every successful Apply.
+        routesLive: [],
+        middlewaresLive: [],
+        configLive: {},
+        // alpha.20: pending-changes summary from GET /api/pending. Refreshed
+        // after every successful auto-save flush + on load. Drives the
+        // sticky Apply footer at the bottom of the page.
+        pending: { routes: { modified: [], added: [], deleted: [] },
+                   middlewares: { modified: [], added: [], deleted: [] },
+                   config: { modified: [] },
+                   warnings: [], total: 0 },
+        // alpha.20: auto-save bookkeeping. Per-surface debounce timer +
+        // in-flight marker. _suspendAutoSave skips watcher firings during
+        // the initial load() so we don't immediately re-PUT what we just
+        // GET'd. autoSaveError tracks the last failure per surface so the
+        // UI can show "auto-save failing" without spamming toasts.
+        _autoSaveTimer: { routes: null, middlewares: null, config: null },
+        _autoSaveInflight: { routes: false, middlewares: false, config: false },
+        _suspendAutoSave: true,                       // true until first load completes
+        autoSaveError: { routes: '', middlewares: '', config: '' },
+        // alpha.20: Apply + Discard state.
+        applying: false,
+        discarding: false,
+        discardConfirmOpen: false,
         // alpha.16: Routes-tab grouping state. groupBy: 'externalTarget' |
         // 'none'. collapsedGroups: Set of currently-collapsed group keys
         // (interned with the same key shape groupedRoutes emits). Both load
@@ -427,7 +459,12 @@ function traefikAppData() {
                 // Defensive: unknown groupBy → flat list.
                 return { key: 'all', label: 'All routes' };
             };
-            for (const r of this.routes) {
+            // alpha.20: include orphan rows (routes in live but missing
+            // from draft = user clicked Remove, not yet Applied) so they
+            // render with strikethrough + Restore button inline with their
+            // group. _sortRoutes pushes orphans to the bottom of the group.
+            const allRows = [...this.routes, ...this._orphanRoutes];
+            for (const r of allRows) {
                 const { key, label } = keyFor(r);
                 const g = ensure(key, label);
                 g.routes.push(r);
@@ -469,8 +506,14 @@ function traefikAppData() {
                 }
             };
             return [...routes].sort((a, b) => {
+                // alpha.17: system row pinned to top regardless of sort.
                 if (a.system && !b.system) return -1;
                 if (!a.system && b.system) return 1;
+                // alpha.20: soft-deleted (orphan) rows pinned to BOTTOM of
+                // their group regardless of sort, so the active list stays
+                // scannable. The audit specifically flagged this.
+                if (a._orphan && !b._orphan) return 1;
+                if (!a._orphan && b._orphan) return -1;
                 const av = valueOf(a), bv = valueOf(b);
                 if (av < bv) return -1 * dir;
                 if (av > bv) return  1 * dir;
@@ -628,6 +671,15 @@ function traefikAppData() {
             const headers = {};
             if (body !== undefined) headers['Content-Type'] = 'application/json';
             if (this.sid && method !== 'GET') headers['X-Session-Id'] = this.sid;
+            // alpha.20: every mutating call sends X-Addon-Version so the
+            // backend can 409 a stale browser tab after an addon upgrade
+            // (avoids sending an old payload shape to a new validator).
+            // {{APP_VERSION}} is substituted by server.serve_index; if the
+            // literal placeholder is still there (unexpected) we just send
+            // empty, which the backend ignores.
+            if (method !== 'GET' && this.appVersion) {
+                headers['X-Addon-Version'] = this.appVersion;
+            }
             const r = await fetch(this.url(path), {
                 method,
                 headers,
@@ -638,6 +690,19 @@ function traefikAppData() {
                 err.code = 'SESSION_LOST';
                 this.onSessionLost();
                 throw err;
+            }
+            if (r.status === 409) {
+                // alpha.20: VERSION_MISMATCH gets a distinct code so the
+                // caller can prompt a reload (other 409s — like Apply no-op
+                // — surface as normal errors).
+                const j = await r.json().catch(() => ({}));
+                if (j.code === 'VERSION_MISMATCH') {
+                    const err = new Error(j.error || 'Addon version mismatch — reload required.');
+                    err.code = 'VERSION_MISMATCH';
+                    throw err;
+                }
+                // Re-emit as a regular error so the caller's catch sees it.
+                throw new Error(j.error || `HTTP 409`);
             }
             if (!r.ok) {
                 // alpha.11+ backend returns {"error": "..."} JSON for every error;
@@ -778,6 +843,13 @@ function traefikAppData() {
             }
             await this.loadRoutes();
             await this.loadMiddlewares();   // Phase F
+            // alpha.20: All surfaces are loaded; re-enable auto-save so the
+            // Alpine watchers can fire on actual user edits. The watchers
+            // are registered in alpine:init (bottom of file).
+            // Defer one tick so any pending Alpine reactivity from the
+            // loaders settles BEFORE we unblock the watchers.
+            await new Promise(r => setTimeout(r, 0));
+            this._suspendAutoSave = false;
             this.pollStatus();
             if (!this._statusTimer) {
                 this._statusTimer = setInterval(() => this.pollStatus(), 5000);
@@ -823,13 +895,27 @@ function traefikAppData() {
             // alpha.12: failures land in loadFailed.config (NOT a shared
             // save-error slot), so a stale load can't be "fixed" by clicking
             // Save and overwriting the real config.
+            // alpha.20: fetch draft + live concurrently for per-field diff.
             this.loadFailed.config = '';
+            // alpha.20: _suspendAutoSave management is owned by the
+            // orchestrators (load, apply, discardAll) — not per-loader.
+            // Loaders just write through; the orchestrator wraps the call
+            // in suspend so the watcher firings from this.routes = ...
+            // assignments don't trigger redundant PUTs.
             try {
-                const r = await fetch(this.url('/api/config'));
-                if (!r.ok) {
-                    const j = await r.json().catch(() => ({}));
-                    throw new Error(j.error || `GET /api/config -> ${r.status}`);
+                const [draftRes, liveRes] = await Promise.all([
+                    fetch(this.url('/api/config')),
+                    fetch(this.url('/api/config?live=1')),
+                ]);
+                if (!draftRes.ok) {
+                    const j = await draftRes.json().catch(() => ({}));
+                    throw new Error(j.error || `GET /api/config -> ${draftRes.status}`);
                 }
+                if (liveRes.ok) {
+                    const liveJ = await liveRes.json();
+                    this.configLive = { ...liveJ };
+                }
+                const r = draftRes;
                 const j = await r.json();
                 // cloudflare_token always comes back empty; client treats the
                 // input as write-only (placeholder shows ••••• when set).
@@ -851,21 +937,263 @@ function traefikAppData() {
         },
 
         async loadRoutes() {
+            // alpha.20: fetch draft + live concurrently. Draft binds to the
+            // editor; live caches for the per-row diff + soft-delete restore.
+            // _suspendAutoSave is set true here and cleared in load() after
+            // ALL surface loads complete, so the initial routes assignment
+            // doesn't fire a spurious auto-save round-trip.
             this.loadFailed.routes = '';
+            // alpha.20: _suspendAutoSave management is owned by the
+            // orchestrators (load, apply, discardAll) — not per-loader.
+            // Loaders just write through; the orchestrator wraps the call
+            // in suspend so the watcher firings from this.routes = ...
+            // assignments don't trigger redundant PUTs.
             try {
-                const r = await fetch(this.url('/api/routes'));
-                if (!r.ok) {
-                    const j = await r.json().catch(() => ({}));
-                    throw new Error(j.error || `GET /api/routes -> ${r.status}`);
+                const [draftRes, liveRes] = await Promise.all([
+                    fetch(this.url('/api/routes')),
+                    fetch(this.url('/api/routes?live=1')),
+                ]);
+                if (!draftRes.ok) {
+                    const j = await draftRes.json().catch(() => ({}));
+                    throw new Error(j.error || `GET /api/routes -> ${draftRes.status}`);
                 }
-                const j = await r.json();
-                if (j.domain && !this.config.domain) {
-                    this.config.domain = j.domain;
+                if (!liveRes.ok) {
+                    const j = await liveRes.json().catch(() => ({}));
+                    throw new Error(j.error || `GET /api/routes?live=1 -> ${liveRes.status}`);
                 }
-                this.routes = normalizeRoutes(j.routes);
+                const draft = await draftRes.json();
+                const live = await liveRes.json();
+                if (draft.domain && !this.config.domain) {
+                    this.config.domain = draft.domain;
+                }
+                this.routes = normalizeRoutes(draft.routes);
+                this.routesLive = (live.routes || []).map(r => ({ ...r }));
             } catch (e) {
                 this.loadFailed.routes = e.message || String(e);
             }
+            // Refresh pending after the surface reloads so the Apply banner
+            // accurately reflects disk state (e.g. on the first load after a
+            // takeover the inherited draft may already have pending changes).
+            this.loadPending().catch(() => {});
+        },
+
+        // alpha.20: re-fetch the per-surface diff summary + warnings from
+        // disk. Cheap; computed on demand server-side. Called after every
+        // successful auto-save flush and after Apply/Discard so the sticky
+        // Apply footer stays in sync.
+        async loadPending() {
+            try {
+                const r = await fetch(this.url('/api/pending'));
+                if (!r.ok) return;
+                this.pending = await r.json();
+            } catch (_) { /* drop quietly */ }
+        },
+
+        // ---------- alpha.20: auto-save + Apply ----------
+        // Debounce window: 500ms covers Most edit patterns. Configuration's
+        // regex-gated text fields (cloudflare token, domain) get 1500ms in
+        // _autoSaveDelayFor to avoid per-keystroke validation toast spam.
+        _autoSaveDelayFor(surface) {
+            // alpha.20: tiered debounce. Config is the only surface with
+            // strict regex fields where mid-typing snapshots would fail
+            // validation on the backend.
+            return surface === 'config' ? 1500 : 500;
+        },
+
+        // Schedule a debounced auto-save flush for one surface. Called by
+        // the Alpine $watch handlers registered in alpine:init. Skipped
+        // entirely while _suspendAutoSave is true (set during load()).
+        scheduleAutoSave(surface) {
+            if (this._suspendAutoSave) return;
+            if (this.viewMode === 'ro') return;       // RO observer can't save
+            const t = this._autoSaveTimer[surface];
+            if (t) clearTimeout(t);
+            this._autoSaveTimer[surface] = setTimeout(
+                () => this._flushAutoSave(surface),
+                this._autoSaveDelayFor(surface),
+            );
+        },
+
+        async _flushAutoSave(surface) {
+            this._autoSaveTimer[surface] = null;
+            this._autoSaveInflight[surface] = true;
+            try {
+                if (surface === 'routes')           await this._putRoutesDraft();
+                else if (surface === 'middlewares') await this._putMiddlewaresDraft();
+                else if (surface === 'config')      await this._putConfigDraft();
+                this.autoSaveError[surface] = '';
+                this.loadPending().catch(() => {});
+            } catch (e) {
+                if (e.code === 'VERSION_MISMATCH') {
+                    this.toast.error(
+                        'Addon was updated — reload to continue editing.',
+                        { sticky: true },
+                    );
+                    return;
+                }
+                if (e.code === 'SESSION_LOST') return;   // already handled
+                this.autoSaveError[surface] = e.message || String(e);
+                this.toast.error(`Auto-save (${surface}) failed: ${e.message}`);
+            } finally {
+                this._autoSaveInflight[surface] = false;
+            }
+        },
+
+        async _putRoutesDraft() {
+            // Build the same payload shape save() built. Soft-deleted routes
+            // are not in this.routes (removeRoute splices) so they're
+            // naturally excluded.
+            const payload = {
+                routes: this.routes.map(r => {
+                    const out = {
+                        hostname: r.hostname,
+                        backend_kind: r.backend_kind,
+                        backend_host: r.backend_kind === 'external' ? (r.backend_host || null) : null,
+                        backend_port: r.backend_kind === 'external' ? (r.backend_port || null) : null,
+                        scheme: r.scheme,
+                        tls: !!r.tls,
+                        enabled: !!r.enabled,
+                        middlewares: r.middlewares || [],
+                        health_path: r.health_path || null,
+                        skip_tls_verify: !!r.skip_tls_verify,
+                    };
+                    if (r.rid) out.rid = r.rid;
+                    if (r.system) out.system = r.system;
+                    return out;
+                }),
+            };
+            await this.api('PUT', '/api/routes', payload);
+        },
+
+        async _putMiddlewaresDraft() {
+            const payload = {
+                middlewares: this.middlewares.map(m => {
+                    const out = { name: m.name, type: m.type, config: m.config || {} };
+                    if (m.mid) out.mid = m.mid;
+                    return out;
+                }),
+            };
+            await this.api('PUT', '/api/middlewares', payload);
+        },
+
+        async _putConfigDraft() {
+            // Cloudflare token: empty means "keep existing" (backend honors).
+            const payload = { ...this.config };
+            // Strip blank cloudflare_token (preserve-existing semantic).
+            if (!(payload.cloudflare_token || '').trim()) delete payload.cloudflare_token;
+            await this.api('PUT', '/api/config', payload);
+        },
+
+        // Apply: flush any pending debounce + commit draft → live + render.
+        async apply() {
+            if (this.applying || this.viewMode === 'ro') return;
+            if (this.pending.total === 0) return;
+            // Flush any pending debounce timers synchronously first so we
+            // don't lose the latest edit.
+            for (const s of ['routes', 'middlewares', 'config']) {
+                if (this._autoSaveTimer[s]) {
+                    clearTimeout(this._autoSaveTimer[s]);
+                    this._autoSaveTimer[s] = null;
+                    await this._flushAutoSave(s);
+                }
+            }
+            this.applying = true;
+            try {
+                const j = await this.api('POST', '/api/apply', {});
+                if (j && j.ok) {
+                    this.toast.success(`Applied ${j.applied} change(s); Traefik reloaded.`);
+                    // Live state advanced — refetch everything so the
+                    // diff caches + per-row highlights reset cleanly.
+                    // Suspend auto-save during the reload to avoid spurious
+                    // PUTs from the this.routes = ... reassignment.
+                    this._suspendAutoSave = true;
+                    await this.loadRoutes();
+                    await this.loadMiddlewares();
+                    await this.loadConfig();
+                    await this.loadPending();
+                    await new Promise(r => setTimeout(r, 0));
+                    this._suspendAutoSave = false;
+                }
+            } catch (e) {
+                if (e.code === 'VERSION_MISMATCH') {
+                    this.toast.error(
+                        'Addon was updated — reload to continue editing.',
+                        { sticky: true },
+                    );
+                } else if (e.code !== 'SESSION_LOST') {
+                    this.toast.error(`Apply failed: ${e.message}`);
+                }
+            } finally {
+                this.applying = false;
+            }
+        },
+
+        // Discard all pending changes (resets draft → live). Inline-confirm
+        // pattern: first click opens discardConfirmOpen; second click
+        // (the "Discard all" button rendered when open) executes.
+        async discardAll() {
+            if (this.discarding || this.viewMode === 'ro') return;
+            this.discarding = true;
+            // Cancel any pending debounce timers so a late flush doesn't
+            // re-poison the draft after the discard.
+            for (const s of ['routes', 'middlewares', 'config']) {
+                if (this._autoSaveTimer[s]) {
+                    clearTimeout(this._autoSaveTimer[s]);
+                    this._autoSaveTimer[s] = null;
+                }
+            }
+            try {
+                await this.api('POST', '/api/discard', { scope: 'all' });
+                this.toast.success('Discarded pending changes.');
+                this.discardConfirmOpen = false;
+                // Reload everything so the editor view matches live.
+                this._suspendAutoSave = true;
+                await this.loadRoutes();
+                await this.loadMiddlewares();
+                await this.loadConfig();
+                await this.loadPending();
+                await new Promise(r => setTimeout(r, 0));
+                this._suspendAutoSave = false;
+            } catch (e) {
+                if (e.code !== 'SESSION_LOST') {
+                    this.toast.error(`Discard failed: ${e.message}`);
+                }
+            } finally {
+                this.discarding = false;
+            }
+        },
+
+        // Restore a soft-deleted route — the orphan rows (live routes not
+        // present in draft) render with a Restore button instead of Remove.
+        // Click pushes the live route back into this.routes; auto-save
+        // picks it up.
+        restoreRoute(rid) {
+            const liveR = this.routesLive.find(r => r.rid === rid);
+            if (!liveR) return;
+            // Don't duplicate if somehow already present.
+            if (this.routes.some(r => r.rid === rid)) return;
+            // normalizeRoutes adds default fields + _uid + _expanded; we
+            // want the same shape so render is consistent.
+            const restored = normalizeRoutes([liveR])[0];
+            this.routes.push(restored);
+            // No explicit scheduleAutoSave call: the Alpine watcher on
+            // this.routes fires on the .push and schedules the flush.
+        },
+
+        // Per-row diff helpers used by the Routes table (modified dot etc.).
+        isRouteAdded(rid)    { return rid && this.pending.routes.added && this.pending.routes.added.includes(rid); },
+        isRouteModified(rid) { return rid && this.pending.routes.modified && this.pending.routes.modified.includes(rid); },
+        isRouteDirty(rid)    { return this.isRouteAdded(rid) || this.isRouteModified(rid); },
+
+        // Orphan rows for the Routes table: routes that exist in live but
+        // are missing from the draft (= user clicked Remove on them but
+        // hasn't Applied yet). Synthesized into the table as struck-through
+        // rows with a Restore button.
+        get _orphanRoutes() {
+            const draftRids = new Set(this.routes.map(r => r.rid).filter(Boolean));
+            return this.routesLive
+                .filter(r => r.rid && !draftRids.has(r.rid))
+                .map(r => ({ ...r, _orphan: true, _expanded: false, _uid: 'orphan-' + r.rid }));
         },
 
         async pollStatus() {
@@ -1162,6 +1490,14 @@ function traefikAppData() {
                         // "system route field 'skip_tls_verify' is locked".
                         skip_tls_verify: !!r.skip_tls_verify,
                     };
+                    // alpha.20: round-trip the server-assigned `rid`. Backend
+                    // uses it to key the draft-vs-live diff for per-row
+                    // change tracking; if the frontend ever dropped it on
+                    // save, the server would re-generate a fresh rid and
+                    // every save would look like add+delete in the pending
+                    // changes UI. Lesson from alpha.15 — hand-rolled
+                    // serializers drift; this list MUST grow with the model.
+                    if (r.rid) out.rid = r.rid;
                     // Phase F: preserve system tag so backend's protection
                     // check matches; user routes omit the field entirely
                     // (sending null would trigger "unknown kind" elsewhere).
@@ -1184,18 +1520,35 @@ function traefikAppData() {
 
         // ---------- Phase F: middlewares CRUD ----------
         async loadMiddlewares() {
+            // alpha.20: fetch draft + live concurrently. Same shape as
+            // loadRoutes — draft binds to the editor, live caches for diff.
             this.loadFailed.middlewares = '';
+            // alpha.20: _suspendAutoSave management is owned by the
+            // orchestrators (load, apply, discardAll) — not per-loader.
+            // Loaders just write through; the orchestrator wraps the call
+            // in suspend so the watcher firings from this.routes = ...
+            // assignments don't trigger redundant PUTs.
             try {
-                const r = await fetch(this.url('/api/middlewares'));
-                if (!r.ok) {
-                    const j = await r.json().catch(() => ({}));
-                    throw new Error(j.error || `GET /api/middlewares -> ${r.status}`);
+                const [draftRes, liveRes] = await Promise.all([
+                    fetch(this.url('/api/middlewares')),
+                    fetch(this.url('/api/middlewares?live=1')),
+                ]);
+                if (!draftRes.ok) {
+                    const j = await draftRes.json().catch(() => ({}));
+                    throw new Error(j.error || `GET /api/middlewares -> ${draftRes.status}`);
                 }
-                const j = await r.json();
-                this.middlewares = normalizeMiddlewares(j.middlewares);
+                if (!liveRes.ok) {
+                    const j = await liveRes.json().catch(() => ({}));
+                    throw new Error(j.error || `GET /api/middlewares?live=1 -> ${liveRes.status}`);
+                }
+                const draft = await draftRes.json();
+                const live = await liveRes.json();
+                this.middlewares = normalizeMiddlewares(draft.middlewares);
+                this.middlewaresLive = (live.middlewares || []).map(m => ({ ...m }));
             } catch (e) {
                 this.loadFailed.middlewares = e.message || String(e);
             }
+            this.loadPending().catch(() => {});
         },
 
         // alpha.15: middlewares to render as chips on the HA system row
@@ -1393,6 +1746,35 @@ function traefikAppData() {
 
         url(path) {
             return (this.ingressPath || '') + path;
+        },
+
+        // alpha.20: getter-backed snapshots used as $watch targets.
+        // Alpine 3's $watch on a bare property name ('routes') only fires
+        // on shallow ref changes — NOT on nested edits to
+        // routes[i].hostname. By routing through these getters, every
+        // nested field becomes a reactive dependency of the getter; the
+        // string output changes on any meaningful mutation; $watch fires.
+        // The replacer strips `_`-prefixed UI-state fields (`_uid`,
+        // `_expanded`, `_orphan`) so a chevron toggle doesn't trigger an
+        // auto-save PUT.
+        get _routesSnapshot() {
+            return JSON.stringify(this.routes,
+                (k, v) => k.startsWith('_') ? undefined : v);
+        },
+        get _middlewaresSnapshot() {
+            return JSON.stringify(this.middlewares,
+                (k, v) => k.startsWith('_') ? undefined : v);
+        },
+        get _configSnapshot() {
+            return JSON.stringify(this.config);
+        },
+
+        // alpha.20: Alpine auto-invokes init() before x-init="load()"; the
+        // watchers register against the snapshot getters above.
+        init() {
+            this.$watch('_routesSnapshot',      () => this.scheduleAutoSave('routes'));
+            this.$watch('_middlewaresSnapshot', () => this.scheduleAutoSave('middlewares'));
+            this.$watch('_configSnapshot',      () => this.scheduleAutoSave('config'));
         },
     };
 }

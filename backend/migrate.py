@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,37 @@ ROUTES_YML = DATA / "routes.yml"
 CONFIG_YML = DATA / "config.yml"
 MIDDLEWARES_YML = DATA / "middlewares.yml"
 OPTIONS = DATA / "options.json"
+
+# alpha.20: draft/live split. The renderer reads ONLY *.yml; the editor
+# mutates *.draft.yml. POST /api/apply copies draft → live atomically
+# (journal-based) and runs render.
+ROUTES_DRAFT_YML = DATA / "routes.draft.yml"
+CONFIG_DRAFT_YML = DATA / "config.draft.yml"
+MIDDLEWARES_DRAFT_YML = DATA / "middlewares.draft.yml"
+
+# alpha.20: baseline files = exact bytes of LIVE at the moment draft was
+# last initialized / last Apply'd. Drives the 3-way merge on live drift
+# (when migrate.py mutates live behind the editor's back). Storing
+# content (not just hash) so the merge can distinguish "user edited" vs
+# "migration edited" without losing the common ancestor.
+ROUTES_BASELINE_YML = DATA / ".routes.baseline.yml"
+CONFIG_BASELINE_YML = DATA / ".config.baseline.yml"
+MIDDLEWARES_BASELINE_YML = DATA / ".middlewares.baseline.yml"
+
+# alpha.20: per-surface live + draft + baseline triples.
+SURFACE_TRIPLES = [
+    (ROUTES_YML, ROUTES_DRAFT_YML, ROUTES_BASELINE_YML),
+    (MIDDLEWARES_YML, MIDDLEWARES_DRAFT_YML, MIDDLEWARES_BASELINE_YML),
+    (CONFIG_YML, CONFIG_DRAFT_YML, CONFIG_BASELINE_YML),
+]
+
+# alpha.20: journal marker written by POST /api/apply BEFORE the live
+# rename. cont-init / migrate completes any pending apply on next boot.
+APPLY_JOURNAL = DATA / ".apply_journal.yml"
+
+# alpha.20: surfaced to the frontend on next load if the 3-way merge
+# couldn't reconcile (user and migration both edited the same field).
+DRAFT_RESET_REASONS = DATA / ".draft_reset_reasons.json"
 
 # Fields that move from supervisor options into /data/config.yml in 0.5.0.
 # Order preserved so the YAML is human-readable.
@@ -385,7 +417,343 @@ def _strip_route_tags() -> None:
         )
 
 
+def _recover_apply_journal() -> None:
+    """alpha.20: complete-or-rollback a pending POST /api/apply that crashed.
+
+    POST /api/apply writes the journal AFTER staging all three drafts as
+    `*.applying` siblings, then atomically renames each `*.applying` → live,
+    then deletes the journal. If the addon was killed between staging and
+    journal write → no `*.applying` files (they were leftover from a prior
+    failed attempt and `_atomic_write_bytes` already replaced them). If
+    killed between journal write and ALL renames complete → some live files
+    point at old content, some at new; recover by completing every rename
+    listed in the journal. If killed AFTER all renames but before journal
+    delete → no `.applying` files remain; we just need to delete the journal.
+
+    Idempotent: missing journal → no-op. Run as the VERY FIRST step so all
+    subsequent migration steps see a consistent live.
+    """
+    if not APPLY_JOURNAL.exists():
+        return
+    try:
+        journal = yaml.safe_load(APPLY_JOURNAL.read_text()) or {}
+    except yaml.YAMLError as e:
+        print(
+            f"migrate: apply journal unreadable ({e}); leaving it in place "
+            "for inspection. WARNING: live config may be inconsistent.",
+            file=sys.stderr,
+        )
+        return
+    targets = journal.get("targets") or []
+    completed = 0
+    for target_str in targets:
+        target = Path(target_str)
+        applying = target.parent / (target.name + ".applying")
+        if applying.exists():
+            os.replace(str(applying), str(target))
+            completed += 1
+    try:
+        APPLY_JOURNAL.unlink()
+    except FileNotFoundError:
+        pass
+    print(
+        f"migrate: alpha.20 — apply journal recovered "
+        f"({completed} pending rename(s) completed of {len(targets)})",
+        file=sys.stderr,
+    )
+
+
+def _backfill_route_rid() -> None:
+    """alpha.20: assign uuid4 `rid` to any live route lacking one. Idempotent.
+
+    MUST run AFTER `_ensure_ha_system_route` (which seeds the HA self-route
+    on first boot without a rid) so the seeded route also gets a rid on
+    first boot — otherwise the diff endpoint sees it as added+removed
+    until the next boot.
+    """
+    if not ROUTES_YML.exists():
+        return
+    routes_doc = yaml.safe_load(ROUTES_YML.read_text()) or {}
+    routes = routes_doc.get("routes") or []
+    changed = False
+    assigned = 0
+    for r in routes:
+        if not isinstance(r, dict):
+            continue
+        if not r.get("rid"):
+            r["rid"] = str(uuid.uuid4())
+            changed = True
+            assigned += 1
+    if changed:
+        routes_doc["routes"] = routes
+        _atomic_write(ROUTES_YML, _dump(routes_doc))
+        print(
+            f"migrate: alpha.20 — assigned rid to {assigned} route(s)",
+            file=sys.stderr,
+        )
+
+
+def _backfill_middleware_mid() -> None:
+    """alpha.20: assign uuid4 `mid` to any live middleware lacking one.
+
+    Idempotent. Stable identity for the per-row change-tracking UI; needed
+    because middleware NAMES are user-editable (server.py:495-507 only
+    enforces regex + uniqueness), so a name rename would otherwise show as
+    delete+add in the pending changes summary. Runs AFTER
+    `_ensure_builtin_middlewares` so the seeded built-ins also get a mid.
+    """
+    if not MIDDLEWARES_YML.exists():
+        return
+    mw_doc = yaml.safe_load(MIDDLEWARES_YML.read_text()) or {}
+    mws = mw_doc.get("middlewares") or []
+    changed = False
+    assigned = 0
+    for m in mws:
+        if not isinstance(m, dict):
+            continue
+        if not m.get("mid"):
+            m["mid"] = str(uuid.uuid4())
+            changed = True
+            assigned += 1
+    if changed:
+        mw_doc["middlewares"] = mws
+        _atomic_write(MIDDLEWARES_YML, _dump(mw_doc))
+        print(
+            f"migrate: alpha.20 — assigned mid to {assigned} middleware(s)",
+            file=sys.stderr,
+        )
+
+
+def _routes_by_rid(doc: dict) -> dict[str, dict]:
+    """{rid: route_dict} for a routes.yml doc; routes lacking rid are skipped
+    (`_backfill_route_rid` runs first so this is robust to fresh-install
+    state)."""
+    return {r["rid"]: r for r in (doc.get("routes") or [])
+            if isinstance(r, dict) and r.get("rid")}
+
+
+def _mws_by_mid(doc: dict) -> dict[str, dict]:
+    return {m["mid"]: m for m in (doc.get("middlewares") or [])
+            if isinstance(m, dict) and m.get("mid")}
+
+
+def _merge_3way_rid_collection(prior: dict, draft: dict, current: dict,
+                                surface: str, key_field: str) -> tuple[list, list]:
+    """3-way merge of rid/mid-keyed entries. Returns (merged_list, conflicts).
+
+    For each unit (route by rid OR middleware by mid):
+      - in current only           -> added by migration; merge into draft
+      - in prior only             -> removed by migration; remove from draft
+                                     unless the user has edited it (conflict)
+      - in all three, draft == prior, current differs -> migration touched a
+        field the user hadn't touched; take current (silent merge)
+      - in all three, draft differs, current == prior -> user touched; keep draft
+      - in all three, both differ same way -> coincidence; keep current
+      - in all three, both differ different ways -> CONFLICT; keep draft,
+        record for surfacing
+    """
+    conflicts: list[dict] = []
+    out: list[dict] = []
+    all_ids = set(prior) | set(draft) | set(current)
+    for uid in all_ids:
+        p = prior.get(uid)
+        d = draft.get(uid)
+        c = current.get(uid)
+        if c and not p and not d:
+            out.append(c)                             # migration added; carry
+        elif d and not p and not c:
+            out.append(d)                             # user added; keep
+        elif d and not c and p:
+            if d == p:
+                pass                                   # migration removed it; user hadn't touched -> drop
+            else:
+                # user edited an entry migration removed -> conflict; keep user copy
+                out.append(d)
+                conflicts.append({
+                    "surface": surface, key_field: uid, "kind": "removed_by_migration_user_edited"})
+        elif d and c and not p:
+            # both added the same id? extremely unlikely (uuid). Keep draft.
+            out.append(d)
+            if d != c:
+                conflicts.append({
+                    "surface": surface, key_field: uid, "kind": "added_both"})
+        elif d and c and p:
+            d_changed = (d != p)
+            c_changed = (c != p)
+            if not d_changed and not c_changed:
+                out.append(d)                          # quiet, no churn
+            elif d_changed and not c_changed:
+                out.append(d)                          # user edited only
+            elif not d_changed and c_changed:
+                out.append(c)                          # migration edited; silent merge
+            else:                                       # both edited
+                if d == c:
+                    out.append(d)                      # coincident edit
+                else:
+                    out.append(d)                      # keep user; flag conflict
+                    conflicts.append({
+                        "surface": surface, key_field: uid, "kind": "both_edited"})
+        # All other branches (e.g. in prior only, not in current, not in draft)
+        # are silent drops — migration removed it, user already accepted.
+    return out, conflicts
+
+
+def _merge_3way_config(prior: dict, draft: dict, current: dict
+                        ) -> tuple[dict, list]:
+    """Flat-dict 3-way merge for config.yml. Same rules as the rid version,
+    keyed by config field name."""
+    conflicts: list[dict] = []
+    out: dict = {}
+    all_keys = set(prior) | set(draft) | set(current)
+    for k in all_keys:
+        p = prior.get(k)
+        d = draft.get(k)
+        c = current.get(k)
+        in_prior = k in prior
+        in_draft = k in draft
+        in_current = k in current
+        if in_current and not in_prior and not in_draft:
+            out[k] = c
+        elif in_draft and not in_prior and not in_current:
+            out[k] = d
+        elif in_draft and in_current and in_prior:
+            d_changed = (d != p)
+            c_changed = (c != p)
+            if not d_changed and not c_changed:
+                out[k] = d
+            elif d_changed and not c_changed:
+                out[k] = d
+            elif not d_changed and c_changed:
+                out[k] = c
+            else:
+                if d == c:
+                    out[k] = d
+                else:
+                    out[k] = d
+                    conflicts.append({
+                        "surface": "config", "field": k, "kind": "both_edited"})
+        elif in_draft and not in_current and in_prior:
+            if d == p:
+                pass
+            else:
+                out[k] = d
+                conflicts.append({
+                    "surface": "config", "field": k, "kind": "removed_by_migration_user_edited"})
+        elif in_draft and in_current and not in_prior:
+            out[k] = d
+            if d != c:
+                conflicts.append({
+                    "surface": "config", "field": k, "kind": "added_both"})
+    return out, conflicts
+
+
+def _ensure_drafts_consistent() -> None:
+    """alpha.20: per surface, ensure draft + baseline exist and are
+    consistent with live.
+
+    First boot on alpha.20 over alpha.19 live state:
+      - drafts missing -> copy live to draft AND baseline; no merge needed
+    Steady-state boot:
+      - baseline == live -> no drift, leave draft as-is
+    Migration drift (a step above mutated live):
+      - 3-way merge prior=baseline, draft=draft, current=live; conflicts
+        surface to .draft_reset_reasons; baseline ← live after merge
+
+    Runs LAST in migrate.main() so it sees the final live shape after all
+    other steps (rid backfill, system route seed, etc.) have settled.
+    """
+    all_conflicts: list[dict] = []
+
+    for live_path, draft_path, baseline_path in SURFACE_TRIPLES:
+        if not live_path.exists():
+            # Edge: a surface whose live file is missing (shouldn't happen
+            # after the bootstrap steps above). Skip; we have nothing to
+            # seed draft from.
+            continue
+        live_bytes = live_path.read_bytes()
+
+        if not draft_path.exists():
+            # Fresh: copy live -> draft AND baseline.
+            _atomic_write(draft_path, live_bytes.decode("utf-8"))
+            _atomic_write(baseline_path, live_bytes.decode("utf-8"))
+            print(
+                f"migrate: alpha.20 — seeded draft for {live_path.name}",
+                file=sys.stderr,
+            )
+            continue
+
+        if not baseline_path.exists():
+            # Draft exists but no baseline (mid-upgrade edge or someone
+            # nuked the baseline). Assume current live IS the baseline;
+            # no merge — would be guessing. Just snapshot baseline ← live.
+            _atomic_write(baseline_path, live_bytes.decode("utf-8"))
+            print(
+                f"migrate: alpha.20 — reseeded baseline for {live_path.name} "
+                "(was missing; no merge performed)",
+                file=sys.stderr,
+            )
+            continue
+
+        baseline_bytes = baseline_path.read_bytes()
+        if baseline_bytes == live_bytes:
+            continue  # no drift; quiet steady state
+
+        # Drift detected — 3-way merge.
+        prior_doc = yaml.safe_load(baseline_bytes.decode("utf-8")) or {}
+        draft_doc = yaml.safe_load(draft_path.read_text()) or {}
+        current_doc = yaml.safe_load(live_bytes.decode("utf-8")) or {}
+
+        if live_path.name == "routes.yml":
+            merged_list, conflicts = _merge_3way_rid_collection(
+                _routes_by_rid(prior_doc),
+                _routes_by_rid(draft_doc),
+                _routes_by_rid(current_doc),
+                surface="routes", key_field="rid",
+            )
+            merged_doc = {"routes": merged_list}
+        elif live_path.name == "middlewares.yml":
+            merged_list, conflicts = _merge_3way_rid_collection(
+                _mws_by_mid(prior_doc),
+                _mws_by_mid(draft_doc),
+                _mws_by_mid(current_doc),
+                surface="middlewares", key_field="mid",
+            )
+            merged_doc = {
+                "version": current_doc.get("version", 1),
+                "middlewares": merged_list,
+            }
+        else:  # config.yml
+            merged_map, conflicts = _merge_3way_config(
+                prior_doc, draft_doc, current_doc,
+            )
+            merged_doc = merged_map
+
+        _atomic_write(draft_path, _dump(merged_doc))
+        _atomic_write(baseline_path, live_bytes.decode("utf-8"))
+        all_conflicts.extend(conflicts)
+        print(
+            f"migrate: alpha.20 — drift detected on {live_path.name}, "
+            f"3-way merged ({len(conflicts)} conflict(s))",
+            file=sys.stderr,
+        )
+
+    if all_conflicts:
+        try:
+            DRAFT_RESET_REASONS.write_text(json.dumps(all_conflicts, indent=2))
+        except OSError as e:
+            print(f"migrate: failed writing draft_reset_reasons: {e}",
+                  file=sys.stderr)
+
+
 def main() -> int:
+    # alpha.20: complete any pending POST /api/apply BEFORE any other step
+    # reads live. Exception-isolated; an unreadable journal leaves live
+    # untouched and logs a warning.
+    try:
+        _recover_apply_journal()
+    except Exception as e:
+        print(f"migrate: apply-journal recovery failed: {e}", file=sys.stderr)
+
     # Phase A-E bootstrap: routes + config from options.json (or empty defaults).
     bootstrap_rc = 0
     if not OPTIONS.exists():
@@ -444,6 +812,27 @@ def main() -> int:
         _strip_route_tags()
     except Exception as e:
         print(f"migrate: route-tags strip failed: {e}", file=sys.stderr)
+        bootstrap_step_rc = 1
+    # alpha.20: rid + mid assignment must come AFTER any step that mutates
+    # the live shape (ensure_ha_system_route seeds without rid;
+    # ensure_builtin_middlewares seeds without mid; strip migrations rewrite
+    # docs). Idempotent on steady state — one yaml load each, no write.
+    try:
+        _backfill_route_rid()
+    except Exception as e:
+        print(f"migrate: route rid backfill failed: {e}", file=sys.stderr)
+        bootstrap_step_rc = 1
+    try:
+        _backfill_middleware_mid()
+    except Exception as e:
+        print(f"migrate: middleware mid backfill failed: {e}", file=sys.stderr)
+        bootstrap_step_rc = 1
+    # alpha.20: draft/baseline consistency runs LAST so it sees the final
+    # live shape after all rid/mid/structural backfills.
+    try:
+        _ensure_drafts_consistent()
+    except Exception as e:
+        print(f"migrate: drafts consistency failed: {e}", file=sys.stderr)
         bootstrap_step_rc = 1
 
     return bootstrap_rc or bootstrap_step_rc

@@ -26,6 +26,7 @@ import shutil
 import sys
 import time
 import traceback
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -38,6 +39,27 @@ OPTIONS = Path("/data/options.json")
 ROUTES_YML = Path("/data/routes.yml")
 CONFIG_YML = Path("/data/config.yml")
 MIDDLEWARES_YML = Path("/data/middlewares.yml")
+# alpha.20: draft/live split. PUT handlers write the *.draft.yml files; only
+# POST /api/apply copies them to live + runs render. Renderer reads live only.
+ROUTES_DRAFT_YML = Path("/data/routes.draft.yml")
+CONFIG_DRAFT_YML = Path("/data/config.draft.yml")
+MIDDLEWARES_DRAFT_YML = Path("/data/middlewares.draft.yml")
+# alpha.20: baseline files = live bytes at the moment draft was last
+# initialized / last Apply'd. Used for 3-way merge on live drift; bumped
+# by post_apply after a successful render.
+ROUTES_BASELINE_YML = Path("/data/.routes.baseline.yml")
+CONFIG_BASELINE_YML = Path("/data/.config.baseline.yml")
+MIDDLEWARES_BASELINE_YML = Path("/data/.middlewares.baseline.yml")
+# alpha.20: apply journal written before live rename — completed/cleaned by
+# migrate._recover_apply_journal on the next boot if Apply crashed mid-way.
+APPLY_JOURNAL = Path("/data/.apply_journal.yml")
+DRAFT_RESET_REASONS = Path("/data/.draft_reset_reasons.json")
+# (live, draft, baseline) per surface — iterated by apply / discard / pending.
+SURFACE_TRIPLES = (
+    (ROUTES_YML, ROUTES_DRAFT_YML, ROUTES_BASELINE_YML),
+    (MIDDLEWARES_YML, MIDDLEWARES_DRAFT_YML, MIDDLEWARES_BASELINE_YML),
+    (CONFIG_YML, CONFIG_DRAFT_YML, CONFIG_BASELINE_YML),
+)
 WEB_ROOT = Path("/usr/share/traefik-web")
 RENDER_PY = "/usr/local/bin/render.py"
 TRAEFIK_URL = "http://127.0.0.1:8090"
@@ -159,6 +181,12 @@ ROUTE_TYPES = {
     # it into a service-level serversTransport), so it now lives where it
     # belongs — on the route. Optional; renderer defaults to False when absent.
     "skip_tls_verify": bool,
+    # alpha.20: per-route stable identity. Server-generated uuid4 (assigned
+    # by migrate._backfill_route_rid on boot if missing; assigned by put_routes
+    # on a fresh route). Preserved through draft round-trips; the per-field
+    # diff endpoint keys on this so hostname renames don't surface as
+    # add+delete. Hidden from the user; UI never displays it.
+    "rid": (str, type(None)),
     # Phase F: marks routes seeded/managed by the add-on (currently only
     # "ha_self"). Absent on user routes. User PUTs that try to set or change
     # this field on existing system routes are rejected; only the hostname
@@ -527,7 +555,15 @@ async def _validate_middlewares(body, existing_defs: list) -> list:
             cfg_out = _validate_headers(cfg, i)
         else:
             raise web.HTTPInternalServerError(text="unreachable")
-        out.append({"name": name, "type": typ, "config": cfg_out})
+        # alpha.20: preserve `mid` (uuid4 per middleware). Middleware names
+        # are user-editable, so identity tracking for the per-row diff lives
+        # in `mid` not `name`. _validate_middlewares is constructive (drops
+        # any unknown input key), so we MUST explicitly carry `mid` through.
+        mid = mw.get("mid")
+        out_dict = {"name": name, "type": typ, "config": cfg_out}
+        if mid:
+            out_dict["mid"] = mid
+        out.append(out_dict)
     return out
 
 
@@ -543,6 +579,11 @@ def _redact_middlewares(defs: list) -> list:
             # not removable). Derived server-side; never read from the stored def.
             "system": mw.get("name") in SYSTEM_MIDDLEWARE_NAMES,
         }
+        # alpha.20: per-row stable identity for diff/sort/rollback. Always
+        # present after migrate._backfill_middleware_mid runs (first boot
+        # of alpha.20+); fresh middlewares get a mid in put_middlewares.
+        if mw.get("mid"):
+            copy["mid"] = mw["mid"]
         cfg = mw.get("config") or {}
         if mw.get("type") == "basicAuth":
             copy["config"] = {
@@ -560,18 +601,27 @@ def _redact_middlewares(defs: list) -> list:
     return out
 
 
-def _load_middlewares_yml() -> list:
-    if not MIDDLEWARES_YML.exists():
+def _load_middlewares_from(path: Path) -> list:
+    if not path.exists():
         return []
     try:
-        parsed = yaml.safe_load(MIDDLEWARES_YML.read_text()) or {}
+        parsed = yaml.safe_load(path.read_text()) or {}
     except yaml.YAMLError as e:
         raise web.HTTPInternalServerError(
-            text=f"/data/middlewares.yml has invalid YAML and the add-on "
-                 f"refuses to overwrite it. Fix the file by hand before "
-                 f"saving. ({e})"
+            text=f"{path} has invalid YAML and the add-on refuses to "
+                 f"overwrite it. Fix the file by hand before saving. ({e})"
         )
     return parsed.get("middlewares") or []
+
+
+def _load_middlewares_yml() -> list:
+    return _load_middlewares_from(MIDDLEWARES_YML)
+
+
+def _load_middlewares_draft() -> list:
+    if MIDDLEWARES_DRAFT_YML.exists():
+        return _load_middlewares_from(MIDDLEWARES_DRAFT_YML)
+    return _load_middlewares_yml()
 
 
 def _system_default_config(name: str) -> dict:
@@ -584,7 +634,10 @@ def _reinject_system_middlewares(defs: list, existing: list) -> list:
     """alpha.7: built-ins can't be deleted via the UI/API. After validation,
     re-add any system middleware that this PUT omitted — preserving its stored
     config (or seeding the default if it didn't exist yet) and its canonical
-    type. Idempotent: names already present are left untouched."""
+    type. Idempotent: names already present are left untouched. alpha.20:
+    preserves `mid` on the reinjected built-in so its identity survives the
+    discard-all → re-PUT round-trip; without this, every save without an
+    explicit built-in would generate a fresh mid and the diff would explode."""
     present = {m.get("name") for m in defs}
     by_name = {m.get("name"): m for m in existing}
     for name, canon_type in SYSTEM_MIDDLEWARE_NAMES.items():
@@ -592,8 +645,49 @@ def _reinject_system_middlewares(defs: list, existing: list) -> list:
             continue
         prior = by_name.get(name)
         cfg = (prior.get("config") if prior else None) or _system_default_config(name)
-        defs.append({"name": name, "type": canon_type, "config": cfg})
+        entry = {"name": name, "type": canon_type, "config": cfg}
+        if prior and prior.get("mid"):
+            entry["mid"] = prior["mid"]
+        defs.append(entry)
     return defs
+
+
+# alpha.20: extracted render+rollback helper. Used by post_apply (the only
+# path that renders now); the per-PUT renders moved to drafts so the dev
+# UX of "edit freely, see traefik update only on Apply" works.
+async def _run_render_with_rollback(snapshots: dict[Path, bytes | None]
+                                     ) -> tuple[bool, str]:
+    """Spawns render.py; on timeout or non-zero exit, restores each path in
+    `snapshots` to its captured bytes (or unlinks if the value is None) so
+    cont-init's next-boot render starts from a known-good state. Returns
+    (ok, stderr_text). stderr is redacted before returning."""
+    proc = await asyncio.create_subprocess_exec(
+        "python3", RENDER_PY,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        _, err_bytes = await asyncio.wait_for(
+            proc.communicate(), timeout=RENDER_TIMEOUT
+        )
+        err = _redact(err_bytes.decode(errors="replace"))
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.communicate()
+        for path, prior in snapshots.items():
+            if prior is None:
+                path.unlink(missing_ok=True)
+            else:
+                _atomic_write_bytes(path, prior)
+        return False, f"render.py exceeded {RENDER_TIMEOUT}s"
+    if proc.returncode != 0:
+        for path, prior in snapshots.items():
+            if prior is None:
+                path.unlink(missing_ok=True)
+            else:
+                _atomic_write_bytes(path, prior)
+        return False, err
+    return True, err
 
 
 # ---------- helpers ----------
@@ -642,11 +736,11 @@ def _atomic_write_yml(path: Path, data: dict) -> None:
     _atomic_write_bytes(path, payload.encode("utf-8"))
 
 
-def _load_config_yml() -> dict:
-    # Merges /data/config.yml on top of /data/options.json so users mid-
-    # migration see the same effective config as the renderer. config.yml
-    # takes precedence; missing values fall back to supervisor options for
-    # back-compat (Phase A-C installs).
+def _load_config_from(path: Path) -> dict:
+    """Merges <path> on top of /data/options.json so the caller sees the
+    effective config (back-compat with Phase A-C installs that only had
+    options.json). Path is either CONFIG_YML (live) or CONFIG_DRAFT_YML
+    (alpha.20 draft view)."""
     merged = {
         "provider": "cloudflare",
         "cloudflare_token": "",
@@ -668,29 +762,40 @@ def _load_config_yml() -> dict:
                   "entrypoint_http", "entrypoint_https", "log_level"):
         if opts.get(field):
             merged[field] = opts[field]
-    if CONFIG_YML.exists():
-        # Corrupt config.yml used to silently fall back to defaults — and the
+    if path.exists():
+        # Corrupt config used to silently fall back to defaults — and the
         # next save would then overwrite the file with the validated payload,
         # erasing any stored unknown keys (redirect_seeded,
         # integration_available_dismissed_for). Refuse instead: surface a
         # 500 with the parse error and let the user fix the file by hand.
         try:
-            data = yaml.safe_load(CONFIG_YML.read_text()) or {}
+            data = yaml.safe_load(path.read_text()) or {}
         except yaml.YAMLError as e:
             raise web.HTTPInternalServerError(
-                text=f"/data/config.yml has invalid YAML and the add-on "
-                     f"refuses to overwrite it. Fix the file by hand before "
-                     f"saving. ({e})"
+                text=f"{path} has invalid YAML and the add-on refuses to "
+                     f"overwrite it. Fix the file by hand before saving. ({e})"
             )
         if not isinstance(data, dict):
             raise web.HTTPInternalServerError(
-                text="/data/config.yml top level is not a YAML mapping; "
+                text=f"{path} top level is not a YAML mapping; "
                      "expected a dict of fields."
             )
         for field in merged:
             if field in data and data[field] is not None:
                 merged[field] = data[field]
     return merged
+
+
+def _load_config_yml() -> dict:
+    return _load_config_from(CONFIG_YML)
+
+
+def _load_config_draft() -> dict:
+    """alpha.20: draft view. Falls back to live if the draft hasn't been
+    seeded yet."""
+    if CONFIG_DRAFT_YML.exists():
+        return _load_config_from(CONFIG_DRAFT_YML)
+    return _load_config_yml()
 
 
 def _validate_config(body):
@@ -1010,17 +1115,32 @@ def _redact_config(config: dict) -> dict:
     return redacted
 
 
-def _load_routes_yml() -> list:
-    if not ROUTES_YML.exists():
+def _load_routes_from(path: Path) -> list:
+    """Generic YAML-doc loader for a routes file (live OR draft). Raises
+    HTTPInternalServerError on a corrupt file rather than returning an empty
+    list so we don't silently overwrite the user's data."""
+    if not path.exists():
         return []
     try:
-        parsed = yaml.safe_load(ROUTES_YML.read_text()) or {}
+        parsed = yaml.safe_load(path.read_text()) or {}
     except yaml.YAMLError as e:
         raise web.HTTPInternalServerError(
-            text=f"/data/routes.yml has invalid YAML and the add-on refuses "
+            text=f"{path} has invalid YAML and the add-on refuses "
                  f"to overwrite it. Fix the file by hand before saving. ({e})"
         )
     return parsed.get("routes") or []
+
+
+def _load_routes_yml() -> list:
+    return _load_routes_from(ROUTES_YML)
+
+
+def _load_routes_draft() -> list:
+    """alpha.20: draft view. Falls back to live if the draft hasn't been
+    seeded yet (very first boot before _ensure_drafts_consistent ran)."""
+    if ROUTES_DRAFT_YML.exists():
+        return _load_routes_from(ROUTES_DRAFT_YML)
+    return _load_routes_yml()
 
 
 def _strip_headers(headers, banned):
@@ -1048,80 +1168,50 @@ async def serve_index(request):
 
 
 async def get_routes(request):
-    config = _load_config_yml()
+    """alpha.20: returns the draft view by default; ?live=1 returns the
+    currently-rendered live snapshot for the per-row diff in the UI. The
+    config domain comes from the draft too so a draft hostname-rewrite
+    previews correctly against the user's pending domain change."""
+    live = request.query.get("live") == "1"
+    config = _load_config_yml() if live else _load_config_draft()
+    routes = _load_routes_yml() if live else _load_routes_draft()
     return web.json_response(
-        {"domain": config.get("domain", ""), "routes": _load_routes_yml()}
+        {"domain": config.get("domain", ""), "routes": routes}
     )
 
 
 async def get_config(request):
-    config = _load_config_yml()
+    """alpha.20: returns draft by default; ?live=1 returns live."""
+    live = request.query.get("live") == "1"
+    config = _load_config_yml() if live else _load_config_draft()
     payload = _redact_config(config)
     payload["state"] = _config_state(config)
     return web.json_response(payload)
 
 
 async def put_config(request):
+    """alpha.20: writes draft config (CONFIG_DRAFT_YML). Does NOT render —
+    only post_apply renders. The "restart required" flag is gone from this
+    response because draft-only writes can't trigger a restart-need; the
+    Apply flow will compute it when it commits live."""
     try:
         body = await request.json()
     except json.JSONDecodeError as e:
         raise web.HTTPBadRequest(text=f"invalid JSON: {e}")
     # Preserve-existing-token: empty cloudflare_token in PUT means "keep the
-    # value already stored." UI sends "" on every PUT unless the user types a
-    # new token (the input is treated as write-only).
-    current = _load_config_yml()
+    # value already stored." Read from CURRENT DRAFT (not live) so a user who
+    # has been editing the token sees the same write-only behaviour against
+    # their pending value, not against the stale live one.
+    current = _load_config_draft()
     if not (body.get("cloudflare_token") or "").strip():
         body["cloudflare_token"] = current.get("cloudflare_token", "")
     validated = _validate_config(body)
 
-    async with request.app["save_lock"]:
-        # Snapshot prior bytes so we can roll back if render.py fails. Without
-        # this, a bad config persists to /data → next cont-init's render also
-        # fails → addon unbootable. The snapshot is the on-disk file (not the
-        # parsed dict) so the restored content is byte-identical to what was
-        # there before.
-        prior_bytes = CONFIG_YML.read_bytes() if CONFIG_YML.exists() else None
-        _atomic_write_yml(CONFIG_YML, validated)
-        proc = await asyncio.create_subprocess_exec(
-            "python3", RENDER_PY,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            _, err = await asyncio.wait_for(
-                proc.communicate(), timeout=RENDER_TIMEOUT
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.communicate()
-            # Render timed out — restore prior content so the next boot's
-            # cont-init render succeeds against the previous known-good config.
-            if prior_bytes is None:
-                CONFIG_YML.unlink(missing_ok=True)
-            else:
-                _atomic_write_bytes(CONFIG_YML, prior_bytes)
-            raise web.HTTPGatewayTimeout(
-                text=f"render.py exceeded {RENDER_TIMEOUT}s"
-            )
-        if proc.returncode != 0:
-            if prior_bytes is None:
-                CONFIG_YML.unlink(missing_ok=True)
-            else:
-                _atomic_write_bytes(CONFIG_YML, prior_bytes)
-            raise web.HTTPInternalServerError(
-                text=_redact(err.decode(errors="replace"))
-            )
+    async with request.app["draft_write_lock"]:
+        _atomic_write_yml(CONFIG_DRAFT_YML, validated)
 
     state = _config_state(validated)
-    return web.json_response({
-        "saved": True,
-        "state": state,
-        # If the token changed, the env var the traefik service inherited is
-        # stale until cont-init re-runs (next addon restart). Surface this
-        # so the UI can show a "Restart add-on to apply" banner.
-        "restart_required": True,
-        "stderr": _redact(err.decode(errors="replace")),
-    })
+    return web.json_response({"saved": True, "state": state})
 
 
 async def get_state(request):
@@ -1235,7 +1325,10 @@ async def post_fix_trusted_proxies(request):
     comment-preserving, custom-tag-safe, backed up and idempotent; on any
     condition we can't safely auto-edit, bail with the manual snippet."""
     loop = asyncio.get_running_loop()
-    async with request.app["save_lock"]:
+    # alpha.20: apply_lock — this handler writes outside /data so it doesn't
+    # need draft_write_lock, but it's an exclusive long-running action so it
+    # serializes against Apply.
+    async with request.app["apply_lock"]:
         try:
             await loop.run_in_executor(None, _do_fix_trusted_proxies)
         except _FixBail as e:
@@ -1251,7 +1344,10 @@ async def post_dismiss_integration(request):
     CURRENTLY-deployed integration content. A future deploy with new content
     re-surfaces it (content-scoped). Reads/writes config.yml RAW so unrelated
     keys (redirect_seeded, etc.) are preserved."""
-    async with request.app["save_lock"]:
+    # alpha.20: apply_lock — this writes config.yml LIVE directly (server-
+    # managed state field, not a user-editable draft surface), so it
+    # serializes against Apply rather than draft writes.
+    async with request.app["apply_lock"]:
         raw = _read_raw_config()
         try:
             deployed = CONTENT_HASH_FILE.read_text(encoding="utf-8").strip()
@@ -1263,6 +1359,12 @@ async def post_dismiss_integration(request):
 
 
 async def put_routes(request):
+    """alpha.20: writes the DRAFT routes file (ROUTES_DRAFT_YML). The
+    system-route protection check still runs against LIVE — locked fields
+    on the HA self-route are immutable regardless of which file we're
+    writing. Cross-reference against the DRAFT middlewares so a user can
+    add a middleware in draft and reference it from a new route in the same
+    edit session. No render — post_apply is the only path that renders."""
     try:
         body = await request.json()
     except json.JSONDecodeError as e:
@@ -1270,66 +1372,56 @@ async def put_routes(request):
     if not isinstance(body, dict):
         raise web.HTTPBadRequest(text="payload: must be object")
 
-    # Load + protect + write + render ALL inside save_lock. Loading existing
-    # state outside the lock would race with a concurrent PUT and let one
-    # writer clobber the other's system route after both pass protection
-    # independently.
-    async with request.app["save_lock"]:
-        existing = _load_routes_yml()
+    async with request.app["draft_write_lock"]:
+        # Protection check is always against LIVE — locked fields are
+        # immutable, draft or not.
+        existing_live = _load_routes_yml()
         incoming = _validate_routes(body.get("routes", []))
-        # Cross-reference against current middlewares.
-        defined_mw = {m["name"] for m in _load_middlewares_yml()}
+        # Cross-reference against DRAFT middlewares so an in-progress add
+        # is reachable.
+        defined_mw = {m["name"] for m in _load_middlewares_draft()}
         _cross_reference_middlewares(incoming, defined_mw)
-        # System routes are seeded + locked.
-        _enforce_system_route_protection(incoming, existing)
+        _enforce_system_route_protection(incoming, existing_live)
+        # Auto-assign rid to any route lacking one (fresh "Add route"
+        # entries from the UI). Match-by-system-kind first so the seeded
+        # HA self-route keeps its existing rid even if the frontend forgot
+        # to round-trip it.
+        live_by_rid = {r.get("rid"): r for r in existing_live if r.get("rid")}
+        live_systems = {r.get("system"): r for r in existing_live if r.get("system")}
+        for r in incoming:
+            if r.get("rid"):
+                continue
+            # No rid on incoming. Try to match an existing live row so we
+            # don't regenerate identity by accident (alpha.15 lesson —
+            # hand-rolled serializers drift). Match priority: system kind.
+            sys_kind = r.get("system")
+            if sys_kind and sys_kind in live_systems:
+                r["rid"] = live_systems[sys_kind].get("rid") or str(uuid.uuid4())
+            else:
+                r["rid"] = str(uuid.uuid4())
         # Persist with system routes at the front so the renderer's file-order
         # iteration matches.
         incoming = sorted(incoming, key=lambda r: 0 if r.get("system") else 1)
-        prior_bytes = ROUTES_YML.read_bytes() if ROUTES_YML.exists() else None
-        _atomic_write_yml(ROUTES_YML, {"routes": incoming})
-        proc = await asyncio.create_subprocess_exec(
-            "python3", RENDER_PY,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            _, err = await asyncio.wait_for(
-                proc.communicate(), timeout=RENDER_TIMEOUT
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.communicate()
-            if prior_bytes is None:
-                ROUTES_YML.unlink(missing_ok=True)
-            else:
-                _atomic_write_bytes(ROUTES_YML, prior_bytes)
-            raise web.HTTPGatewayTimeout(
-                text=f"render.py exceeded {RENDER_TIMEOUT}s"
-            )
-        if proc.returncode != 0:
-            # Roll back so cont-init's render succeeds on the next boot.
-            if prior_bytes is None:
-                ROUTES_YML.unlink(missing_ok=True)
-            else:
-                _atomic_write_bytes(ROUTES_YML, prior_bytes)
-            raise web.HTTPInternalServerError(
-                text=_redact(err.decode(errors="replace"))
-            )
+        _atomic_write_yml(ROUTES_DRAFT_YML, {"routes": incoming})
 
-    return web.json_response(
-        {"saved": len(incoming),
-         "stderr": _redact(err.decode(errors="replace"))}
-    )
+    return web.json_response({"saved": len(incoming)})
 
 
 async def get_middlewares(request):
-    defs = _load_middlewares_yml()
+    """alpha.20: returns draft by default; ?live=1 returns live."""
+    live = request.query.get("live") == "1"
+    defs = _load_middlewares_yml() if live else _load_middlewares_draft()
     return web.json_response(
         {"version": 1, "middlewares": _redact_middlewares(defs)}
     )
 
 
 async def put_middlewares(request):
+    """alpha.20: writes the DRAFT middlewares file. The existing-basicAuth-
+    users preservation looks at DRAFT (not live) so an in-progress edit
+    doesn't lose its own pending user list when the user types in the input.
+    Reinjection of system built-ins also reads DRAFT for the same reason.
+    No render — Apply does it."""
     try:
         body = await request.json()
     except json.JSONDecodeError as e:
@@ -1337,47 +1429,30 @@ async def put_middlewares(request):
     if not isinstance(body, dict):
         raise web.HTTPBadRequest(text="payload: must be object")
 
-    # Same locking discipline as put_routes.
-    async with request.app["save_lock"]:
-        existing = _load_middlewares_yml()
+    async with request.app["draft_write_lock"]:
+        existing = _load_middlewares_draft()
         defs = await _validate_middlewares(body.get("middlewares", []), existing)
         defs = _reinject_system_middlewares(defs, existing)
-        prior_bytes = (
-            MIDDLEWARES_YML.read_bytes() if MIDDLEWARES_YML.exists() else None
-        )
-        _atomic_write_yml(MIDDLEWARES_YML, {"version": 1, "middlewares": defs})
-        proc = await asyncio.create_subprocess_exec(
-            "python3", RENDER_PY,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            _, err = await asyncio.wait_for(
-                proc.communicate(), timeout=RENDER_TIMEOUT
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.communicate()
-            if prior_bytes is None:
-                MIDDLEWARES_YML.unlink(missing_ok=True)
+        # Auto-assign mid to any middleware lacking one (fresh "Add
+        # middleware" from the UI). Match-by-name first against live to
+        # preserve identity for renames that the frontend missed (alpha.15
+        # lesson). Note: matching against LIVE here (not draft) so a name
+        # round-trip from a downgrade scenario picks up the live mid.
+        live_defs = _load_middlewares_yml()
+        live_by_name = {m.get("name"): m for m in live_defs if m.get("name")}
+        for m in defs:
+            if m.get("mid"):
+                continue
+            n = m.get("name")
+            if n and n in live_by_name and live_by_name[n].get("mid"):
+                m["mid"] = live_by_name[n]["mid"]
             else:
-                _atomic_write_bytes(MIDDLEWARES_YML, prior_bytes)
-            raise web.HTTPGatewayTimeout(
-                text=f"render.py exceeded {RENDER_TIMEOUT}s"
-            )
-        if proc.returncode != 0:
-            if prior_bytes is None:
-                MIDDLEWARES_YML.unlink(missing_ok=True)
-            else:
-                _atomic_write_bytes(MIDDLEWARES_YML, prior_bytes)
-            raise web.HTTPInternalServerError(
-                text=_redact(err.decode(errors="replace"))
-            )
+                m["mid"] = str(uuid.uuid4())
+        _atomic_write_yml(
+            MIDDLEWARES_DRAFT_YML, {"version": 1, "middlewares": defs}
+        )
 
-    return web.json_response({
-        "saved": len(defs),
-        "stderr": _redact(err.decode(errors="replace")),
-    })
+    return web.json_response({"saved": len(defs)})
 
 
 def _effective_slug(raw_hostname: str, domain: str) -> str | None:
@@ -1656,6 +1731,9 @@ GATED_MUTATIONS: set[tuple[str, str]] = {
     ("POST", "/api/dismiss-integration"),
     ("POST", "/api/restart"),
     ("POST", "/api/restart-core"),
+    # alpha.20: draft/live + Apply.
+    ("POST", "/api/apply"),
+    ("POST", "/api/discard"),
 }
 
 
@@ -1730,9 +1808,319 @@ async def json_error_mw(request, handler):
         return web.json_response({"error": "internal error"}, status=500)
 
 
+# ---------- alpha.20: draft/live diff + Apply + Discard ----------
+
+def _routes_diff(draft: list, live: list) -> dict:
+    """Compute the per-rid diff between draft and live routes.
+    Returns {modified: [rid], added: [rid], deleted: [rid]}."""
+    draft_by_rid = {r.get("rid"): r for r in draft if r.get("rid")}
+    live_by_rid = {r.get("rid"): r for r in live if r.get("rid")}
+    modified = []
+    for rid, d in draft_by_rid.items():
+        if rid in live_by_rid and d != live_by_rid[rid]:
+            modified.append(rid)
+    added = sorted(set(draft_by_rid) - set(live_by_rid))
+    deleted = sorted(set(live_by_rid) - set(draft_by_rid))
+    return {"modified": sorted(modified), "added": added, "deleted": deleted}
+
+
+def _middlewares_diff(draft: list, live: list) -> dict:
+    """Same shape as _routes_diff but keyed on mid."""
+    draft_by_mid = {m.get("mid"): m for m in draft if m.get("mid")}
+    live_by_mid = {m.get("mid"): m for m in live if m.get("mid")}
+    modified = []
+    for mid, d in draft_by_mid.items():
+        if mid in live_by_mid and d != live_by_mid[mid]:
+            modified.append(mid)
+    added = sorted(set(draft_by_mid) - set(live_by_mid))
+    deleted = sorted(set(live_by_mid) - set(draft_by_mid))
+    return {"modified": sorted(modified), "added": added, "deleted": deleted}
+
+
+def _config_diff(draft: dict, live: dict) -> dict:
+    """Flat-dict diff. Returns {modified: [field_name]}."""
+    keys = set(draft) | set(live)
+    modified = [k for k in keys if draft.get(k) != live.get(k)]
+    return {"modified": sorted(modified)}
+
+
+def _pending_warnings(draft_routes: list, draft_config: dict) -> list[dict]:
+    """Routes whose draft state would be silently skipped by render.py.
+    Currently: force_ssl on + tls:false (render WARN-skips them per
+    alpha.9). Surfaced in the Apply banner's details dropdown so the user
+    knows BEFORE clicking Apply that the route won't actually serve."""
+    warnings: list[dict] = []
+    if draft_config.get("force_ssl"):
+        for r in draft_routes:
+            if not r.get("tls") and r.get("enabled", True) and not r.get("system"):
+                warnings.append({
+                    "kind": "force_ssl_skip",
+                    "rid": r.get("rid"),
+                    "hostname": r.get("hostname"),
+                    "message": "Force SSL is on but this route has TLS off; "
+                               "render will skip it.",
+                })
+    return warnings
+
+
+async def get_pending(request):
+    """alpha.20: per-surface diff between draft and live + the total change
+    count + any preview warnings. Computed on demand from disk; cheap
+    enough that the frontend can poll on a debounce-tick without worry."""
+    draft_routes = _load_routes_draft()
+    live_routes = _load_routes_yml()
+    draft_mws = _load_middlewares_draft()
+    live_mws = _load_middlewares_yml()
+    draft_config = _load_config_draft()
+    live_config = _load_config_yml()
+
+    rd = _routes_diff(draft_routes, live_routes)
+    md = _middlewares_diff(draft_mws, live_mws)
+    cd = _config_diff(draft_config, live_config)
+    total = (len(rd["modified"]) + len(rd["added"]) + len(rd["deleted"])
+             + len(md["modified"]) + len(md["added"]) + len(md["deleted"])
+             + len(cd["modified"]))
+    payload = {
+        "routes": rd,
+        "middlewares": md,
+        "config": cd,
+        "warnings": _pending_warnings(draft_routes, draft_config),
+        "total": total,
+    }
+    # Surface and clear the 3-way-merge conflict marker (migrate writes it
+    # when live drift overlapped user edits). One-shot delivery: the
+    # frontend acknowledges by reading; we leave the file so it survives
+    # accidental tab close, and the frontend POSTs /api/discard?scope=conflicts
+    # OR a dedicated dismiss endpoint to clear it. For now read-only delivery.
+    if DRAFT_RESET_REASONS.exists():
+        try:
+            payload["draft_reset_reasons"] = json.loads(
+                DRAFT_RESET_REASONS.read_text()
+            )
+        except (OSError, json.JSONDecodeError):
+            pass
+    return web.json_response(payload)
+
+
+async def post_apply(request):
+    """alpha.20: atomic, crash-safe Apply. Validates all three drafts using
+    the same validators run at PUT (re-validation defends against a draft
+    that was edited on disk between PUT and Apply, or a draft that was
+    written through an older code path that didn't validate). Snapshots
+    LIVE bytes in memory; stages all three drafts as `*.applying` siblings
+    via _atomic_write_bytes (each individually crash-safe via fsync); writes
+    the journal marker; performs atomic rename to live for each surface;
+    deletes the journal; runs render. On render failure, restores live from
+    the in-memory snapshots and returns 500 with the stderr.
+
+    Crash-recovery is handled by migrate._recover_apply_journal at boot:
+    a partial Apply (some renames done, some pending) is completed; a
+    crash before any rename leaves a stale journal that gets cleaned up
+    (no actual live mutation occurred yet)."""
+    draft_routes_raw = _load_routes_draft()
+    draft_mws_raw = _load_middlewares_draft()
+    draft_config_raw = _load_config_draft()
+    live_routes = _load_routes_yml()
+    live_mws = _load_middlewares_yml()
+
+    # Validate (re-canonicalize). Errors surface with {stage, path, message}
+    # so the UI can scroll to the offender. The validators raise
+    # HTTPBadRequest with a message — convert to a structured error response.
+    try:
+        validated_routes = _validate_routes(draft_routes_raw)
+        _enforce_system_route_protection(validated_routes, live_routes)
+        validated_mws = await _validate_middlewares(draft_mws_raw, live_mws)
+        validated_mws = _reinject_system_middlewares(validated_mws, live_mws)
+        defined_names = {m["name"] for m in validated_mws}
+        _cross_reference_middlewares(validated_routes, defined_names)
+        validated_config = _validate_config(draft_config_raw)
+    except web.HTTPBadRequest as e:
+        return web.json_response(
+            {"ok": False, "stage": "validate", "error": e.text},
+            status=400,
+        )
+
+    # No-op guard. If nothing's pending, refuse to apply (avoids
+    # spuriously hot-reloading traefik on a double-click).
+    rd = _routes_diff(validated_routes, live_routes)
+    md = _middlewares_diff(validated_mws, live_mws)
+    cd = _config_diff(validated_config, _load_config_yml())
+    total = (len(rd["modified"]) + len(rd["added"]) + len(rd["deleted"])
+             + len(md["modified"]) + len(md["added"]) + len(md["deleted"])
+             + len(cd["modified"]))
+    if total == 0:
+        return web.json_response(
+            {"ok": False, "stage": "noop", "error": "No pending changes."},
+            status=409,
+        )
+
+    # Sort routes for stable on-disk order (system first, then user).
+    validated_routes = sorted(
+        validated_routes, key=lambda r: 0 if r.get("system") else 1
+    )
+
+    # Acquire apply_lock. The draft_write_lock is acquired briefly inside
+    # for the snapshot+stage phases; released before render so other tabs
+    # can keep auto-saving while the ~1s render runs.
+    apply_lock: asyncio.Lock = request.app["apply_lock"]
+    draft_lock: asyncio.Lock = request.app["draft_write_lock"]
+    async with apply_lock:
+        live_paths = [ROUTES_YML, MIDDLEWARES_YML, CONFIG_YML]
+        async with draft_lock:
+            # Snapshot live bytes for rollback.
+            snapshots: dict[Path, bytes | None] = {}
+            for p in live_paths:
+                snapshots[p] = p.read_bytes() if p.exists() else None
+
+            # Stage validated docs as *.applying siblings.
+            staged_docs = [
+                (ROUTES_YML, {"routes": validated_routes}),
+                (MIDDLEWARES_YML, {"version": 1, "middlewares": validated_mws}),
+                (CONFIG_YML, validated_config),
+            ]
+            for live_path, doc in staged_docs:
+                applying = live_path.parent / (live_path.name + ".applying")
+                _atomic_write_yml(applying, doc)
+
+            # Journal — written AFTER staging so a crash before this point
+            # leaves no live mutation. A crash AFTER this point but before
+            # all renames complete is recovered on next boot by
+            # migrate._recover_apply_journal.
+            journal = {
+                "targets": [str(p) for p in live_paths],
+                "version": ADDON_VERSION,
+                "ts": int(time.time()),
+            }
+            _atomic_write_bytes(
+                APPLY_JOURNAL, yaml.safe_dump(journal).encode("utf-8")
+            )
+
+            # Atomic renames (os.replace is atomic on POSIX).
+            for live_path in live_paths:
+                applying = live_path.parent / (live_path.name + ".applying")
+                os.replace(str(applying), str(live_path))
+
+            # Renames complete; delete the journal.
+            APPLY_JOURNAL.unlink(missing_ok=True)
+
+        # Render (outside draft_lock so concurrent edits aren't blocked
+        # during the ~1s render).
+        ok, err = await _run_render_with_rollback(snapshots)
+        if not ok:
+            return web.json_response(
+                {"ok": False, "stage": "render", "error": err},
+                status=500,
+            )
+
+        # Success — update baselines to match the new live so the next
+        # _ensure_drafts_consistent run sees no drift.
+        for live_path, _draft_path, baseline_path in SURFACE_TRIPLES:
+            try:
+                _atomic_write_bytes(baseline_path, live_path.read_bytes())
+            except OSError as ex:
+                sys.stderr.write(
+                    f"WARN: failed updating baseline {baseline_path}: {ex}\n"
+                )
+        # Clear stale conflict marker if any (apply resolves all conflicts).
+        DRAFT_RESET_REASONS.unlink(missing_ok=True)
+
+    return web.json_response(
+        {"ok": True, "applied": total, "stderr": err}
+    )
+
+
+async def post_discard(request):
+    """alpha.20: reset draft to live. Body: {scope: 'all'|'routes'|
+    'middlewares'|'config'|'field', path?: 'routes.<rid>.scheme' (only when
+    scope=='field')}. Field-scope is reserved for alpha.21; alpha.20 ships
+    'all' and per-surface."""
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        body = {}
+    scope = body.get("scope", "all")
+    if scope not in {"all", "routes", "middlewares", "config", "field"}:
+        raise web.HTTPBadRequest(text=f"unknown scope: {scope!r}")
+    if scope == "field":
+        # alpha.21 stub: backend not yet implemented.
+        raise web.HTTPNotImplemented(
+            text="field-scoped discard is alpha.21; use 'all' or per-surface"
+        )
+
+    surface_targets = {
+        "routes":      (ROUTES_YML, ROUTES_DRAFT_YML),
+        "middlewares": (MIDDLEWARES_YML, MIDDLEWARES_DRAFT_YML),
+        "config":      (CONFIG_YML, CONFIG_DRAFT_YML),
+    }
+    if scope == "all":
+        targets = list(surface_targets.values())
+    else:
+        targets = [surface_targets[scope]]
+
+    async with request.app["draft_write_lock"]:
+        for live_path, draft_path in targets:
+            if live_path.exists():
+                _atomic_write_bytes(draft_path, live_path.read_bytes())
+            else:
+                draft_path.unlink(missing_ok=True)
+        if scope == "all":
+            # Clear the stale conflict marker too — a full reset acknowledges
+            # whatever the merge surfaced.
+            DRAFT_RESET_REASONS.unlink(missing_ok=True)
+
+    return web.json_response({"discarded": scope})
+
+
+# alpha.20: version-skew middleware. After an addon upgrade, an old browser
+# tab still has the previous app.js loaded. Mutating against a new backend
+# (which may have new validators or new endpoints) is unsafe. Frontend sends
+# X-Addon-Version on every mutating request; mismatch → 409 with a clear
+# "reload required" message so the UI can prompt.
+GATED_VERSION_METHODS = {"PUT", "POST", "DELETE", "PATCH"}
+VERSION_UNGATED_PATHS = {
+    # Session ops are unversioned by design — a fresh tab with no app.js
+    # cache yet needs to be able to claim or take over.
+    "/api/session/claim",
+    "/api/session/takeover",
+}
+
+
+@web.middleware
+async def version_gate_mw(request, handler):
+    if (request.method in GATED_VERSION_METHODS
+            and request.path.startswith("/api/")
+            and request.path not in VERSION_UNGATED_PATHS):
+        client_version = request.headers.get("X-Addon-Version", "")
+        if client_version and client_version != ADDON_VERSION:
+            return web.json_response(
+                {"error": f"Addon version mismatch: client={client_version} "
+                          f"server={ADDON_VERSION}. Reload required.",
+                 "code": "VERSION_MISMATCH"},
+                status=409,
+            )
+    return await handler(request)
+
+
 async def client_session_ctx(app):
     app["client"] = aiohttp.ClientSession()
-    app["save_lock"] = asyncio.Lock()
+    # alpha.20: lock split.
+    # - apply_lock: held during POST /api/apply for the entire flow
+    #   (snapshot + stage + journal + rename + render + baseline update).
+    #   Other apply-touching handlers (post_fix_trusted_proxies,
+    #   post_dismiss_integration) also acquire this so they don't race
+    #   with Apply.
+    # - draft_write_lock: held during PUT-to-draft (cheap, no render) +
+    #   briefly inside Apply for the snapshot+stage+rename phase. Released
+    #   before the render call so concurrent auto-saves from other tabs
+    #   don't hang during the ~1s render window. Within Apply, the
+    #   draft_write_lock release after rename is safe — live is already
+    #   the new content and other writers are draft-only.
+    app["apply_lock"] = asyncio.Lock()
+    app["draft_write_lock"] = asyncio.Lock()
+    # Back-compat alias: any handler still referencing `save_lock` (none
+    # should after the alpha.20 refactor — grep before next release) gets
+    # the apply_lock semantics. Safe to delete once verified zero refs.
+    app["save_lock"] = app["apply_lock"]
     app["session_mgr"] = SessionManager()
     yield
     await app["client"].close()
@@ -1740,9 +2128,12 @@ async def client_session_ctx(app):
 
 def make_app():
     # Middleware order: outermost first. json_error_mw wraps ALL responses
-    # (including the _HTTPLocked from session_gate_mw) as JSON; session_gate_mw
-    # then runs inside that wrap so its 423 flows through the JSON shape.
-    app = web.Application(middlewares=[json_error_mw, session_gate_mw])
+    # (including the _HTTPLocked from session_gate_mw) as JSON; version_gate_mw
+    # rejects stale clients early so neither session_gate nor the handler
+    # see a mismatched-version request; session_gate_mw runs innermost.
+    app = web.Application(
+        middlewares=[json_error_mw, version_gate_mw, session_gate_mw]
+    )
     app.cleanup_ctx.append(client_session_ctx)
     app.router.add_get("/", serve_index)
     app.router.add_static("/static", str(WEB_ROOT / "static"))
@@ -1761,6 +2152,10 @@ def make_app():
     app.router.add_post("/api/dismiss-integration", post_dismiss_integration)
     app.router.add_post("/api/session/claim", post_session_claim)
     app.router.add_post("/api/session/takeover", post_session_takeover)
+    # alpha.20: draft/live diff + Apply + Discard.
+    app.router.add_get("/api/pending", get_pending)
+    app.router.add_post("/api/apply", post_apply)
+    app.router.add_post("/api/discard", post_discard)
     # NOTE: /dashboard/api/* must register BEFORE /dashboard/* so it wins
     # the route match (aiohttp resolves in registration order). It catches
     # the dashboard SPA's monkey-patched API fetches and forwards to

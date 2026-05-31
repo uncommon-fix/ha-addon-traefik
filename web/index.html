@@ -4,6 +4,10 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="ingress-path" content="{{INGRESS_PATH}}">
+  <!-- alpha.20: served by serve_index alongside ingress-path. Sent on every
+       mutating call as X-Addon-Version so the backend can 409 a stale tab
+       after an addon upgrade. -->
+  <meta name="app-version" content="{{APP_VERSION}}">
   <title>Traefik</title>
   <script src="{{INGRESS_PATH}}/static/tailwindcss-3.4.17.min.js"></script>
   <!-- alpha.14: ?v=<addon-version> cache-buster so the browser fetches the
@@ -11,7 +15,9 @@
   <script src="{{INGRESS_PATH}}/static/app.js?v={{APP_VERSION}}"></script>
   <script defer src="{{INGRESS_PATH}}/static/alpinejs-3.15.12.min.js"></script>
 </head>
-<body class="h-full bg-gray-50 text-gray-900 antialiased" x-data="traefikApp" x-init="load()" x-cloak>
+<body class="h-full bg-gray-50 text-gray-900 antialiased"
+      :class="pending.total > 0 && viewMode === 'rw' ? 'pb-20' : ''"
+      x-data="traefikApp" x-init="load()" x-cloak>
   <!-- ============ TOAST REGION (alpha.12) ============ -->
   <!-- Two aria-live regions: polite for success/info (announced when idle);
        assertive for errors (interrupts). Fixed top-right; toasts auto-fade
@@ -260,18 +266,15 @@
         </div>
 
         <div class="flex items-center gap-4 pt-2">
-          <button type="submit"
-                  :disabled="savingConfig || viewMode === 'ro' || !configFormValid"
-                  :title="viewMode === 'ro' ? 'Read-only — take over to save' :
-                          (!configFormValid ? 'Fix the highlighted fields first' : '')"
-                  class="px-4 py-2 rounded bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 disabled:bg-gray-500">
-            <span x-show="!savingConfig">Save</span>
-            <span x-show="savingConfig">Saving...</span>
-          </button>
+          <!-- alpha.20: Save button removed — auto-save flushes edits to the
+               draft as you type (1500ms debounce on this form for regex-
+               validated fields). Apply (sticky footer) commits draft -> live. -->
           <button type="button" @click="openWizard()"
                   class="text-sm text-blue-600 hover:text-blue-800 underline">
             Re-run setup wizard
           </button>
+          <span x-show="autoSaveError.config" class="text-xs text-red-700"
+                x-text="'Auto-save error: ' + autoSaveError.config"></span>
         </div>
       </form>
     </section>
@@ -403,15 +406,26 @@
 
             <!-- ============ COMPACT ROUTE ROW ============ -->
             <template x-if="item.type === 'route'">
-              <tr :class="item.r.system ? 'bg-blue-50 border-b border-blue-200' : 'border-b hover:bg-gray-50'">
-                <!-- Chevron: expand/collapse the editor below -->
+              <tr :class="item.r._orphan
+                            ? 'bg-red-50/40 border-b border-red-100 line-through text-gray-500'
+                            : (item.r.system
+                                ? 'bg-blue-50 border-b border-blue-200'
+                                : 'border-b hover:bg-gray-50')">
+                <!-- Chevron: expand/collapse the editor below. alpha.20:
+                     orphan rows (soft-deleted) can't be edited; render a
+                     placeholder dash instead of the toggle. -->
                 <td class="py-2 pr-1 text-center">
-                  <button type="button"
-                          @click="toggleRouteExpanded(item.r)"
-                          :aria-expanded="item.r._expanded"
-                          :aria-label="(item.r._expanded ? 'Collapse' : 'Expand') + ' editor for route ' + (item.r.hostname || 'unnamed')"
-                          class="text-gray-500 hover:text-gray-900 leading-none align-middle"
-                          x-html="icon(item.r._expanded ? 'chevron-down' : 'chevron-right', 'w-4 h-4 inline-block')"></button>
+                  <template x-if="!item.r._orphan">
+                    <button type="button"
+                            @click="toggleRouteExpanded(item.r)"
+                            :aria-expanded="item.r._expanded"
+                            :aria-label="(item.r._expanded ? 'Collapse' : 'Expand') + ' editor for route ' + (item.r.hostname || 'unnamed')"
+                            class="text-gray-500 hover:text-gray-900 leading-none align-middle"
+                            x-html="icon(item.r._expanded ? 'chevron-down' : 'chevron-right', 'w-4 h-4 inline-block')"></button>
+                  </template>
+                  <template x-if="item.r._orphan">
+                    <span class="text-gray-300 text-xs" aria-hidden="true">—</span>
+                  </template>
                 </td>
                 <!-- Enabled: checkbox for user, static for system -->
                 <td class="py-2 pr-2">
@@ -422,9 +436,16 @@
                     <input type="checkbox" x-model="item.r.enabled">
                   </template>
                 </td>
-                <!-- Hostname (read-only display in compact view) + status dot -->
+                <!-- Hostname (read-only display in compact view) + status dot +
+                     alpha.20: amber "modified" dot on the left when this row
+                     differs from live. -->
                 <td class="py-2 pr-3">
                   <div class="flex items-center gap-2">
+                    <span x-show="isRouteDirty(item.r.rid)"
+                          class="shrink-0 w-2 h-2 rounded-full bg-amber-500"
+                          title="Pending change in this route"
+                          aria-label="Pending change"
+                          role="img"></span>
                     <span class="shrink-0 w-2.5 h-2.5 rounded-full"
                           :class="routeStatusColor(item.r)"
                           :title="routeStatusTitle(item.r)"
@@ -453,12 +474,21 @@
                         title="Skip TLS verify on backend"
                         x-html="icon('shield-alert', 'w-3.5 h-3.5 inline-block')"></span>
                 </td>
-                <!-- Actions: System pill for system rows, Remove button for user rows -->
+                <!-- Actions: System pill for system rows, Restore for orphan
+                     rows (alpha.20 soft-delete), Remove button for user rows -->
                 <td class="py-2 text-right pr-2">
-                  <template x-if="item.r.system">
+                  <template x-if="item.r._orphan">
+                    <button @click="restoreRoute(item.r.rid)"
+                            :aria-label="'Restore route ' + (item.r.hostname || 'unnamed')"
+                            class="text-blue-700 hover:text-blue-900 text-sm no-underline"
+                            title="Restore (was Removed; pending until Apply)">
+                      Restore
+                    </button>
+                  </template>
+                  <template x-if="!item.r._orphan && item.r.system">
                     <span class="inline-block px-1.5 py-0.5 text-[10px] font-semibold rounded bg-blue-200 text-blue-900 uppercase tracking-wide">System</span>
                   </template>
-                  <template x-if="!item.r.system">
+                  <template x-if="!item.r._orphan && !item.r.system">
                     <button @click="removeRoute(item.r)"
                             :aria-label="'Remove route ' + (item.r.hostname || 'unnamed')"
                             class="text-red-600 hover:text-red-800 text-sm" title="Remove">
@@ -622,20 +652,9 @@
       </table>
       </div>
 
-      <div x-show="!loadFailed.routes" class="mt-6 flex flex-wrap items-center gap-3">
-        <button @click="save()"
-                :disabled="saving || systemRowInvalid || viewMode === 'ro'"
-                class="px-4 py-2 rounded bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 disabled:bg-gray-500"
-                :title="viewMode === 'ro' ? 'Read-only — take over to save' :
-                        (systemRowInvalid ? 'Fix the HA system route hostname first' : '')">
-          <span x-show="!saving">Save and apply</span>
-          <span x-show="saving">Saving...</span>
-        </button>
-        <button @click="loadRoutes()" :disabled="saving"
-                class="px-3 py-2 rounded border text-sm font-medium hover:bg-gray-50 disabled:opacity-50">
-          Discard changes
-        </button>
-      </div>
+      <!-- alpha.20: per-tab Save/Discard footers removed. Auto-save flushes
+           every edit to the draft (debounced); the sticky Apply footer at
+           the bottom of the page commits draft -> live for ALL surfaces. -->
     </section>
 
     <!-- ============ MIDDLEWARES TAB ============ -->
@@ -850,19 +869,8 @@
         </template>
       </div>
 
-      <div x-show="!loadFailed.middlewares" class="mt-6 flex items-center gap-3">
-        <button @click="saveMiddlewares()"
-                :disabled="savingMw || viewMode === 'ro'"
-                :title="viewMode === 'ro' ? 'Read-only — take over to save' : ''"
-                class="px-4 py-2 rounded bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 disabled:bg-gray-500">
-          <span x-show="!savingMw">Save and apply</span>
-          <span x-show="savingMw">Saving...</span>
-        </button>
-        <button @click="loadMiddlewares()" :disabled="savingMw"
-                class="px-3 py-2 rounded border text-sm font-medium hover:bg-gray-50 disabled:opacity-50">
-          Discard changes
-        </button>
-      </div>
+      <!-- alpha.20: per-tab Save/Discard footers removed; see global
+           sticky Apply footer at the bottom of <body>. -->
     </section>
 
     <!-- ============ TRAEFIK DASHBOARD TAB ============ -->
@@ -1007,5 +1015,90 @@
       </form>
     </div>
   </div>
+
+  <!-- ============ STICKY APPLY FOOTER (alpha.20) ============ -->
+  <!-- Replaces the per-tab Save/Discard footers. Visible on every tab so
+       the user can Apply or Discard pending changes regardless of where
+       they are. Hidden completely on read-only view. -->
+  <div x-show="pending.total > 0 && viewMode === 'rw'" x-transition
+       class="fixed bottom-0 left-0 right-0 z-40 bg-amber-50 border-t border-amber-200 shadow-lg">
+    <div class="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between flex-wrap gap-3">
+      <div class="flex items-center gap-3 text-sm">
+        <span class="inline-block w-2 h-2 rounded-full bg-amber-500"></span>
+        <span class="font-semibold text-amber-900"
+              x-text="pending.total + ' pending change' + (pending.total === 1 ? '' : 's')"></span>
+        <span class="text-gray-700 text-xs">
+          <template x-if="(pending.routes.modified.length + pending.routes.added.length + pending.routes.deleted.length) > 0">
+            <span>Routes:
+              <span x-show="pending.routes.added.length"   x-text="'+' + pending.routes.added.length"></span>
+              <span x-show="pending.routes.deleted.length" x-text="' -' + pending.routes.deleted.length"></span>
+              <span x-show="pending.routes.modified.length" x-text="' ~' + pending.routes.modified.length"></span>
+            </span>
+          </template>
+          <template x-if="(pending.middlewares.modified.length + pending.middlewares.added.length + pending.middlewares.deleted.length) > 0">
+            <span class="ml-2">Middlewares:
+              <span x-show="pending.middlewares.added.length"   x-text="'+' + pending.middlewares.added.length"></span>
+              <span x-show="pending.middlewares.deleted.length" x-text="' -' + pending.middlewares.deleted.length"></span>
+              <span x-show="pending.middlewares.modified.length" x-text="' ~' + pending.middlewares.modified.length"></span>
+            </span>
+          </template>
+          <template x-if="pending.config.modified.length > 0">
+            <span class="ml-2">Config:
+              <span x-text="'~' + pending.config.modified.length"></span>
+            </span>
+          </template>
+        </span>
+        <!-- alpha.20: warning preview. force_ssl + tls:false routes that
+             render would silently skip on Apply (per alpha.9 rule). -->
+        <template x-if="pending.warnings && pending.warnings.length">
+          <span class="text-xs text-amber-800">
+            <span x-text="pending.warnings.length + ' warning' + (pending.warnings.length === 1 ? '' : 's')"></span>
+            <span class="text-[10px] text-amber-700"
+                  x-text="'(' + pending.warnings.map(w => w.hostname || w.message).join(', ') + ')'"></span>
+          </span>
+        </template>
+      </div>
+      <div class="flex items-center gap-2">
+        <!-- Inline-confirm: first click opens, second click confirms. -->
+        <template x-if="!discardConfirmOpen">
+          <button @click="discardConfirmOpen = true"
+                  :disabled="discarding || applying"
+                  class="px-3 py-1.5 rounded border border-gray-300 bg-white text-sm font-medium hover:bg-gray-50 disabled:opacity-50">
+            Discard all
+          </button>
+        </template>
+        <template x-if="discardConfirmOpen">
+          <span class="flex items-center gap-1.5">
+            <span class="text-xs text-amber-900">Discard everything?</span>
+            <button @click="discardAll()"
+                    :disabled="discarding"
+                    class="px-2.5 py-1 rounded bg-red-600 text-white text-xs font-medium hover:bg-red-700 disabled:opacity-50">
+              <span x-show="!discarding">Yes, discard</span>
+              <span x-show="discarding">...</span>
+            </button>
+            <button @click="discardConfirmOpen = false" :disabled="discarding"
+                    class="px-2.5 py-1 rounded border bg-white text-xs hover:bg-gray-50 disabled:opacity-50">
+              Cancel
+            </button>
+          </span>
+        </template>
+        <button @click="apply()"
+                :disabled="applying || discarding || systemRowInvalid"
+                :title="systemRowInvalid ? 'Fix the HA system route hostname first' : ''"
+                class="px-4 py-1.5 rounded bg-blue-600 text-white text-sm font-semibold hover:bg-blue-700 disabled:bg-gray-500">
+          <span x-show="!applying">Apply</span>
+          <span x-show="applying">Applying…</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- alpha.20: input lockout overlay during Apply (~1s render). Dims the
+       body and blocks pointer events so a fast-typed edit can't sneak in
+       between live-snapshot and render — debounce timers queue and fire
+       after Apply resolves. -->
+  <div x-show="applying" x-transition.opacity
+       class="fixed inset-0 z-30 bg-black/10 pointer-events-auto"
+       aria-hidden="true"></div>
 </body>
 </html>
