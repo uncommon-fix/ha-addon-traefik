@@ -1,5 +1,5 @@
 name: Traefik
-version: "0.1.0-alpha.20"
+version: "0.1.0-alpha.21"
 slug: traefik
 description: LAN reverse-proxy add-on for Home Assistant. Bundles Traefik with a custom UI for routes, middlewares, Cloudflare DNS-01 TLS, and the Traefik dashboard.
 arch:

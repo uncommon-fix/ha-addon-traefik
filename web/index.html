@@ -210,10 +210,18 @@
       </div>
 
       <form x-show="!loadFailed.config" @submit.prevent="saveConfig()" class="space-y-5">
+        <!-- alpha.21: per-field undo. Each block wraps the input in a flex
+             row so the undo icon sits to the right; the amber border /
+             background lights up when the value differs from live. -->
         <div class="flex items-start gap-2 p-3 rounded border bg-gray-50">
           <input type="checkbox" id="force_ssl" x-model="config.force_ssl" class="mt-0.5">
           <label for="force_ssl" class="text-sm">
             <span class="font-medium">Force SSL</span>
+            <button x-show="isFieldDirty('config', null, 'force_ssl')"
+                    @click.prevent.stop="discardField('config', null, 'force_ssl')"
+                    type="button" title="Revert Force SSL to live"
+                    class="ml-1 text-amber-700 hover:text-amber-900 inline-flex"
+                    x-html="icon('undo', 'w-3.5 h-3.5 inline-block')"></button>
             <span class="block text-xs text-gray-500 mt-0.5">
               Redirect every HTTP request to HTTPS at the entry point (301),
               globally — supersedes per-route redirects. HTTP-only routes (TLS
@@ -224,24 +232,41 @@
         </div>
         <div>
           <label class="block text-sm font-medium mb-1">Log level</label>
-          <select x-model="config.log_level"
-                  class="block w-full border rounded px-3 py-2 bg-white">
-            <option value="DEBUG">DEBUG</option>
-            <option value="INFO">INFO</option>
-            <option value="WARN">WARN</option>
-            <option value="ERROR">ERROR</option>
-            <option value="FATAL">FATAL</option>
-          </select>
+          <div class="flex items-center gap-1.5">
+            <select x-model="config.log_level"
+                    class="block w-full border rounded px-3 py-2"
+                    :class="isFieldDirty('config', null, 'log_level') ? 'border-amber-400 bg-amber-50' : 'bg-white'">
+              <option value="DEBUG">DEBUG</option>
+              <option value="INFO">INFO</option>
+              <option value="WARN">WARN</option>
+              <option value="ERROR">ERROR</option>
+              <option value="FATAL">FATAL</option>
+            </select>
+            <button x-show="isFieldDirty('config', null, 'log_level')"
+                    @click="discardField('config', null, 'log_level')"
+                    type="button" title="Revert log level to live"
+                    class="text-amber-700 hover:text-amber-900 inline-flex"
+                    x-html="icon('undo', 'w-4 h-4 inline-block')"></button>
+          </div>
         </div>
 
         <div>
           <label class="block text-sm font-medium mb-1" for="cfg-ep-http">HTTP entry point name</label>
-          <input id="cfg-ep-http" type="text" x-model="config.entrypoint_http"
-                 @blur="normalizeEntrypoint('entrypoint_http')"
-                 placeholder="web"
-                 :aria-invalid="!!entrypointHttpError"
-                 :class="entrypointHttpError ? 'border-red-400' : ''"
-                 class="block w-full font-mono border rounded px-3 py-2">
+          <div class="flex items-center gap-1.5">
+            <input id="cfg-ep-http" type="text" x-model="config.entrypoint_http"
+                   @blur="normalizeEntrypoint('entrypoint_http')"
+                   placeholder="web"
+                   :aria-invalid="!!entrypointHttpError"
+                   :class="entrypointHttpError
+                           ? 'border-red-400'
+                           : (isFieldDirty('config', null, 'entrypoint_http') ? 'border-amber-400 bg-amber-50' : '')"
+                   class="block w-full font-mono border rounded px-3 py-2">
+            <button x-show="isFieldDirty('config', null, 'entrypoint_http')"
+                    @click="discardField('config', null, 'entrypoint_http')"
+                    type="button" title="Revert HTTP entry point to live"
+                    class="text-amber-700 hover:text-amber-900 inline-flex"
+                    x-html="icon('undo', 'w-4 h-4 inline-block')"></button>
+          </div>
           <p x-show="entrypointHttpError" class="text-xs text-red-700 mt-1" x-text="entrypointHttpError"></p>
           <p class="text-xs text-gray-500 mt-1">
             Name Traefik uses for the :80 listener.
@@ -251,12 +276,21 @@
 
         <div>
           <label class="block text-sm font-medium mb-1" for="cfg-ep-https">HTTPS entry point name</label>
-          <input id="cfg-ep-https" type="text" x-model="config.entrypoint_https"
-                 @blur="normalizeEntrypoint('entrypoint_https')"
-                 placeholder="websecure"
-                 :aria-invalid="!!entrypointHttpsError"
-                 :class="entrypointHttpsError ? 'border-red-400' : ''"
-                 class="block w-full font-mono border rounded px-3 py-2">
+          <div class="flex items-center gap-1.5">
+            <input id="cfg-ep-https" type="text" x-model="config.entrypoint_https"
+                   @blur="normalizeEntrypoint('entrypoint_https')"
+                   placeholder="websecure"
+                   :aria-invalid="!!entrypointHttpsError"
+                   :class="entrypointHttpsError
+                           ? 'border-red-400'
+                           : (isFieldDirty('config', null, 'entrypoint_https') ? 'border-amber-400 bg-amber-50' : '')"
+                   class="block w-full font-mono border rounded px-3 py-2">
+            <button x-show="isFieldDirty('config', null, 'entrypoint_https')"
+                    @click="discardField('config', null, 'entrypoint_https')"
+                    type="button" title="Revert HTTPS entry point to live"
+                    class="text-amber-700 hover:text-amber-900 inline-flex"
+                    x-html="icon('undo', 'w-4 h-4 inline-block')"></button>
+          </div>
           <p x-show="entrypointHttpsError" class="text-xs text-red-700 mt-1" x-text="entrypointHttpsError"></p>
           <p x-show="entrypointConflictError" class="text-xs text-red-700 mt-1" x-text="entrypointConflictError"></p>
           <p class="text-xs text-gray-500 mt-1">
@@ -508,9 +542,20 @@
                     <!-- Hostname (always editable; system route allows hostname change) -->
                     <div>
                       <label class="block text-xs text-gray-600 mb-0.5">Hostname</label>
-                      <input type="text" x-model="item.r.hostname"
-                             class="font-mono border rounded px-2 py-1 w-64 bg-white"
-                             :placeholder="item.r.system ? 'hass' : 'cloud or cloud.example.com'">
+                      <!-- alpha.21: amber accent + undo icon when value differs from live -->
+                      <div class="flex items-center gap-1.5">
+                        <input type="text" x-model="item.r.hostname"
+                               class="font-mono border rounded px-2 py-1 w-64"
+                               :class="isFieldDirty('routes', item.r.rid, 'hostname') ? 'border-amber-400 bg-amber-50' : 'bg-white'"
+                               :placeholder="item.r.system ? 'hass' : 'cloud or cloud.example.com'">
+                        <button x-show="isFieldDirty('routes', item.r.rid, 'hostname')"
+                                @click="discardField('routes', item.r.rid, 'hostname')"
+                                type="button"
+                                title="Revert hostname to live value"
+                                aria-label="Revert hostname"
+                                class="text-amber-700 hover:text-amber-900 inline-flex"
+                                x-html="icon('undo', 'w-4 h-4 inline-block')"></button>
+                      </div>
                     </div>
 
                     <!-- Backend, Scheme, TLS, Middlewares, Health: user routes only.
@@ -521,44 +566,86 @@
                         <div class="flex gap-3 items-end flex-wrap">
                           <div>
                             <label class="block text-xs text-gray-600 mb-0.5">Backend</label>
-                            <select x-model="item.r.backend_kind" class="border rounded px-2 py-1 bg-white">
-                              <option value="home_assistant">Home Assistant</option>
-                              <option value="external">External</option>
-                            </select>
+                            <div class="flex items-center gap-1.5">
+                              <select x-model="item.r.backend_kind" class="border rounded px-2 py-1"
+                                      :class="isFieldDirty('routes', item.r.rid, 'backend_kind') ? 'border-amber-400 bg-amber-50' : 'bg-white'">
+                                <option value="home_assistant">Home Assistant</option>
+                                <option value="external">External</option>
+                              </select>
+                              <button x-show="isFieldDirty('routes', item.r.rid, 'backend_kind')"
+                                      @click="discardField('routes', item.r.rid, 'backend_kind')"
+                                      type="button" title="Revert backend kind to live"
+                                      class="text-amber-700 hover:text-amber-900 inline-flex"
+                                      x-html="icon('undo', 'w-4 h-4 inline-block')"></button>
+                            </div>
                           </div>
                           <div x-show="item.r.backend_kind === 'external'" class="flex gap-1 items-end">
                             <div>
                               <label class="block text-[10px] text-gray-500 mb-0.5">host</label>
-                              <input type="text" x-model="item.r.backend_host" placeholder="10.0.0.20"
-                                     class="font-mono border rounded px-2 py-1 w-40">
+                              <div class="flex items-center gap-1.5">
+                                <input type="text" x-model="item.r.backend_host" placeholder="10.0.0.20"
+                                       class="font-mono border rounded px-2 py-1 w-40"
+                                       :class="isFieldDirty('routes', item.r.rid, 'backend_host') ? 'border-amber-400 bg-amber-50' : 'bg-white'">
+                                <button x-show="isFieldDirty('routes', item.r.rid, 'backend_host')"
+                                        @click="discardField('routes', item.r.rid, 'backend_host')"
+                                        type="button" title="Revert backend host to live"
+                                        class="text-amber-700 hover:text-amber-900 inline-flex"
+                                        x-html="icon('undo', 'w-4 h-4 inline-block')"></button>
+                              </div>
                             </div>
                             <div>
                               <label class="block text-[10px] text-gray-500 mb-0.5">port</label>
-                              <input type="number" x-model.number="item.r.backend_port" placeholder="443"
-                                     min="1" max="65535"
-                                     class="font-mono border rounded px-2 py-1 w-24">
+                              <div class="flex items-center gap-1.5">
+                                <input type="number" x-model.number="item.r.backend_port" placeholder="443"
+                                       min="1" max="65535"
+                                       class="font-mono border rounded px-2 py-1 w-24"
+                                       :class="isFieldDirty('routes', item.r.rid, 'backend_port') ? 'border-amber-400 bg-amber-50' : 'bg-white'">
+                                <button x-show="isFieldDirty('routes', item.r.rid, 'backend_port')"
+                                        @click="discardField('routes', item.r.rid, 'backend_port')"
+                                        type="button" title="Revert backend port to live"
+                                        class="text-amber-700 hover:text-amber-900 inline-flex"
+                                        x-html="icon('undo', 'w-4 h-4 inline-block')"></button>
+                              </div>
                             </div>
                           </div>
                         </div>
 
-                        <!-- Scheme + TLS + Skip TLS verify -->
+                        <!-- Scheme + TLS + Skip TLS verify (alpha.21: per-field diff + undo) -->
                         <div class="flex gap-4 items-end flex-wrap">
                           <div>
                             <label class="block text-xs text-gray-600 mb-0.5">Scheme</label>
-                            <select x-model="item.r.scheme" @change="onRouteSchemeChange(item.r)"
-                                    class="border rounded px-2 py-1 bg-white"
-                                    :disabled="item.r.backend_kind === 'home_assistant'">
-                              <option value="http">http</option>
-                              <option value="https">https</option>
-                            </select>
+                            <div class="flex items-center gap-1.5">
+                              <select x-model="item.r.scheme" @change="onRouteSchemeChange(item.r)"
+                                      class="border rounded px-2 py-1"
+                                      :class="isFieldDirty('routes', item.r.rid, 'scheme') ? 'border-amber-400 bg-amber-50' : 'bg-white'"
+                                      :disabled="item.r.backend_kind === 'home_assistant'">
+                                <option value="http">http</option>
+                                <option value="https">https</option>
+                              </select>
+                              <button x-show="isFieldDirty('routes', item.r.rid, 'scheme')"
+                                      @click="discardField('routes', item.r.rid, 'scheme')"
+                                      type="button" title="Revert scheme to live"
+                                      class="text-amber-700 hover:text-amber-900 inline-flex"
+                                      x-html="icon('undo', 'w-4 h-4 inline-block')"></button>
+                            </div>
                           </div>
                           <label class="flex items-center gap-1.5 text-sm pb-1.5">
                             <input type="checkbox" x-model="item.r.tls">
                             TLS on (front-side)
+                            <button x-show="isFieldDirty('routes', item.r.rid, 'tls')"
+                                    @click.prevent.stop="discardField('routes', item.r.rid, 'tls')"
+                                    type="button" title="Revert TLS to live"
+                                    class="text-amber-700 hover:text-amber-900 inline-flex"
+                                    x-html="icon('undo', 'w-3.5 h-3.5 inline-block')"></button>
                           </label>
                           <label x-show="item.r.scheme === 'https'" class="flex items-center gap-1.5 text-sm pb-1.5">
                             <input type="checkbox" x-model="item.r.skip_tls_verify">
                             Skip TLS verify on backend
+                            <button x-show="isFieldDirty('routes', item.r.rid, 'skip_tls_verify')"
+                                    @click.prevent.stop="discardField('routes', item.r.rid, 'skip_tls_verify')"
+                                    type="button" title="Revert Skip TLS verify to live"
+                                    class="text-amber-700 hover:text-amber-900 inline-flex"
+                                    x-html="icon('undo', 'w-3.5 h-3.5 inline-block')"></button>
                           </label>
                         </div>
 

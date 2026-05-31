@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.0-alpha.21
+
+- **Per-field change indicators + undo (Routes + Configuration).** Every
+  edited input lights up with an amber accent + a small undo icon to
+  the right whenever its value differs from live. Click the undo icon
+  to revert just that one field back to the live value (auto-save
+  flushes the revert; pending count decrements accordingly). Wired up
+  for: Routes hostname, backend (kind/host/port), scheme, TLS, Skip
+  TLS verify; Configuration's Force SSL, log level, HTTP entry point,
+  HTTPS entry point. Per-row "modified" amber dot from alpha.20 is
+  unchanged and still summarises the row state.
+
 ## 0.1.0-alpha.20
 
 - **Draft / live config split + Apply.** Editing the Routes, Middlewares,

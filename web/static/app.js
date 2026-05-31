@@ -65,6 +65,8 @@ const MDI_ICONS = {
     'chevron-up':    'M7.41,15.41L12,10.83L16.59,15.41L18,14L12,8L6,14L7.41,15.41Z',
     'lock':          'M12,17A2,2 0 0,0 14,15C14,13.89 13.1,13 12,13A2,2 0 0,0 10,15A2,2 0 0,0 12,17M18,8A2,2 0 0,1 20,10V20A2,2 0 0,1 18,22H6A2,2 0 0,1 4,20V10C4,8.89 4.9,8 6,8H7V6A5,5 0 0,1 12,1A5,5 0 0,1 17,6V8H18M12,3A3,3 0 0,0 9,6V8H15V6A3,3 0 0,0 12,3Z',
     'shield-alert':  'M12,1L3,5V11C3,16.55 6.84,21.74 12,23C17.16,21.74 21,16.55 21,11V5L12,1M11,7H13V13H11V7M11,15H13V17H11V15Z',
+    // alpha.21: undo for per-field rollback icons.
+    'undo':          'M12.5,8C9.85,8 7.45,8.99 5.6,10.6L2,7V16H11L7.38,12.38C8.77,11.22 10.54,10.5 12.5,10.5C16.04,10.5 19.05,12.81 20.1,16L22.47,15.22C21.08,11.03 17.15,8 12.5,8Z',
 };
 function mdiSvg(name, classes = '') {
     const path = MDI_ICONS[name];
@@ -1184,6 +1186,133 @@ function traefikAppData() {
         isRouteAdded(rid)    { return rid && this.pending.routes.added && this.pending.routes.added.includes(rid); },
         isRouteModified(rid) { return rid && this.pending.routes.modified && this.pending.routes.modified.includes(rid); },
         isRouteDirty(rid)    { return this.isRouteAdded(rid) || this.isRouteModified(rid); },
+
+        // ---------- alpha.21: per-field diff + rollback ----------
+        // Per-field "this input differs from live" checks + per-field
+        // discard. The implementation is purely client-side: discard sets
+        // the local draft value to the live value, the Alpine watcher
+        // fires, auto-save flushes the new state to the backend draft, and
+        // the per-row + per-field highlights clear naturally. No backend
+        // round-trip needed (and the backend's POST /api/discard with
+        // scope='field' stays NotImplemented — reserved for a future
+        // server-validated discard if we ever need one).
+        //
+        // Path notation: a dotted path inside the scope's object.
+        //   isFieldDirty('routes', '<rid>', 'hostname')
+        //   isFieldDirty('config', null, 'force_ssl')
+        //   isFieldDirty('middlewares', '<mid>', 'config.users')
+
+        _getLiveRoute(rid) {
+            if (!rid) return null;
+            return (this.routesLive || []).find(r => r.rid === rid) || null;
+        },
+        _getLiveMiddleware(mid) {
+            if (!mid) return null;
+            return (this.middlewaresLive || []).find(m => m.mid === mid) || null;
+        },
+
+        _liveValueFor(scope, idOrKey, fieldPath) {
+            let obj = null;
+            if (scope === 'routes')           obj = this._getLiveRoute(idOrKey);
+            else if (scope === 'middlewares') obj = this._getLiveMiddleware(idOrKey);
+            else if (scope === 'config')      obj = this.configLive;
+            return this._pathGet(obj, fieldPath);
+        },
+        _draftObjectFor(scope, idOrKey) {
+            if (scope === 'routes')           return this.routes.find(r => r.rid === idOrKey);
+            if (scope === 'middlewares')      return this.middlewares.find(m => m.mid === idOrKey);
+            if (scope === 'config')           return this.config;
+            return null;
+        },
+
+        // Shallow dotted-path get. Returns undefined if any segment is
+        // missing. Doesn't support array indexing — list fields like
+        // `middlewares.config.users` are compared / restored as whole
+        // lists, not per-element (per the alpha.21 scope decision).
+        _pathGet(obj, path) {
+            if (obj == null || !path) return undefined;
+            const parts = String(path).split('.');
+            let cur = obj;
+            for (const p of parts) {
+                if (cur == null || typeof cur !== 'object') return undefined;
+                cur = cur[p];
+            }
+            return cur;
+        },
+        _pathSet(obj, path, value) {
+            if (obj == null || !path) return;
+            const parts = String(path).split('.');
+            const last = parts.pop();
+            let cur = obj;
+            for (const p of parts) {
+                if (cur[p] == null || typeof cur[p] !== 'object') cur[p] = {};
+                cur = cur[p];
+            }
+            cur[last] = value;
+        },
+
+        // Deep equality for primitives + arrays + plain objects. Drops
+        // `_`-prefixed UI fields so a chevron toggle doesn't show as a
+        // diff. Cheap for our shapes (small dicts; route/middleware ≤30
+        // fields each). Avoids pulling in lodash.
+        _deepEqual(a, b) {
+            if (a === b) return true;
+            if (a == null || b == null) return a === b;
+            const ta = typeof a, tb = typeof b;
+            if (ta !== tb) return false;
+            if (ta !== 'object') return false;
+            if (Array.isArray(a) !== Array.isArray(b)) return false;
+            if (Array.isArray(a)) {
+                if (a.length !== b.length) return false;
+                for (let i = 0; i < a.length; i++) {
+                    if (!this._deepEqual(a[i], b[i])) return false;
+                }
+                return true;
+            }
+            const ka = Object.keys(a).filter(k => !k.startsWith('_'));
+            const kb = Object.keys(b).filter(k => !k.startsWith('_'));
+            if (ka.length !== kb.length) return false;
+            for (const k of ka) {
+                if (!this._deepEqual(a[k], b[k])) return false;
+            }
+            return true;
+        },
+
+        isFieldDirty(scope, idOrKey, fieldPath) {
+            // alpha.21: amber-highlight + show undo icon when the draft
+            // value at <fieldPath> differs from the live value. For
+            // brand-new routes (rid present in draft but no live row), we
+            // treat all fields as "dirty" so the user can see every input
+            // is part of a new entity — matches the per-row added marker.
+            const draftObj = this._draftObjectFor(scope, idOrKey);
+            if (draftObj == null) return false;
+            // For routes/middlewares: if no live counterpart, it's a new
+            // entry — the per-row "added" dot covers it; no field-level
+            // highlight needed (would amber-paint every input which is
+            // visual noise).
+            if (scope !== 'config') {
+                const liveObj = (scope === 'routes'
+                    ? this._getLiveRoute(idOrKey)
+                    : this._getLiveMiddleware(idOrKey));
+                if (!liveObj) return false;
+            }
+            const draftVal = this._pathGet(draftObj, fieldPath);
+            const liveVal  = this._liveValueFor(scope, idOrKey, fieldPath);
+            return !this._deepEqual(draftVal, liveVal);
+        },
+
+        discardField(scope, idOrKey, fieldPath) {
+            const draftObj = this._draftObjectFor(scope, idOrKey);
+            if (!draftObj) return;
+            const liveVal = this._liveValueFor(scope, idOrKey, fieldPath);
+            // For lists/objects, clone so a later live mutation doesn't
+            // mutate the draft by reference. Primitives are copied as-is.
+            const copied = (liveVal && typeof liveVal === 'object')
+                ? JSON.parse(JSON.stringify(liveVal))
+                : liveVal;
+            this._pathSet(draftObj, fieldPath, copied);
+            // Auto-save watcher picks up the mutation and flushes.
+        },
 
         // Orphan rows for the Routes table: routes that exist in live but
         // are missing from the draft (= user clicked Remove on them but
