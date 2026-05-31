@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.0-alpha.18
+
+- **Proper icons in the Routes tab.** The emoji glyphs (`▶`/`▼` chevrons
+  for group + row expand, `🔒` for TLS) have been replaced with crisp,
+  monochrome MDI SVGs -- visually consistent with Home Assistant's own
+  iconography and rendered at the correct text size. Vendored inline;
+  no CDN.
+- **"Skip TLS verify" is now a chip beside the lock.** Was a wide amber
+  `skip-tls` text marker that wrapped narrow rows; is now a small
+  amber shield-alert icon with a tooltip -- same information, fits on
+  one line at any reasonable width.
+
 ## 0.1.0-alpha.17
 
 - Fixed: the tag editor silently swallowed invalid input — typing a tag

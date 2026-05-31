@@ -51,6 +51,24 @@ function makeBlankRoute() {
 // feature toggle, hide it from the relevant UI surface." Both filter sites
 // (route dropdown + Middlewares tab list) consult this table. Adding a future
 // feature-managed middleware = one entry here, no scattered edits.
+// alpha.18: vendored MDI icon paths. We render proper SVGs instead of
+// emoji glyphs (▶/▼/🔒) so the UI looks consistent and chip-sized
+// markers don't push compact rows into wrap. MDI paths are open-source
+// and visually match HA's own iconography. The addon UI runs inside an
+// HA ingress iframe, so HA's <ha-icon> custom element is not reachable;
+// reusing MDI's path data is the closest equivalent without a CDN dep.
+const MDI_ICONS = {
+    'chevron-down':  'M7.41,8.59L12,13.17L16.59,8.59L18,10L12,16L6,10L7.41,8.59Z',
+    'chevron-right': 'M8.59,16.58L13.17,12L8.59,7.41L10,6L16,12L10,18L8.59,16.58Z',
+    'lock':          'M12,17A2,2 0 0,0 14,15C14,13.89 13.1,13 12,13A2,2 0 0,0 10,15A2,2 0 0,0 12,17M18,8A2,2 0 0,1 20,10V20A2,2 0 0,1 18,22H6A2,2 0 0,1 4,20V10C4,8.89 4.9,8 6,8H7V6A5,5 0 0,1 12,1A5,5 0 0,1 17,6V8H18M12,3A3,3 0 0,0 9,6V8H15V6A3,3 0 0,0 12,3Z',
+    'shield-alert':  'M12,1L3,5V11C3,16.55 6.84,21.74 12,23C17.16,21.74 21,16.55 21,11V5L12,1M11,7H13V13H11V7M11,15H13V17H11V15Z',
+};
+function mdiSvg(name, classes = '') {
+    const path = MDI_ICONS[name];
+    if (!path) return '';
+    return `<svg viewBox="0 0 24 24" aria-hidden="true" class="${classes}"><path fill="currentColor" d="${path}"></path></svg>`;
+}
+
 const FEATURE_MANAGED_MIDDLEWARES = {
     'redirect-to-https': {
         // Hide from the Middlewares tab always: its two params
@@ -173,6 +191,11 @@ function blankState() {
 
 function traefikAppData() {
     return {
+        // alpha.18: MDI icon helper exposed to Alpine templates via
+        // `x-html="icon('chevron-down', 'w-4 h-4 …')"`. Path data lives
+        // in module-level MDI_ICONS so it isn't duplicated per instance.
+        icon(name, classes = '') { return mdiSvg(name, classes); },
+
         ingressPath: INGRESS_PATH,
         // Default 'routes' once configured; load() flips to 'config'
         // (with wizardOpen=true) on first run so a sensible underlay
