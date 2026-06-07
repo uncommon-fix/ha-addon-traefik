@@ -335,12 +335,107 @@
               </template>
             </select>
           </label>
-          <button @click="addRoute()"
-                  class="px-3 py-1.5 rounded bg-blue-600 text-white text-sm font-medium hover:bg-blue-700">
+          <button @click="startComposeRoute()"
+                  :disabled="_composeRoute !== null || viewMode === 'ro'"
+                  :title="_composeRoute !== null ? 'Finish the route you started above first' : ''"
+                  class="px-3 py-1.5 rounded bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 disabled:bg-gray-400">
             Add route
           </button>
         </div>
       </div>
+
+      <!-- ============ NEW ROUTE COMPOSE PANEL (alpha.22) ============
+           Renders ONLY while _composeRoute !== null. The in-progress route
+           lives outside this.routes so it doesn't shuffle through the
+           grouped/sorted table as the user fills in fields, and so that
+           partial state (empty hostname / port) doesn't trigger
+           validation-failing auto-save PUTs. On Create it gets a uuid +
+           is pushed into this.routes; the watcher then fires auto-save.
+           -->
+      <template x-if="_composeRoute !== null">
+        <div class="mb-4 p-4 rounded-lg border-2 border-blue-300 bg-blue-50/50 shadow-sm">
+          <div class="flex items-center justify-between mb-3">
+            <h3 class="text-sm font-semibold text-blue-900">New route</h3>
+            <span class="text-xs text-gray-600">Fill in the required fields, then click <strong>Create</strong>. Nothing is sent to Traefik until you Apply.</span>
+          </div>
+
+          <div class="space-y-3 max-w-3xl">
+            <!-- Hostname -->
+            <div>
+              <label class="block text-xs text-gray-600 mb-0.5">Hostname <span class="text-red-600">*</span></label>
+              <input type="text" x-model="_composeRoute.hostname"
+                     placeholder="cloud or cloud.example.com"
+                     :class="composeHostnameError ? 'border-red-400 bg-red-50' : 'bg-white'"
+                     class="font-mono border rounded px-2 py-1 w-64">
+              <p x-show="composeHostnameError" class="text-[10px] text-red-700 mt-0.5" x-text="composeHostnameError"></p>
+            </div>
+
+            <!-- Backend kind + host/port -->
+            <div class="flex gap-3 items-end flex-wrap">
+              <div>
+                <label class="block text-xs text-gray-600 mb-0.5">Backend</label>
+                <select x-model="_composeRoute.backend_kind" class="border rounded px-2 py-1 bg-white">
+                  <option value="home_assistant">Home Assistant</option>
+                  <option value="external">External</option>
+                </select>
+              </div>
+              <div x-show="_composeRoute.backend_kind === 'external'" class="flex gap-1 items-end">
+                <div>
+                  <label class="block text-[10px] text-gray-500 mb-0.5">host <span class="text-red-600">*</span></label>
+                  <input type="text" x-model="_composeRoute.backend_host" placeholder="10.0.0.20"
+                         :class="composeBackendHostError ? 'border-red-400 bg-red-50' : 'bg-white'"
+                         class="font-mono border rounded px-2 py-1 w-40">
+                  <p x-show="composeBackendHostError" class="text-[10px] text-red-700 mt-0.5" x-text="composeBackendHostError"></p>
+                </div>
+                <div>
+                  <label class="block text-[10px] text-gray-500 mb-0.5">port <span class="text-red-600">*</span></label>
+                  <input type="number" x-model.number="_composeRoute.backend_port" placeholder="443"
+                         min="1" max="65535"
+                         :class="composeBackendPortError ? 'border-red-400 bg-red-50' : 'bg-white'"
+                         class="font-mono border rounded px-2 py-1 w-24">
+                  <p x-show="composeBackendPortError" class="text-[10px] text-red-700 mt-0.5" x-text="composeBackendPortError"></p>
+                </div>
+              </div>
+            </div>
+
+            <!-- Scheme + TLS + Skip TLS verify -->
+            <div class="flex gap-4 items-end flex-wrap">
+              <div>
+                <label class="block text-xs text-gray-600 mb-0.5">Scheme</label>
+                <select x-model="_composeRoute.scheme"
+                        class="border rounded px-2 py-1 bg-white"
+                        :disabled="_composeRoute.backend_kind === 'home_assistant'">
+                  <option value="http">http</option>
+                  <option value="https">https</option>
+                </select>
+              </div>
+              <label class="flex items-center gap-1.5 text-sm pb-1.5">
+                <input type="checkbox" x-model="_composeRoute.tls">
+                TLS on (front-side)
+              </label>
+              <label x-show="_composeRoute.scheme === 'https'" class="flex items-center gap-1.5 text-sm pb-1.5">
+                <input type="checkbox" x-model="_composeRoute.skip_tls_verify">
+                Skip TLS verify on backend
+              </label>
+            </div>
+
+            <!-- Actions -->
+            <div class="flex items-center gap-2 pt-2 border-t border-blue-200">
+              <button @click="commitComposeRoute()"
+                      :disabled="!isComposeRouteValid"
+                      :title="!isComposeRouteValid ? 'Fill in the required fields first' : 'Add the route to the table; auto-save will draft it'"
+                      class="px-4 py-1.5 rounded bg-blue-600 text-white text-sm font-semibold hover:bg-blue-700 disabled:bg-gray-400">
+                Create
+              </button>
+              <button @click="cancelComposeRoute()"
+                      class="px-3 py-1.5 rounded border bg-white text-sm font-medium hover:bg-gray-50">
+                Cancel
+              </button>
+              <span class="text-xs text-gray-500 ml-1">Required fields are marked <span class="text-red-600">*</span>. Other fields (middlewares, health check) are available after creation in the row editor.</span>
+            </div>
+          </div>
+        </div>
+      </template>
 
       <!-- alpha.12: per-section load-failure panel. Render INSTEAD of the
            form / table so a stale load can't be 'fixed' by clicking Save. -->

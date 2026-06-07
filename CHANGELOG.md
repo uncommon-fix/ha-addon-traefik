@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.0-alpha.22
+
+- **Fixed: new routes no longer churn the table or the auto-save while
+  you're filling them in.** Clicking **Add route** now opens a separate
+  compose panel above the table; the new route only joins the grouped/
+  sorted list when you click **Create** with the required fields
+  (hostname, plus host + port for external backends) filled in. Two
+  UX issues this resolves: the row no longer jumps between the
+  "Home Assistant" and "External backend" groups as you change the
+  backend kind, and there's no more stream of "route[N].hostname
+  empty" / "external needs backend_host + backend_port" toasts from
+  the half-typed state. Auto-save only fires once the route exists.
+- **Fixed: auto-save error toasts deduplicated.** A regex- or
+  validator-rejecting keystroke stream used to push a fresh sticky
+  toast per debounce flush. Now there's one sticky toast per surface
+  that updates in place and dismisses automatically when the next
+  flush succeeds.
+
 ## 0.1.0-alpha.21
 
 - **Per-field change indicators + undo (Routes + Configuration).** Every

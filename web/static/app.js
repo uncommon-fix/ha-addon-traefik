@@ -283,6 +283,21 @@ function traefikAppData() {
         applying: false,
         discarding: false,
         discardConfirmOpen: false,
+        // alpha.22: compose-then-create. Holds the in-progress NEW route
+        // until the user clicks Create with valid fields. Null when no
+        // compose is open. Kept OUT of this.routes so:
+        //   1. the grouped/sorted table doesn't shuffle as the user fills
+        //      in fields (no jumping between "Home Assistant" and
+        //      "External backend" groups);
+        //   2. partial fields (hostname empty, port empty) don't fire
+        //      validation-failing auto-saves.
+        _composeRoute: null,
+        // alpha.22: auto-save toast dedup. Per-surface IDs of the currently-
+        // visible sticky error toast (if any). _flushAutoSave updates the
+        // toast in place instead of pushing a fresh one on every failed
+        // attempt, so a regex-rejecting keystroke stream doesn't stack
+        // dozens of identical toasts.
+        _autoSaveErrorToastId: { routes: 0, middlewares: 0, config: 0 },
         // alpha.16: Routes-tab grouping state. groupBy: 'externalTarget' |
         // 'none'. collapsedGroups: Set of currently-collapsed group keys
         // (interned with the same key shape groupedRoutes emits). Both load
@@ -1024,6 +1039,11 @@ function traefikAppData() {
                 else if (surface === 'middlewares') await this._putMiddlewaresDraft();
                 else if (surface === 'config')      await this._putConfigDraft();
                 this.autoSaveError[surface] = '';
+                // alpha.22: success — dismiss any prior sticky error toast.
+                if (this._autoSaveErrorToastId[surface]) {
+                    this._dismissToast(this._autoSaveErrorToastId[surface]);
+                    this._autoSaveErrorToastId[surface] = 0;
+                }
                 this.loadPending().catch(() => {});
             } catch (e) {
                 if (e.code === 'VERSION_MISMATCH') {
@@ -1035,7 +1055,18 @@ function traefikAppData() {
                 }
                 if (e.code === 'SESSION_LOST') return;   // already handled
                 this.autoSaveError[surface] = e.message || String(e);
-                this.toast.error(`Auto-save (${surface}) failed: ${e.message}`);
+                // alpha.22: dedup. Dismiss the prior error toast (if any)
+                // before pushing the new one, so a stream of keystrokes
+                // through invalid intermediate states shows ONE toast that
+                // updates, not a stack of identical messages. Sticky so the
+                // user can't miss it; cleared on the next successful flush.
+                if (this._autoSaveErrorToastId[surface]) {
+                    this._dismissToast(this._autoSaveErrorToastId[surface]);
+                }
+                this._autoSaveErrorToastId[surface] = this.toast.error(
+                    `Auto-save (${surface}) failed: ${e.message}`,
+                    { sticky: true },
+                );
             } finally {
                 this._autoSaveInflight[surface] = false;
             }
@@ -1580,8 +1611,76 @@ function traefikAppData() {
             }
         },
 
+        // alpha.22: compose-then-create. The old addRoute() pushed an empty
+        // route into this.routes immediately, which (a) made the new row
+        // jump groups as the user filled in backend_kind/backend_host, and
+        // (b) fired auto-save validation errors on every keystroke until
+        // hostname + host + port were all set. New flow: a separate
+        // _composeRoute slot holds the in-progress entry; on commit (with
+        // valid fields) it gets a uuid + is pushed into this.routes, and
+        // ONLY THEN does the watcher fire + auto-save flush.
         addRoute() {
-            this.routes.push(makeBlankRoute());
+            // Back-compat alias for any old caller; the UI now uses
+            // startComposeRoute() directly.
+            this.startComposeRoute();
+        },
+        startComposeRoute() {
+            if (this._composeRoute) return;     // one at a time
+            this._composeRoute = makeBlankRoute();
+        },
+        cancelComposeRoute() {
+            this._composeRoute = null;
+        },
+        commitComposeRoute() {
+            if (!this.isComposeRouteValid) return;
+            const r = this._composeRoute;
+            // Assign a fresh client-side rid so the diff endpoint sees this
+            // as an "added" route from the first auto-save (no add+delete
+            // churn on the round-trip; alpha.20's backend rid-preservation
+            // logic accepts client-provided rids verbatim).
+            r.rid = (typeof crypto !== 'undefined' && crypto.randomUUID)
+                ? crypto.randomUUID()
+                : ('client-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10));
+            r._expanded = true;                 // open the inline editor so user sees what landed
+            this.routes.push(r);
+            this._composeRoute = null;
+            // Watcher fires on routes.push -> scheduleAutoSave -> PUT.
+        },
+
+        // Validity gate for the compose form's Create button. Mirrors the
+        // server's _validate_routes rules so the user can't click Create
+        // and immediately hit a backend rejection.
+        get isComposeRouteValid() {
+            const r = this._composeRoute;
+            if (!r) return false;
+            if (!(r.hostname || '').trim()) return false;
+            if (r.backend_kind === 'external') {
+                if (!(r.backend_host || '').trim()) return false;
+                const port = Number(r.backend_port);
+                if (!Number.isInteger(port) || port < 1 || port > 65535) return false;
+            }
+            return true;
+        },
+        // Per-field validity helpers for the compose form's hints (red
+        // border + caption beneath each input that needs attention).
+        get composeHostnameError() {
+            const r = this._composeRoute;
+            if (!r) return '';
+            return (r.hostname || '').trim() ? '' : 'Required.';
+        },
+        get composeBackendHostError() {
+            const r = this._composeRoute;
+            if (!r || r.backend_kind !== 'external') return '';
+            return (r.backend_host || '').trim() ? '' : 'Required for external backends.';
+        },
+        get composeBackendPortError() {
+            const r = this._composeRoute;
+            if (!r || r.backend_kind !== 'external') return '';
+            const port = Number(r.backend_port);
+            if (!Number.isInteger(port) || port < 1 || port > 65535) {
+                return 'Required (1–65535).';
+            }
+            return '';
         },
 
         // Phase F: takes the route OBJECT (template iterates sortedRoutes,
