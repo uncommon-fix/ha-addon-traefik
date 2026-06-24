@@ -1407,6 +1407,143 @@ async def put_routes(request):
     return web.json_response({"saved": len(incoming)})
 
 
+# ------------------- alpha.23: cross-addon internal API ------------------
+# Sibling addons (e.g. davinci-resolve) can POST here to scaffold a route
+# in this addon's DRAFT — the user then reviews + clicks Apply in this
+# addon's UI to actually publish. Bypasses session_gate (callers are
+# addons, not user tabs) + version_gate (callers don't know our app
+# version). Authentication: requires a non-empty Bearer token in the
+# Authorization header. The supervisor's bridge network is internal-only,
+# so any container that reaches us is by construction another addon on
+# the same HA install — adequate for homelab MVP. Stronger auth (verify
+# the token via supervisor /info) is a future improvement.
+
+INTERNAL_API_MAX_FIELD_LEN = 256
+
+
+async def post_internal_routes(request):
+    """alpha.23: scaffold a new route into the DRAFT from a sibling addon
+    request. Body (all fields optional except `name`):
+        {
+            "name": "davinci-resolve",       # used as the route hostname
+            "backend_kind": "external",      # default "external"
+            "backend_host": "local_davinci-resolve",   # addon hostname on bridge
+            "backend_port": 5432,
+            "scheme": "http",                # default "http"
+            "tls": false,                    # default false
+            "source": "davinci-resolve"      # informational; logged
+        }
+    Returns: {"rid": "<uuid>", "name": <name>}.
+
+    The created route is APPENDED to the existing draft routes list. The
+    user reviews + Applies in the UI. We DO NOT auto-Apply — sibling
+    addons mutating live config without an explicit user gesture would
+    be a surprise.
+
+    Validation: route shape goes through the same `_validate_routes` as
+    PUT /api/routes; duplicate hostname check rejects re-scaffolds.
+    """
+    # 1. Auth: non-empty Authorization header (homelab trust).
+    auth = request.headers.get("Authorization", "")
+    if not auth.strip():
+        return web.json_response(
+            {"error": "Authorization header required (bearer token)."},
+            status=401,
+        )
+
+    # 2. Parse body.
+    try:
+        body = await request.json()
+    except json.JSONDecodeError as e:
+        raise web.HTTPBadRequest(text=f"invalid JSON: {e}")
+    if not isinstance(body, dict):
+        raise web.HTTPBadRequest(text="payload: must be object")
+
+    # 3. Extract + clamp lengths so a misbehaving caller can't shove huge
+    #    strings into routes.yml. Field-by-field rather than a blanket
+    #    iterate so we stay explicit about what we accept.
+    def _str_field(key: str, default: str = "") -> str:
+        v = body.get(key, default)
+        if not isinstance(v, str):
+            raise web.HTTPBadRequest(text=f"{key}: must be string")
+        return v[:INTERNAL_API_MAX_FIELD_LEN]
+
+    name = _str_field("name").strip()
+    if not name:
+        raise web.HTTPBadRequest(text="name: required (used as the route hostname)")
+
+    backend_kind = _str_field("backend_kind", "external").strip() or "external"
+    backend_host = _str_field("backend_host").strip() or None
+    backend_port = body.get("backend_port")
+    if backend_port is not None and not isinstance(backend_port, int):
+        raise web.HTTPBadRequest(text="backend_port: must be int")
+    scheme = _str_field("scheme", "http").strip() or "http"
+    tls = bool(body.get("tls", False))
+    source = _str_field("source").strip() or "internal"
+
+    # 4. Build the candidate route dict in the same shape put_routes accepts.
+    candidate = {
+        "hostname": name,
+        "backend_kind": backend_kind,
+        "backend_host": backend_host,
+        "backend_port": backend_port,
+        "scheme": scheme,
+        "tls": tls,
+        "enabled": True,
+        "middlewares": [],
+    }
+
+    # 5. Load draft, dedupe, append, validate, write — all inside
+    #    draft_write_lock to serialise against other PUT/internal calls.
+    async with request.app["draft_write_lock"]:
+        existing_draft = _load_routes_draft()
+        existing_hostnames = {(r.get("hostname") or "").strip().lower()
+                              for r in existing_draft}
+        if name.lower() in existing_hostnames:
+            return web.json_response(
+                {"error": f"a route named {name!r} already exists in the draft",
+                 "code": "ROUTE_EXISTS"},
+                status=409,
+            )
+        # Combine into the full list and run the existing validator —
+        # gives us the same coverage as PUT /api/routes (kind, scheme,
+        # port range, hostname non-empty, middleware list of strings).
+        combined = list(existing_draft) + [candidate]
+        validated = _validate_routes(combined)
+        # System-route protection (HA self-route locked fields) compares
+        # to LIVE; cross-reference middlewares against DRAFT same as PUT.
+        existing_live = _load_routes_yml()
+        defined_mw = {m["name"] for m in _load_middlewares_draft()}
+        _cross_reference_middlewares(validated, defined_mw)
+        _enforce_system_route_protection(validated, existing_live)
+        # Assign rid to the new entry (it's the only one without one).
+        live_by_rid = {r.get("rid"): r for r in existing_live if r.get("rid")}
+        for r in validated:
+            if r.get("rid"):
+                continue
+            r["rid"] = str(uuid.uuid4())
+        validated = sorted(validated, key=lambda r: 0 if r.get("system") else 1)
+        _atomic_write_yml(ROUTES_DRAFT_YML, {"routes": validated})
+
+        # Locate the newly-added rid (by hostname match — name is unique
+        # by the dedupe check above).
+        new_route = next(
+            (r for r in validated if (r.get("hostname") or "").lower() == name.lower()),
+            None,
+        )
+        new_rid = new_route.get("rid") if new_route else None
+
+    sys.stderr.write(
+        f"INFO internal route scaffolded: name={name!r} source={source!r} "
+        f"rid={new_rid!r}\n"
+    )
+    return web.json_response({
+        "rid": new_rid,
+        "name": name,
+        "message": "Route scaffolded in draft. Open the Traefik addon UI and click Apply to publish.",
+    })
+
+
 async def get_middlewares(request):
     """alpha.20: returns draft by default; ?live=1 returns live."""
     live = request.query.get("live") == "1"
@@ -2083,13 +2220,22 @@ VERSION_UNGATED_PATHS = {
     "/api/session/claim",
     "/api/session/takeover",
 }
+# alpha.23: `/api/internal/*` is the cross-addon API surface — called by
+# sibling addons over the supervisor's bridge network, NOT by the user's
+# browser. Skip the version gate entirely (sibling addons don't know our
+# X-Addon-Version) and skip the session gate (callers are addons, not
+# users in tabs). Authentication is a non-empty Bearer token in the
+# Authorization header — the bridge network is internal-only so we
+# trust any container that can reach us.
+VERSION_UNGATED_PREFIXES = ("/api/internal/",)
 
 
 @web.middleware
 async def version_gate_mw(request, handler):
     if (request.method in GATED_VERSION_METHODS
             and request.path.startswith("/api/")
-            and request.path not in VERSION_UNGATED_PATHS):
+            and request.path not in VERSION_UNGATED_PATHS
+            and not any(request.path.startswith(p) for p in VERSION_UNGATED_PREFIXES)):
         client_version = request.headers.get("X-Addon-Version", "")
         if client_version and client_version != ADDON_VERSION:
             return web.json_response(
@@ -2156,6 +2302,9 @@ def make_app():
     app.router.add_get("/api/pending", get_pending)
     app.router.add_post("/api/apply", post_apply)
     app.router.add_post("/api/discard", post_discard)
+    # alpha.23: cross-addon internal API. Bypasses session + version
+    # gates; auth is a non-empty Bearer header (homelab bridge trust).
+    app.router.add_post("/api/internal/routes", post_internal_routes)
     # NOTE: /dashboard/api/* must register BEFORE /dashboard/* so it wins
     # the route match (aiohttp resolves in registration order). It catches
     # the dashboard SPA's monkey-patched API fetches and forwards to

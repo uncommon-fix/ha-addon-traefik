@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.1.0-alpha.23
+
+- **New: cross-addon scaffold API.** Sibling Home Assistant add-ons
+  can now POST to `http://traefik:8080/api/internal/routes` from
+  inside the supervisor bridge network to scaffold a route into the
+  Traefik draft. The route appears alongside any user-edited routes
+  in the Routes tab; the user reviews + clicks Apply to publish.
+  Bypasses the session and version gates (system call, not a user
+  tab); authenticates with a non-empty `Bearer` token (homelab trust
+  — the bridge network is internal-only).
+
+  Body shape:
+  ```json
+  {
+    "name": "davinci-resolve",
+    "backend_kind": "external",
+    "backend_host": "local_davinci-resolve",
+    "backend_port": 5432,
+    "scheme": "http",
+    "tls": false,
+    "source": "davinci-resolve"
+  }
+  ```
+
+  Returns `{rid, name, message}` on success. 401 on missing auth
+  header, 409 on duplicate hostname.
+
+  First consumer is the DaVinci Resolve Postgres addon (its dashboard
+  has a "Create scaffold in Traefik" button), but the API is generic.
+
 ## 0.1.0-alpha.22
 
 - **Fixed: new routes no longer churn the table or the auto-save while
