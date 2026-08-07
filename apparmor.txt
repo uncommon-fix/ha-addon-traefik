@@ -41,6 +41,14 @@ profile traefik flags=(attach_disconnected,mediate_deleted) {
   # journal, options.json) -- render.py:19-31, backend/server.py:38-56.
   /data/** rwk,
 
+  # /config -- the addon_config mount, and the only state that survives an
+  # uninstall. state-sync.sh mirrors /data here from the backend's s6 finish
+  # script and reads it back from cont-init, so both directions need write:
+  # `w` on the directory node itself for the temp-file rename the export uses.
+  /config/ rw,
+  /config/** rwk,
+  /usr/local/bin/state-sync.sh rix,
+
   # rendered Traefik config -- outside /data, container-private, rewritten on
   # every boot and every Apply (render.py:29-30,187-189,575-592).
   /etc/traefik/ rw,

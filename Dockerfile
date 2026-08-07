@@ -60,9 +60,11 @@ RUN mkdir -p /usr/share/traefik-web/static \
 # COPY --chmod doesn't compose with directory-tree COPY.
 COPY rootfs/ /
 RUN chmod +x /etc/services.d/backend/run \
+             /etc/services.d/backend/finish \
              /etc/services.d/traefik/run \
              /etc/cont-init.d/00-prep.sh \
-             /etc/cont-init.d/99-deploy-integration.sh
+             /etc/cont-init.d/99-deploy-integration.sh \
+             /usr/local/bin/state-sync.sh
 
 # render.py installed at the same path Phase B/C used; backend invokes it as a
 # subprocess.
@@ -82,7 +84,7 @@ COPY web/ /usr/share/traefik-web/
 # differs from what's already deployed. BUILD_VERSION is auto-injected by the
 # home-assistant/builder CI action (= config.yaml's version:); the default
 # below covers local builds — keep it in sync with config.yaml's version: field.
-ARG BUILD_VERSION=0.1.0-alpha.24
+ARG BUILD_VERSION=0.1.0-alpha.25
 # alpha.14: also export BUILD_VERSION as a runtime env var so the backend can
 # read it for the app.js cache-buster query string. The integration's
 # .bundled_version file already gives cont-init's deploy step a version to

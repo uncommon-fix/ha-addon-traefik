@@ -1,0 +1,14 @@
+#!/bin/sh
+# Runs when the backend longrun goes down -- including the graceful stop the
+# supervisor performs immediately before it removes the container and deletes
+# /data on uninstall. That is the one moment we get to preserve state, so this
+# is where the mirror to /config is written.
+#
+# The backend owns the state files, which is why the hook hangs off this
+# service rather than traefik's.
+#
+# It also runs on an ordinary restart or a crash, which is harmless: the export
+# is a dozen small files and is idempotent. Never let it fail the shutdown --
+# a non-zero exit here would make s6 report the service as failed.
+/usr/local/bin/state-sync.sh export || echo "[finish] state export failed, continuing"
+exit 0

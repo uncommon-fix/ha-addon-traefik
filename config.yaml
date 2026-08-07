@@ -1,5 +1,5 @@
 name: Traefik
-version: "0.1.0-alpha.24"
+version: "0.1.0-alpha.25"
 slug: traefik
 description: LAN reverse-proxy add-on for Home Assistant. Bundles Traefik with a custom UI for routes, middlewares, Cloudflare DNS-01 TLS, and the Traefik dashboard.
 arch:
@@ -30,6 +30,17 @@ hassio_role: default
 # and without write access find/cp fail with "Read-only file system".
 map:
   - homeassistant_config:rw
+  # /config, and the ONLY directory that survives an uninstall. The supervisor
+  # deletes /data unconditionally (App.unload -> remove_data(path_data)); the
+  # "delete configuration" checkbox in the uninstall dialog governs THIS
+  # directory instead, so mirroring state here is what makes that checkbox
+  # mean what users expect. App.backup() captures it too, unlike /share.
+  - addon_config:rw
+# Grace period for the container stop, in seconds (supervisor allows 10-300;
+# the default 10 is the whole budget for SIGTERM -> SIGKILL). The state mirror
+# runs from the backend's s6 finish script during exactly that window, so this
+# buys it room. Traefik's own shutdown is fast; this is headroom, not need.
+timeout: 30
 ingress: true
 ingress_port: 8080
 # Phase D wires the sidebar entry to our aiohttp backend's two-tab UI

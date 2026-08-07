@@ -6,6 +6,15 @@ set -euo pipefail
 
 bashio::log.info "traefik add-on cont-init: migrate + initial render + token export"
 
+# 0. Repopulate /data from the /config mirror when this is a fresh install that
+#    still has the previous install's config. The supervisor deletes /data on
+#    every uninstall unconditionally, so without this a reinstall starts blank
+#    even when the user chose to keep the configuration. No-ops when /data
+#    already holds state, so a normal restart is untouched.
+#    See rootfs/usr/local/bin/state-sync.sh for why /config is the only
+#    directory that survives, and docs/state-persistence.md for the contract.
+/usr/local/bin/state-sync.sh restore
+
 # 1. Migrate options.routes -> /data/routes.yml AND options.{provider,
 #    cloudflare_token, acme_email, domain} -> /data/config.yml if missing.
 #    migrate.py fails LOUD if options.json is unparseable so the user sees

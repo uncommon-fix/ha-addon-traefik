@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.1.0-alpha.25
+
+- **Uninstalling without ticking "delete configuration" now behaves like a
+  disable.** Reinstall and every route, middleware, TLS certificate and setting
+  is exactly as you left it, with nothing to re-enter.
+
+  Home Assistant always deletes an add-on's `/data` on uninstall — that is not a
+  default and there is no option for it, so the checkbox in the uninstall dialog
+  never protected any of this. It governs a different directory. The add-on now
+  mirrors its state into that directory on every clean stop, including the stop
+  that happens just before an uninstall, and restores it when it next starts on
+  an empty `/data`. Ticking the box still wipes everything, as it should.
+
+  Two consequences worth knowing. Your Cloudflare API token and the ACME account
+  key and certificates are part of that mirror, so they now also live in the
+  add-on's configuration folder, which is visible to add-ons like Samba and File
+  editor; both files are written owner-only. And the add-on now asks Home
+  Assistant for up to 30 seconds to shut down rather than 10, which is the window
+  the mirror is written in.
+
 ## 0.1.0-alpha.24
 
 - **The add-on is now confined by an enforcing AppArmor profile.** It previously
