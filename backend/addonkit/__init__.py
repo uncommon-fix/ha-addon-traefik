@@ -27,9 +27,18 @@ from __future__ import annotations
 
 from typing import Any
 
-from .errors import GateError, KitError, SettingsError
+from .errors import GateError, KitError, SettingsError, SetupError
 
-__all__ = ["AddonKit", "TraefikRoute", "KitError", "SettingsError", "GateError"]
+__all__ = [
+    "AddonKit",
+    "TraefikRoute",
+    "complete_setup",
+    "pending_is_meaningful",
+    "KitError",
+    "SettingsError",
+    "SetupError",
+    "GateError",
+]
 
 
 def __getattr__(name: str) -> Any:
@@ -37,4 +46,10 @@ def __getattr__(name: str) -> Any:
         from . import app
 
         return getattr(app, name)
+    # Lazy for a smaller reason than aiohttp: `setup` pulls in settings, views
+    # and ingress, and the export/restore CLI needs none of them.
+    if name in ("complete_setup", "pending_is_meaningful"):
+        from . import setup
+
+        return getattr(setup, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

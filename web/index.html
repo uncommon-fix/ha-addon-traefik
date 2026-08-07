@@ -1288,15 +1288,20 @@
         </div>
 
         <div class="flex items-center gap-3 pt-2">
+          <!-- "Save and finish" means it: outside the modal this button
+               publishes to Traefik as well as saving, so it owns the render
+               wait and must not look hung while it happens. -->
           <button type="submit"
-                  :disabled="savingConfig || !wizardFormValid"
+                  :disabled="savingConfig || completingSetup || !wizardFormValid"
                   :title="!wizardFormValid ? 'Fix the highlighted fields first' : ''"
                   class="px-4 py-2 rounded bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 disabled:bg-gray-500">
-            <span x-show="!savingConfig" x-text="setupIsModal ? 'Save' : 'Save and finish'"></span>
+            <span x-show="!savingConfig && !completingSetup" x-text="setupIsModal ? 'Save' : 'Save and finish'"></span>
             <span x-show="savingConfig">Saving...</span>
+            <span x-show="completingSetup">Publishing to Traefik...</span>
           </button>
           <button x-show="setupIsModal" type="button" @click="closeWizard()"
-                  class="px-3 py-2 rounded border text-sm font-medium hover:bg-gray-50">
+                  :disabled="completingSetup"
+                  class="px-3 py-2 rounded border text-sm font-medium hover:bg-gray-50 disabled:opacity-50">
             Cancel
           </button>
         </div>
@@ -1308,7 +1313,7 @@
              just testing, is never stuck on a required credential. -->
         <div x-show="config.provider !== 'local'" class="pt-1 border-t">
           <button type="button"
-                  :disabled="savingConfig || !!domainError"
+                  :disabled="savingConfig || completingSetup || !!domainError"
                   @click="useLocalProvider()"
                   class="text-sm text-blue-700 underline hover:text-blue-900 disabled:text-gray-400 disabled:no-underline">
             I don&rsquo;t have a token &mdash; use self-signed certificates instead
@@ -1328,7 +1333,12 @@
        they are. Hidden completely on read-only view, and not rendered at all
        during onboarding — the setup form auto-saves into the draft as you
        type, and a pending-changes bar over a first-run page would be asking
-       the user to Apply a form they haven't finished. -->
+       the user to Apply a form they haven't finished. "Pending" only means
+       something once live is a config someone chose; before that it is a diff
+       against a shipped default (addonkit's pending_is_meaningful says the
+       same thing server-side). `onboarded` flips to true only after
+       /api/setup/complete has published, so the first dashboard the user sees
+       has nothing pending. -->
   <template x-if="onboarded === true">
   <div x-show="pending.total > 0 && viewMode === 'rw'" x-transition
        class="fixed bottom-0 left-0 right-0 z-40 bg-amber-50 border-t border-amber-200 shadow-lg">
@@ -1352,9 +1362,20 @@
               <span x-show="pending.middlewares.modified.length" x-text="' ~' + pending.middlewares.modified.length"></span>
             </span>
           </template>
+          <!-- Name the fields, do not just count them. Routes and middlewares
+               have tabs that list the changed items; Config has no such list,
+               so a bare "~2" leaves the user unable to discover WHAT is
+               pending. (It used to be the first thing a new user saw: the
+               wizard wrote a draft nobody applied, and the two pending changes
+               WERE the setup they had just finished. Completion applies now,
+               so this footer is only ever about edits made afterwards — but
+               naming the fields is worth keeping regardless.) The warnings
+               block below already names what it counts; this matches it. -->
           <template x-if="pending.config.modified.length > 0">
             <span class="ml-2">Config:
               <span x-text="'~' + pending.config.modified.length"></span>
+              <span class="text-[10px] text-gray-600"
+                    x-text="'(' + pending.config.modified.join(', ') + ')'"></span>
             </span>
           </template>
         </span>

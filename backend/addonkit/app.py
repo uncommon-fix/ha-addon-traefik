@@ -53,14 +53,16 @@ from typing import Any, Awaitable, Callable, Iterable, Mapping, Sequence
 import aiohttp
 from aiohttp import web
 
-from .errors import KitError, SettingsError
+from .errors import KitError, SettingsError, SetupError
 from .gate import SESSION_HEADER, Gate, gate_middleware
 from .ingress import ingress_path, view_headers
 from .persist import Mirror
 from .settings import Store
+from .setup import complete_setup as _complete_setup
+from .setup import pending_is_meaningful
 from .siblings import bridge_gateway, detect, scaffold_traefik_route
 from .supervisor import Supervisor
-from .views import READY, Views
+from .views import NEEDS_SETUP, READY, Views
 
 _LOG = logging.getLogger(__name__)
 
@@ -106,9 +108,12 @@ def json_error_middleware(
       * an `HTTPException` keeps its own status -- that is how `HTTPLocked`
         arrives as a 423 in the standard shape, and why the gate middleware is
         registered INSIDE this one;
-      * `SettingsError` is 409 and every other `KitError` is 400. A handler
-        that knows better re-raises as the exact status it wants (a schema
-        rejection on PUT is a 400, not a conflict); this is the backstop;
+      * `SettingsError` and `SetupError` are 409 and every other `KitError` is
+        400. Both of those say "the add-on is not in a state where that verb
+        makes sense", which is what a conflict is; completing setup twice is
+        the clearest example. A handler that knows better re-raises as the
+        exact status it wants (a schema rejection on PUT is a 400, not a
+        conflict); this is the backstop;
       * anything else is logged in full HERE and answered with a fixed string.
         A traceback in the browser tells an attacker the paths on disk, and
         tells the user nothing they can act on.
@@ -125,7 +130,7 @@ def json_error_middleware(
                 raise
             body = exc.text or exc.reason or f"HTTP {exc.status}"
             return web.json_response({"error": body}, status=exc.status)
-        except SettingsError as exc:
+        except (SettingsError, SetupError) as exc:
             return web.json_response({"error": str(exc)}, status=409)
         except KitError as exc:
             return web.json_response({"error": str(exc)}, status=400)
@@ -214,6 +219,14 @@ class AddonKit:
                     otherwise stall every other tab's poll), so it must be a
                     plain function; an `async def` is refused at construction
                     rather than silently never awaited.
+        on_setup_complete  how THIS add-on ends onboarding, when it does not
+                    keep its state in a `Store`. Given one, `POST
+                    /api/setup/complete` calls it instead of applying the
+                    store; given neither it, nor a store, the endpoint does
+                    not exist. Unlike `on_apply` it may be `async def` --
+                    an add-on with its own settings model applies through its
+                    own aiohttp handlers, which are coroutines; a plain
+                    function is run off the loop just the same.
         redact      applied to every settings dict that leaves the process.
                     See `_clean`.
         gate        a `Gate`. Registers claim/takeover and gates the kit's own
@@ -241,6 +254,7 @@ class AddonKit:
         version: str = "dev",
         settings: Store | None = None,
         on_apply: Callable[[dict], None] | None = None,
+        on_setup_complete: Callable[[], Any] | None = None,
         redact: Callable[[dict], dict] | None = None,
         gate: Gate | None = None,
         gated: Iterable[tuple[str, str]] = (),
@@ -283,6 +297,9 @@ class AddonKit:
                     "event loop, so it cannot be an `async def`"
                 )
         self._on_apply = on_apply
+        if on_setup_complete is not None and not callable(on_setup_complete):
+            raise KitError("on_setup_complete must be callable or None")
+        self._on_setup_complete = on_setup_complete
         if redact is not None and not callable(redact):
             raise KitError("redact must be callable or None")
         self._redact = redact
@@ -333,6 +350,20 @@ class AddonKit:
 
     # -- building -----------------------------------------------------------
 
+    @property
+    def can_complete_setup(self) -> bool:
+        """Whether this add-on HAS an onboarding that can be finished.
+
+        Both halves are required and neither is guessable. No `NEEDS_SETUP`
+        view means the add-on never onboards (davinci), so there is nothing to
+        complete; no store and no hook means there is no way to complete it.
+        Optionality is the design: when this is False the endpoint is absent
+        rather than present and 409ing forever.
+        """
+        return self.views.has_state(NEEDS_SETUP) and (
+            self._on_setup_complete is not None or self.settings is not None
+        )
+
     def build(self) -> web.Application:
         """A wired `aiohttp` Application. Add your own routes to `.router`."""
         routes: list[tuple[str, str, Callable]] = [
@@ -356,6 +387,10 @@ class AddonKit:
                 ("POST", "/api/discard"),
                 ("POST", "/api/rollback"),
             }
+
+        if self.can_complete_setup:
+            routes.append(("POST", "/api/setup/complete", self.handle_complete_setup))
+            gated.add(("POST", "/api/setup/complete"))
 
         if self.gate is not None:
             # Both ungated on purpose: a freshly opened tab holds no SID and
@@ -448,7 +483,55 @@ class AddonKit:
         return resp
 
     async def handle_state(self, request: web.Request) -> web.Response:
-        return web.json_response({"state": await self.state(), "version": self.version})
+        state = await self.state()
+        return web.json_response({
+            "state": state,
+            "version": self.version,
+            # So a UI can stop counting pending changes during onboarding
+            # without having to know that "needs_setup" is the state that
+            # means it. See setup.pending_is_meaningful.
+            "pending_meaningful": pending_is_meaningful(state),
+        })
+
+    # -- onboarding ----------------------------------------------------------
+
+    async def complete_setup(self) -> dict:
+        """Finish onboarding: the completion IS the apply.
+
+        Under the same lock as the settings verbs, because it IS one of them
+        on the store path and because a draft write racing a completion is the
+        way you get half an onboarding applied.
+        """
+        if not self.can_complete_setup:
+            raise SetupError(
+                "this add-on has no onboarding to complete: it needs a "
+                f"{NEEDS_SETUP!r} view plus either a Store or an "
+                "on_setup_complete hook"
+            )
+        async with self._lock:
+            # Both are handed over even though only one ACTS: a hook wins, but
+            # if this add-on also has a store then "nothing is pending" is part
+            # of the invariant and a hook that ignores the store must fail
+            # loudly rather than leave /api/settings/pending contradicting the
+            # dashboard it just handed the user.
+            return await _complete_setup(
+                probe=self._probe,
+                store=self.settings,
+                on_apply=self._on_apply,
+                on_setup_complete=self._on_setup_complete,
+            )
+
+    async def handle_complete_setup(self, request: web.Request) -> web.Response:
+        result = await self.complete_setup()
+        if self.settings is not None:
+            store = self._store()
+            result = {
+                **result,
+                "live": self._clean(store.live()),
+                "pending": self._clean_pending(store.pending()),
+                "can_rollback": store.can_rollback(),
+            }
+        return web.json_response(result)
 
     # -- settings -----------------------------------------------------------
 
@@ -513,6 +596,12 @@ class AddonKit:
         return web.json_response({
             "pending": self._clean_pending(pending),
             "has_pending": bool(pending),
+            # `has_pending` keeps telling the truth about the DIFF; this says
+            # whether that diff means anything yet. During onboarding live is a
+            # placeholder nobody chose, so the count is noise and the UI should
+            # hide it -- one probe here is cheaper than every add-on
+            # re-deriving the rule.
+            "pending_meaningful": pending_is_meaningful(await self.state()),
             "can_rollback": store.can_rollback(),
         })
 

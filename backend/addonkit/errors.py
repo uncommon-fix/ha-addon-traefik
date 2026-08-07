@@ -30,5 +30,16 @@ class SettingsError(KitError):
     """
 
 
+class SetupError(KitError):
+    """Onboarding could not be completed.
+
+    Raised for every refusal and every failure of `setup.complete_setup` —
+    the add-on was not in `NEEDS_SETUP`, there was nothing to complete with,
+    the completion action raised, or it returned while the add-on still
+    reports itself unconfigured. The cause is always chained when there was
+    one. A `SetupError` always means "still onboarding, draft intact".
+    """
+
+
 class GateError(KitError):
     """A single-editor gate operation was refused."""

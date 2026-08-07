@@ -222,10 +222,14 @@ function traefikAppData() {
         //           empty tables and disabled tabs.
         //   true  — the dashboard. Setup is still reachable, as a modal, from
         //           "Re-run setup wizard" on the Configuration tab.
-        // Set ONLY from the draft-derived state (loadConfig / saveConfig).
-        // pollStatus must not touch it: /api/state reports LIVE config, and
-        // the wizard writes a draft that only Apply commits, so a poll would
-        // otherwise bounce a just-onboarded user straight back to onboarding.
+        // Derived from the LIVE config (GET /api/config?live=1 -> state), and
+        // set in exactly one place: loadConfig. Live, not draft, because a
+        // draft the user has not published is a wizard they have not finished
+        // — deriving this from the draft handed the dashboard to anyone who
+        // had merely TYPED a domain, which is how a reload mid-wizard used to
+        // land on a dashboard whose Apply footer held the user's own setup.
+        // Completion applies (POST /api/setup/complete), so by the time live
+        // says configured there is genuinely nothing left pending.
         onboarded: null,
 
         // alpha.12: session takeover. The backend allows ONE active editor at
@@ -253,6 +257,10 @@ function traefikAppData() {
         state: blankState(),
         wizardOpen: false,
         savingConfig: false,
+        // True for the length of POST /api/setup/complete — the wizard's
+        // last step publishes, which takes a render (~1s), and the button
+        // has to say so rather than looking hung.
+        completingSetup: false,
         restartRequired: false,
         restarting: false,
 
@@ -1018,21 +1026,67 @@ function traefikAppData() {
             const ok = await this.saveConfig();
             if (!ok) return;
             this.wizardOpen = false;
-            // The second half of the condition matters: the backend decides
-            // what "configured" means, and if it still says no (a field we
-            // didn't gate on) the onboarding page stays put rather than
-            // handing over to a dashboard the server doesn't think is ready.
-            if (!wasOnboarding || this.onboarded !== true) return;
-            // Onboarding just finished: saveConfig set `onboarded` from the
-            // response, so the dashboard has replaced this page. Land on
-            // Routes and make the Apply footer honest about what is now
-            // sitting in the draft — saveConfig writes the draft, and only
-            // Apply pushes it to Traefik.
+            if (!wasOnboarding) return;
+            // The backend decides what "configured" means, and `state` is
+            // draft-derived: if it still says no (a field we didn't gate on)
+            // the onboarding page stays put rather than publishing a
+            // half-answered wizard.
+            if (!this.state.configured) return;
+            // COMPLETION IS THE APPLY. saveConfig only wrote the draft; until
+            // it is published the add-on is unconfigured in fact, which is
+            // what used to drop the user on a dashboard showing their own
+            // setup as "2 pending changes". `onboarded` is live-derived and
+            // completeSetup's loadConfig is what flips it, so a failed
+            // publish simply leaves them here with their answers intact.
+            if (!await this.completeSetup()) return;
             this.tab = 'routes';
-            await this.loadPending().catch(() => {});
-            this.toast.info(
-                'Setup saved. Click Apply to publish it to Traefik.'
-            );
+        },
+
+        // POST /api/setup/complete — the backend refuses unless it is really
+        // in onboarding, applies all three drafts through the same Apply the
+        // footer button uses, and re-checks that the state moved. Returns true
+        // only when it did; `onboarded` is not set here, it follows from the
+        // loadConfig below now that live has changed.
+        async completeSetup() {
+            this.completingSetup = true;
+            try {
+                const j = await this.api('POST', '/api/setup/complete', {});
+                // The response carries the new live state so the banners are
+                // right even if a reload below fails; loadConfig replaces it
+                // with the draft-derived one a moment later, and after an
+                // apply the two are the same thing.
+                if (j && j.state) this.state = j.state;
+                // Live has advanced. Refetch every surface so the diff caches
+                // and the pending footer describe the new live — after this
+                // the count is 0, which is the point of the whole exercise.
+                this._suspendAutoSave = true;
+                await this.loadRoutes();
+                await this.loadMiddlewares();
+                await this.loadConfig();
+                await this.loadPending();
+                await new Promise(r => setTimeout(r, 0));
+                this._suspendAutoSave = false;
+                const n = (j && j.applied) || 0;
+                this.toast.success(
+                    `Setup complete — published ${n} change${n === 1 ? '' : 's'} to Traefik.`
+                );
+                return true;
+            } catch (e) {
+                if (e.code === 'VERSION_MISMATCH') {
+                    this.toast.error(
+                        'Addon was updated — reload to finish setup.',
+                        { sticky: true },
+                    );
+                } else if (e.code !== 'SESSION_LOST') {
+                    this.toast.error(
+                        `Couldn't finish setup: ${e.message}. Your answers are ` +
+                        'saved — fix the problem and press Save and finish again.',
+                    );
+                }
+                return false;
+            } finally {
+                this.completingSetup = false;
+            }
         },
 
         async loadConfig() {
@@ -1056,9 +1110,11 @@ function traefikAppData() {
                     const j = await draftRes.json().catch(() => ({}));
                     throw new Error(j.error || `GET /api/config -> ${draftRes.status}`);
                 }
+                let liveState = null;
                 if (liveRes.ok) {
                     const liveJ = await liveRes.json();
                     this.configLive = { ...liveJ };
+                    liveState = liveJ.state || null;
                 }
                 const r = draftRes;
                 const j = await r.json();
@@ -1081,10 +1137,15 @@ function traefikAppData() {
                     log_level: j.log_level || 'INFO',
                     force_ssl: !!j.force_ssl,
                 };
+                // `state` stays DRAFT-derived: it drives the wizard's
+                // "already set" placeholders and its missing-field list,
+                // which are about what the user is editing.
                 this.state = j.state || blankState();
-                // Draft-derived, and the only place besides saveConfig that
-                // may set it. See the `onboarded` declaration.
-                this.onboarded = !!this.state.configured;
+                // `onboarded` is LIVE-derived, and this is the only place it
+                // is set. A failed live read leaves it alone rather than
+                // guessing — bouncing a configured install into the wizard on
+                // one dropped request would be worse than a stale view.
+                if (liveState) this.onboarded = !!liveState.configured;
             } catch (e) {
                 this.loadFailed.config = e.message || String(e);
                 // `onboarded` is deliberately left alone. On a first load it
@@ -1624,9 +1685,10 @@ function traefikAppData() {
             try {
                 const j = await this.api('PUT', '/api/config', payload);
                 this.state = j.state || blankState();
-                // Draft-derived, like loadConfig: this is what unloads the
-                // onboarding page and mounts the dashboard.
-                this.onboarded = !!this.state.configured;
+                // Deliberately does NOT touch `onboarded`. This wrote the
+                // DRAFT; what unloads the onboarding page is live changing,
+                // which only /api/setup/complete (or Apply) does. See the
+                // `onboarded` declaration.
                 this.restartRequired = !!j.restart_required;
                 // Wipe the secret inputs back to empty: they've been saved
                 // (or preserved); the placeholders switch to ••••• now.

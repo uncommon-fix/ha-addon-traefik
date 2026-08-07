@@ -36,10 +36,13 @@ from aiohttp import web
 # Resolvable as a plain name for the same reason `providers` below is: this file
 # is executed as a script (python3 /usr/local/bin/backend/server.py), which puts
 # its own directory on sys.path. Never edit backend/addonkit/ -- it is a copy.
+from addonkit.errors import SetupError
 from addonkit.gate import Gate, gate_middleware
 from addonkit.ingress import ingress_path as kit_ingress_path
 from addonkit.ingress import render as kit_render
 from addonkit.ingress import view_headers as kit_view_headers
+from addonkit.setup import complete_setup as kit_complete_setup
+from addonkit.views import NEEDS_SETUP, READY
 
 OPTIONS = Path("/data/options.json")
 ROUTES_YML = Path("/data/routes.yml")
@@ -1977,6 +1980,8 @@ GATED_MUTATIONS: set[tuple[str, str]] = {
     # alpha.20: draft/live + Apply.
     ("POST", "/api/apply"),
     ("POST", "/api/discard"),
+    # Onboarding completion applies, so it is as mutating as Apply itself.
+    ("POST", "/api/setup/complete"),
 }
 
 # Kept verbatim from the SessionManager era instead of taking the kit's default
@@ -2263,6 +2268,79 @@ async def post_apply(request):
     )
 
 
+async def _live_setup_state() -> str:
+    """The kit's lifecycle state, derived from LIVE — never from the draft.
+
+    This distinction IS the bug the completion step exists for. The wizard
+    writes the draft; until an Apply promotes it, `config.yml` still holds the
+    shipped defaults, so an add-on whose draft is configured is not a
+    configured add-on. A draft-derived probe here would report READY the
+    instant the user typed a domain, `complete_setup` would refuse as
+    "already onboarded", and the user would land on the dashboard with their
+    own setup sitting in the pending footer — exactly where we started.
+    """
+    return READY if _config_state(_load_config_yml())["configured"] else NEEDS_SETUP
+
+
+async def post_setup_complete(request):
+    """Finish onboarding. Completing the wizard IS the Apply.
+
+    The kit owns the lifecycle rule (refuse unless we are in NEEDS_SETUP,
+    verify afterwards that the state actually moved, leave the draft intact on
+    failure); this add-on owns the domain, so it supplies the action. That
+    action is `post_apply` CALLED, not reimplemented: all three surfaces, the
+    journal, the atomic renames, the render and the baseline bump. A reduced
+    "just commit config.yml" version would be a second apply path to keep in
+    lockstep with the real one — and the journal, the one part that makes a
+    crash mid-Apply recoverable, is precisely what a shortcut would drop.
+
+    Consequence worth knowing: Apply is all-or-nothing across the three
+    surfaces, so a routes or middlewares draft that diverged from live before
+    setup finished is published by this too. On a first install they are
+    identical and it is a no-op; when it is not, `applied` in the response is
+    larger than the config fields alone and the UI says how many.
+    """
+    outcome: dict = {}
+
+    async def _apply_the_wizard() -> None:
+        resp = await post_apply(request)
+        try:
+            body = json.loads(resp.text or "{}")
+        except (TypeError, ValueError):
+            body = {}
+        if resp.status != 200 or not body.get("ok"):
+            # Raise rather than return the failure: the kit's contract is that
+            # a completion that did not complete must not look like success,
+            # and post_apply has already restored live from its snapshots.
+            raise RuntimeError(
+                body.get("error") or f"apply failed with HTTP {resp.status}"
+            )
+        outcome.update(body)
+
+    try:
+        result = await kit_complete_setup(
+            probe=_live_setup_state,
+            on_setup_complete=_apply_the_wizard,
+        )
+    except SetupError as e:
+        # 409, never 500: "the add-on is not in a state where finishing setup
+        # makes sense" is a conflict, and every one of these messages is
+        # something the user can act on. Covers already-onboarded (a second
+        # click, or the wizard re-run from the Configuration tab) and a failed
+        # publish, after which we are still — correctly — in onboarding.
+        raise web.HTTPConflict(text=str(e))
+
+    return web.json_response({
+        "ok": True,
+        "applied": outcome.get("applied", 0),
+        # The same shape GET /api/config returns under "state", so the
+        # frontend can adopt it without a second round-trip. Read from LIVE,
+        # which the apply has just made equal to the draft.
+        "state": _config_state(_load_config_yml()),
+        "setup_state": result["state"],
+    })
+
+
 async def post_discard(request):
     """alpha.20: reset draft to live. Body: {scope: 'all'|'routes'|
     'middlewares'|'config'|'field', path?: 'routes.<rid>.scheme' (only when
@@ -2408,6 +2486,10 @@ def make_app():
     app.router.add_get("/api/pending", get_pending)
     app.router.add_post("/api/apply", post_apply)
     app.router.add_post("/api/discard", post_discard)
+    # Onboarding completion (addonkit.setup). Separate from /api/apply
+    # because it refuses outside NEEDS_SETUP and verifies the state moved --
+    # Apply is the mechanism, this is the lifecycle step that uses it.
+    app.router.add_post("/api/setup/complete", post_setup_complete)
     # alpha.23: cross-addon internal API. Bypasses session + version
     # gates; auth is a non-empty Bearer header (homelab bridge trust).
     app.router.add_post("/api/internal/routes", post_internal_routes)
