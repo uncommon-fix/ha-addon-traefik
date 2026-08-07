@@ -1135,10 +1135,24 @@
                   x-ref="wizardFirstInput"
                   class="block w-full border rounded px-3 py-2 bg-white">
             <option value="cloudflare">Cloudflare (DNS-01)</option>
+            <option value="local">Local &mdash; self-signed, no account needed</option>
           </select>
         </div>
 
-        <div>
+        <div x-show="config.provider === 'local'"
+             class="rounded border border-amber-300 bg-amber-50 p-3 text-sm">
+          <p class="font-medium text-amber-900">No certificate authority will be used.</p>
+          <p class="text-amber-800 mt-1">
+            Traefik serves its own self-signed certificate, so <strong>every
+            browser shows a security warning</strong> on every route and each
+            person has to click through it. Nothing is published or verified,
+            and this is not suitable for anything reachable from the internet.
+            Good for a LAN-only setup or for testing; switch to Cloudflare here
+            at any time to get real certificates.
+          </p>
+        </div>
+
+        <div x-show="config.provider !== 'local'">
           <label class="block text-sm font-medium mb-1" for="wiz-token">2. Cloudflare API token</label>
           <input id="wiz-token" type="password" x-model="config.cloudflare_token"
                  :placeholder="state.cloudflare_token_present ? '••••• (token set; leave blank to keep)' : 'Paste your Cloudflare API token'"
@@ -1153,7 +1167,7 @@
           </p>
         </div>
 
-        <div>
+        <div x-show="config.provider !== 'local'">
           <label class="block text-sm font-medium mb-1" for="wiz-email">3. ACME contact email</label>
           <input id="wiz-email" type="email" x-model="config.acme_email"
                  placeholder="you@example.com"
@@ -1193,6 +1207,24 @@
                   class="px-3 py-2 rounded border text-sm font-medium hover:bg-gray-50">
             Cancel
           </button>
+        </div>
+
+        <!-- Bypass. Shown only while Cloudflare is selected, because once the
+             provider IS local the normal Save button already does this and a
+             second control would just be two buttons doing one thing. Skips the
+             token and email entirely so a user with no DNS account, or anyone
+             just testing, is never stuck on a required credential. -->
+        <div x-show="config.provider !== 'local'" class="pt-1 border-t">
+          <button type="button"
+                  :disabled="savingConfig || !!domainError"
+                  @click="useLocalProvider()"
+                  class="text-sm text-blue-700 underline hover:text-blue-900 disabled:text-gray-400 disabled:no-underline">
+            I don&rsquo;t have a token &mdash; use self-signed certificates instead
+          </button>
+          <p class="text-xs text-gray-500 mt-1">
+            Sets the provider to local and finishes setup. Browsers will warn on
+            every route; you can switch to Cloudflare here whenever you like.
+          </p>
         </div>
       </form>
     </div>

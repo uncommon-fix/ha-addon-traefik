@@ -385,10 +385,27 @@ function traefikAppData() {
             // Wizard doesn't expose entry points or log level; just the four
             // initial-config fields. Token may be blank only if one is already
             // stored (preserve-existing) — backend tolerates blank on PUT.
+            //
+            // The local provider issues no certificates, so it needs neither a
+            // token nor an ACME email; requiring them would defeat the whole
+            // point of offering a path for users who have no DNS account.
+            if (this.config.provider === 'local') {
+                return !this.domainError;
+            }
             const tokenOk = !this.cloudflareTokenError &&
                             (this.config.cloudflare_token.trim() ||
                              this.state.cloudflare_token_present);
             return tokenOk && !this.acmeEmailError && !this.domainError;
+        },
+
+        // Bypass button on the wizard: switch to self-signed and save in one
+        // click, so a user without a Cloudflare token is never stuck on a
+        // required field. Deliberately does NOT clear cloudflare_token — if
+        // they switch back to Cloudflare later the stored token is still there,
+        // and _acme_active() ignores it while the provider is local.
+        useLocalProvider() {
+            this.config.provider = 'local';
+            return this.saveWizard();
         },
         // Auto-lowercase entry-point names on blur so the typed value matches
         // what the server normalises to (avoids "I typed Web, why does it now

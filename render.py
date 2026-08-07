@@ -136,11 +136,19 @@ def _load_core_config(opts: dict[str, Any]) -> dict[str, Any]:
     return merged
 
 
+PROVIDER_LOCAL = "local"
+
+
 def _acme_active(opts: dict[str, Any]) -> bool:
     # NEVER store or log the token value. Truthiness + strip handles "", None,
     # missing-key, AND whitespace-only. The actual token reaches Traefik via
     # CF_DNS_API_TOKEN env var set in cont-init.
     config = _load_core_config(opts)
+    # The local provider issues nothing, deliberately. Checked before the
+    # credentials so that a token left over from a previous cloudflare setup
+    # cannot silently re-enable ACME after the user chose self-signed.
+    if (config.get("provider") or "").strip().lower() == PROVIDER_LOCAL:
+        return False
     email = (config.get("acme_email") or "").strip()
     token = (config.get("cloudflare_token") or "").strip()
     return bool(email) and bool(token)
@@ -170,7 +178,16 @@ def main() -> int:
         )
         return 1
 
-    if resolver_name and not _acme_active(opts):
+    if (config.get("provider") or "").strip().lower() == PROVIDER_LOCAL:
+        # Not a warning: this is the configured mode. Say so once, at INFO,
+        # so the log explains the browser warning the user is about to see.
+        print(
+            "INFO: provider is 'local' - no certificate authority is used. "
+            "TLS routes are served with Traefik's built-in self-signed "
+            "certificate and browsers will show a warning.",
+            file=sys.stderr,
+        )
+    elif resolver_name and not _acme_active(opts):
         missing = [
             k for k in ("acme_email", "cloudflare_token")
             if not (config.get(k) or "").strip()

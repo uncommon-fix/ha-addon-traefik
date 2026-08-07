@@ -101,7 +101,14 @@ SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
 # their own credential fields here. cloudflare_token is the per-provider
 # credential for the cloudflare provider; other providers will have other
 # field names. acme_email + domain are provider-agnostic.
-ALLOWED_PROVIDERS = {"cloudflare"}
+# "local" issues nothing: Traefik serves its own built-in self-signed cert
+# and every browser warns. It exists so a user can run the add-on with no
+# DNS account at all -- for a LAN-only setup, or for testing -- rather than
+# being blocked at the wizard on a credential they may not have. It needs no
+# token and no ACME email; the wizard hides both and validation stops
+# requiring them (see wizardFormValid in app.js).
+PROVIDER_LOCAL = "local"
+ALLOWED_PROVIDERS = {"cloudflare", PROVIDER_LOCAL}
 ALLOWED_LOG_LEVELS = {"DEBUG", "INFO", "WARN", "ERROR", "FATAL"}
 # Traefik entryPoint names: lowercase letters/digits, '-', '_'. Reserved 'traefik'
 # is excluded because we use it internally for the dashboard entryPoint.

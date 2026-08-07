@@ -2,6 +2,18 @@
 
 ## 0.1.0-alpha.25
 
+- **You can now run without a Cloudflare token at all.** A new `local`
+  certificate provider skips the certificate authority entirely and lets Traefik
+  serve its own self-signed certificate, and the setup wizard has an
+  *I don't have a token* button that switches to it and finishes in one click.
+  Useful for a LAN-only setup, and for testing.
+
+  The trade is stated in the wizard rather than buried: **every browser warns on
+  every route**, nothing is verified, and it is not suitable for anything
+  reachable from the internet. Switching to Cloudflare later is one dropdown.
+  A token left over from a previous Cloudflare setup is kept but ignored while
+  the provider is local, so it cannot silently re-enable ACME.
+
 - **Uninstalling without ticking "delete configuration" now behaves like a
   disable.** Reinstall and every route, middleware, TLS certificate and setting
   is exactly as you left it, with nothing to re-enter.
