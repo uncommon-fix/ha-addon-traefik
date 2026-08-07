@@ -8,7 +8,7 @@
 # (backend/server.py, plus its own render.py/migrate.py subprocess calls) --
 # see apparmor.txt notes below for why Python isn't split into its own child.
 # The only real scoping is the traefik binary's child profile.
-profile traefik flags=(attach_disconnected,mediate_deleted,complain) {
+profile traefik flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/base>
   file,
   signal,
@@ -75,10 +75,26 @@ profile traefik flags=(attach_disconnected,mediate_deleted,complain) {
   # dashboard/API entryPoint on 127.0.0.1:8090 (render.py:234-250), reads its
   # own rendered config, and owns /data/acme.json directly (not through the
   # backend) for its ACME DNS-01 cert storage (render.py:261).
-  profile /usr/local/bin/traefik flags=(attach_disconnected,mediate_deleted,complain) {
+  profile /usr/local/bin/traefik flags=(attach_disconnected,mediate_deleted) {
     #include <abstractions/base>
+    # /etc/hosts, /etc/nsswitch.conf, /etc/resolv.conf -- Go's resolver reads all
+    # three before any outbound connection, so ACME and every backend health
+    # check depend on this. (v2 evidence: .../traefik|open|r|/etc/resolv.conf)
+    #include <abstractions/nameservice>
     signal receive,
     capability net_bind_service,
+
+    # Go runtime container detection: it sizes GOMAXPROCS and its allocator from
+    # the cgroup CPU limit and the huge-page setting at startup. Reads only.
+    # (v2 evidence: |open|r| on /proc/<pid>/cgroup, /proc/<pid>/mountinfo,
+    #  /sys/fs/cgroup/cpu.max, /sys/kernel/mm/hugepages/)
+    @{PROC}/@{pid}/cgroup r,
+    @{PROC}/@{pid}/mountinfo r,
+    /sys/fs/cgroup/** r,
+    /sys/kernel/mm/hugepages/ r,
+    # Listener backlog, read when binding :80/:443.
+    # (v2 evidence: |open|r|/proc/sys/net/core/somaxconn)
+    @{PROC}/sys/net/core/somaxconn r,
 
     # Cloudflare DNS-01 (outbound HTTPS to Cloudflare + Let's Encrypt) and the
     # DNS propagation check lego does directly against 1.1.1.1/1.0.0.1:53
