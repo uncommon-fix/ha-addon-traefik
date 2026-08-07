@@ -165,6 +165,10 @@ function blankConfig() {
     return {
         provider: 'cloudflare',
         cloudflare_token: '',
+        // {ENV_VAR_NAME: value} for the selected provider. Write-only:
+        // GET /api/config never returns values, only which names are set,
+        // so a blank box here means "keep what is stored".
+        provider_credentials: {},
         acme_email: '',
         domain: '',
         // Phase F: ha_hostname removed -- the HA system route owns the
@@ -181,6 +185,9 @@ function blankState() {
         configured: false,
         missing: [],
         cloudflare_token_present: false,
+        // {ENV_VAR_NAME: bool}. Drives the "already set" placeholder for
+        // every provider, the way cloudflare_token_present did for one.
+        credentials_present: {},
         // alpha.6: configuration.yaml lacks the trusted_proxies/use_x_forwarded_for
         // config (HTTPS-through-Traefik 400s without it).
         trusted_proxies_pending: false,
@@ -381,21 +388,51 @@ function traefikAppData() {
             return !this.entrypointHttpError && !this.entrypointHttpsError &&
                    !this.entrypointConflictError && !this.cloudflareTokenError;
         },
+        // The provider catalogue, from GET /api/providers. Same table the
+        // renderer and cont-init use, so the form can never offer a field the
+        // exporter would ignore, nor miss one it needs.
+        providers: [],
+
+        get currentProvider() {
+            return this.providers.find(p => p.code === this.config.provider) || null;
+        },
+
+        // Fields for the selected provider, each carrying whether a value is
+        // already stored so the box can say so instead of looking empty.
+        get providerFields() {
+            const p = this.currentProvider;
+            if (!p) return [];
+            return p.fields.map(f => ({
+                ...f,
+                present: !!this.state.credentials_present[f.env],
+            }));
+        },
+
+        async loadProviders() {
+            try {
+                const r = await fetch(this.url('/api/providers'));
+                if (!r.ok) return;
+                this.providers = (await r.json()).providers || [];
+            } catch (e) {
+                // Non-fatal: the select falls back to whatever is already
+                // selected. Never block setup on a catalogue fetch.
+            }
+        },
+
         get wizardFormValid() {
-            // Wizard doesn't expose entry points or log level; just the four
-            // initial-config fields. Token may be blank only if one is already
-            // stored (preserve-existing) — backend tolerates blank on PUT.
+            // Wizard doesn't expose entry points or log level; just the
+            // initial-config fields. A credential may be blank only if one is
+            // already stored (preserve-existing) — backend tolerates that.
             //
-            // The local provider issues no certificates, so it needs neither a
-            // token nor an ACME email; requiring them would defeat the whole
+            // The local provider issues no certificates, so it needs neither
+            // credentials nor an ACME email; requiring them would defeat the
             // point of offering a path for users who have no DNS account.
             if (this.config.provider === 'local') {
                 return !this.domainError;
             }
-            const tokenOk = !this.cloudflareTokenError &&
-                            (this.config.cloudflare_token.trim() ||
-                             this.state.cloudflare_token_present);
-            return tokenOk && !this.acmeEmailError && !this.domainError;
+            const credsOk = this.providerFields.every(f =>
+                (this.config.provider_credentials[f.env] || '').trim() || f.present);
+            return credsOk && !this.acmeEmailError && !this.domainError;
         },
 
         // Bypass button on the wizard: switch to self-signed and save in one
@@ -926,6 +963,7 @@ function traefikAppData() {
         },
 
         async loadConfig() {
+            if (!this.providers.length) await this.loadProviders();
             // alpha.12: failures land in loadFailed.config (NOT a shared
             // save-error slot), so a stale load can't be "fixed" by clicking
             // Save and overwriting the real config.

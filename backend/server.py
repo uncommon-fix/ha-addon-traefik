@@ -101,14 +101,22 @@ SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
 # their own credential fields here. cloudflare_token is the per-provider
 # credential for the cloudflare provider; other providers will have other
 # field names. acme_email + domain are provider-agnostic.
-# "local" issues nothing: Traefik serves its own built-in self-signed cert
-# and every browser warns. It exists so a user can run the add-on with no
-# DNS account at all -- for a LAN-only setup, or for testing -- rather than
-# being blocked at the wizard on a credential they may not have. It needs no
-# token and no ACME email; the wizard hides both and validation stops
-# requiring them (see wizardFormValid in app.js).
-PROVIDER_LOCAL = "local"
-ALLOWED_PROVIDERS = {"cloudflare", PROVIDER_LOCAL}
+# Providers and the credentials each needs live in backend/providers.py --
+# one table, shared with render.py and cont-init. "local" is in the enum but
+# is not an ACME provider: Traefik serves its own self-signed certificate and
+# every browser warns. It exists so someone with no DNS account is not
+# blocked at the wizard on a credential they may never have.
+# Absolute, not relative: this file is executed as a script
+# (python3 /usr/local/bin/backend/server.py), so it has no parent package and
+# `from .providers import` would raise at startup. Running a script puts its
+# own directory on sys.path, which is what makes the plain name resolve.
+from providers import (  # noqa: E402
+    ALL_CREDENTIAL_ENV,
+    ALLOWED_PROVIDERS,
+    PROVIDER_LOCAL,
+    required_env,
+    ui_catalog,
+)
 ALLOWED_LOG_LEVELS = {"DEBUG", "INFO", "WARN", "ERROR", "FATAL"}
 # Traefik entryPoint names: lowercase letters/digits, '-', '_'. Reserved 'traefik'
 # is excluded because we use it internally for the dashboard entryPoint.
@@ -125,6 +133,9 @@ CONFIG_REQUIRED = {"provider", "cloudflare_token", "acme_email",
                    "entrypoint_https", "log_level"}
 CONFIG_TYPES = {
     "provider": str,
+    # {ENV_VAR_NAME: value} for the selected provider. Values are write-only
+    # over the API: GET never returns them, only which names are set.
+    "provider_credentials": dict,
     "cloudflare_token": str,
     "acme_email": str,
     "domain": str,
@@ -766,6 +777,7 @@ def _load_config_from(path: Path) -> dict:
     if opts.get("acme_resolver"):
         merged["provider"] = opts["acme_resolver"]
     for field in ("cloudflare_token", "acme_email", "domain", "ha_hostname",
+                  "provider_credentials",
                   "entrypoint_http", "entrypoint_https", "log_level"):
         if opts.get(field):
             merged[field] = opts[field]
@@ -838,6 +850,35 @@ def _validate_config(body):
         )
     body["cloudflare_token"] = token
     body["provider"] = body["provider"].strip().lower()
+
+    # provider_credentials: only names this provider actually uses, and the
+    # same character rules the cloudflare token has always had. A credential
+    # with an embedded newline validates fine, exports fine, and then fails
+    # at certificate-issue time, which is the worst place to find out.
+    creds = body.get("provider_credentials") or {}
+    allowed = set(required_env(body["provider"]))
+    unknown_creds = set(creds) - allowed
+    if unknown_creds:
+        raise web.HTTPBadRequest(
+            text=f"provider_credentials: {sorted(unknown_creds)} are not used "
+                 f"by provider {body['provider']!r}"
+        )
+    cleaned = {}
+    for name, value in creds.items():
+        if not isinstance(value, str):
+            raise web.HTTPBadRequest(
+                text=f"provider_credentials.{name}: must be a string"
+            )
+        value = value.strip()
+        if not value:
+            continue          # blank means "keep what is stored"
+        if not re.fullmatch(r"[\x21-\x7e]{1,512}", value):
+            raise web.HTTPBadRequest(
+                text=f"provider_credentials.{name}: must be 1-512 printable "
+                     "characters with no whitespace or newlines."
+            )
+        cleaned[name] = value
+    body["provider_credentials"] = cleaned
     # ha_hostname is vestigial (the HA system route owns the subdomain) and the
     # setup wizard omits it; validate only when a client still sends it.
     if "ha_hostname" in body:
@@ -1102,9 +1143,10 @@ def _config_state(config: dict) -> dict:
     state = {
         "configured": not missing,
         "missing": missing,
-        # Boolean so the UI knows whether to show "token set" placeholder
-        # vs an empty input. We NEVER return the token itself.
+        # Booleans so the UI can show a "already set" placeholder instead of
+        # an empty box. We NEVER return a credential value.
         "cloudflare_token_present": bool(config.get("cloudflare_token", "").strip()),
+        "credentials_present": _credentials_present(config),
         # alpha.6: drives the trusted_proxies quick-fix banner.
         "trusted_proxies_pending": _trusted_proxies_pending(),
     }
@@ -1113,6 +1155,30 @@ def _config_state(config: dict) -> dict:
     # integration_available (deployed-but-never-added) is dismissible.
     state.update(_integration_state())
     return state
+
+
+def _credentials_present(config: dict) -> dict:
+    """{ENV_NAME: bool} for every credential this add-on knows about.
+
+    Includes the legacy `cloudflare_token` spelling under its env name, so an
+    install predating the provider table still shows its token as set.
+    """
+    stored = dict(config.get("provider_credentials") or {})
+    legacy = (config.get("cloudflare_token") or "").strip()
+    if legacy and not (stored.get("CF_DNS_API_TOKEN") or "").strip():
+        stored["CF_DNS_API_TOKEN"] = legacy
+    return {env: bool((stored.get(env) or "").strip())
+            for env in sorted(ALL_CREDENTIAL_ENV)}
+
+
+async def get_providers(request: web.Request) -> web.Response:
+    """The provider catalogue the wizard builds its fields from.
+
+    Field DEFINITIONS only -- never values. Served from the same table
+    render.py and cont-init use, so the form can never offer a field the
+    exporter would ignore.
+    """
+    return web.json_response({"providers": ui_catalog()})
 
 
 def _redact_config(config: dict) -> dict:
@@ -2294,6 +2360,7 @@ def make_app():
     app.router.add_put("/api/routes", put_routes)
     app.router.add_get("/api/middlewares", get_middlewares)
     app.router.add_put("/api/middlewares", put_middlewares)
+    app.router.add_get("/api/providers", get_providers)
     app.router.add_get("/api/config", get_config)
     app.router.add_put("/api/config", put_config)
     app.router.add_get("/api/state", get_state)

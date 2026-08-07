@@ -119,7 +119,10 @@ def _load_core_config(opts: dict[str, Any]) -> dict[str, Any]:
             data = yaml.safe_load(CONFIG_IN.read_text()) or {}
             for field in ("provider", "cloudflare_token", "acme_email",
                           "domain", "ha_hostname", "entrypoint_http",
-                          "entrypoint_https", "log_level"):
+                          "entrypoint_https", "log_level",
+                          # Without this the credential map never reaches
+                          # _acme_active and ACME silently stays off.
+                          "provider_credentials"):
                 if field in data and data[field] is not None:
                     merged[field] = data[field]
             if "force_ssl" in data and data["force_ssl"] is not None:
@@ -136,22 +139,50 @@ def _load_core_config(opts: dict[str, Any]) -> dict[str, Any]:
     return merged
 
 
-PROVIDER_LOCAL = "local"
+# The provider table is the single source of truth for which credentials each
+# provider needs; see backend/providers.py. render.py lives one directory up
+# from the package, so make it importable.
+sys.path.insert(0, "/usr/local/bin")
+try:
+    from backend.providers import PROVIDER_LOCAL, required_env
+except ImportError:  # pragma: no cover - only if the image is malformed
+    PROVIDER_LOCAL = "local"
+
+    def required_env(_provider: str) -> list:
+        return ["CF_DNS_API_TOKEN"]
+
+
+def _credentials(config: dict[str, Any]) -> dict[str, str]:
+    """Stored credentials keyed by environment-variable name.
+
+    `cloudflare_token` is the pre-multi-provider spelling and is still read,
+    so an install that predates the provider table keeps working untouched.
+    """
+    creds = dict(config.get("provider_credentials") or {})
+    legacy = (config.get("cloudflare_token") or "").strip()
+    if legacy and not creds.get("CF_DNS_API_TOKEN"):
+        creds["CF_DNS_API_TOKEN"] = legacy
+    return creds
 
 
 def _acme_active(opts: dict[str, Any]) -> bool:
-    # NEVER store or log the token value. Truthiness + strip handles "", None,
-    # missing-key, AND whitespace-only. The actual token reaches Traefik via
-    # CF_DNS_API_TOKEN env var set in cont-init.
+    # NEVER store or log a credential value. Truthiness + strip handles "",
+    # None, missing-key AND whitespace-only. The values themselves reach
+    # Traefik as environment variables written by cont-init.
     config = _load_core_config(opts)
     # The local provider issues nothing, deliberately. Checked before the
-    # credentials so that a token left over from a previous cloudflare setup
-    # cannot silently re-enable ACME after the user chose self-signed.
-    if (config.get("provider") or "").strip().lower() == PROVIDER_LOCAL:
+    # credentials so that a token left over from a previous setup cannot
+    # silently re-enable ACME after the user chose self-signed.
+    provider = (config.get("provider") or "").strip().lower()
+    if provider == PROVIDER_LOCAL:
         return False
-    email = (config.get("acme_email") or "").strip()
-    token = (config.get("cloudflare_token") or "").strip()
-    return bool(email) and bool(token)
+    needed = required_env(provider)
+    if not needed:
+        return False
+    creds = _credentials(config)
+    if not all((creds.get(env) or "").strip() for env in needed):
+        return False
+    return bool((config.get("acme_email") or "").strip())
 
 
 def main() -> int:
@@ -188,10 +219,14 @@ def main() -> int:
             file=sys.stderr,
         )
     elif resolver_name and not _acme_active(opts):
+        creds = _credentials(config)
+        provider = (config.get("provider") or "").strip().lower()
         missing = [
-            k for k in ("acme_email", "cloudflare_token")
-            if not (config.get(k) or "").strip()
+            e for e in required_env(provider)
+            if not (creds.get(e) or "").strip()
         ]
+        if not (config.get("acme_email") or "").strip():
+            missing.append("acme_email")
         print(
             f"WARN: certResolver {resolver_name!r} requested but "
             f"{missing} missing in config - TLS routes will use Traefik's "
@@ -277,7 +312,13 @@ def _build_static(opts: dict[str, Any]) -> dict[str, Any]:
                     "email": config_full["acme_email"].strip(),
                     "storage": "/data/acme.json",
                     "dnsChallenge": {
-                        "provider": "cloudflare",
+                        # The lego provider code, which MUST be the configured
+                        # provider and not a constant. It was hardcoded to
+                        # "cloudflare" while this add-on only had one provider;
+                        # left that way it would hand netcup credentials to
+                        # Cloudflare's API and fail at issuance, not at save.
+                        "provider": (config_full.get("provider")
+                                     or "cloudflare").strip().lower(),
                         "resolvers": ["1.1.1.1:53", "1.0.0.1:53"],
                     },
                 },

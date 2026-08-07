@@ -2,6 +2,23 @@
 
 ## 0.1.0-alpha.25
 
+- **Ten more DNS providers**, so Cloudflare is no longer the only way to get a
+  real certificate: deSEC, DigitalOcean, Duck DNS, Gandi, Hetzner, IONOS,
+  Namecheap, netcup, Porkbun and Amazon Route 53. Cloudflare is unchanged and
+  remains the default.
+
+  The setup wizard now builds its credential fields from the chosen provider,
+  so a provider needing three values (netcup) asks for three, and each field
+  names the environment variable it maps to with a link to the provider's own
+  documentation. Switching provider removes the previous provider's credentials
+  from the container environment rather than leaving them behind.
+
+  Traefik supports over 200 providers; these ten were chosen because each one's
+  variable names were checked by hand against lego's documentation. A wrong
+  variable name would not fail when you save it — it would fail weeks later at
+  renewal, silently — so the list is deliberately the verified one rather than
+  the complete one.
+
 - **You can now run without a Cloudflare token at all.** A new `local`
   certificate provider skips the certificate authority entirely and lets Traefik
   serve its own self-signed certificate, and the setup wizard has an

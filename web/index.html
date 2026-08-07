@@ -1134,8 +1134,12 @@
           <select id="wizard-provider" x-model="config.provider"
                   x-ref="wizardFirstInput"
                   class="block w-full border rounded px-3 py-2 bg-white">
-            <option value="cloudflare">Cloudflare (DNS-01)</option>
-            <option value="local">Local &mdash; self-signed, no account needed</option>
+            <template x-if="!providers.length">
+              <option value="cloudflare">Cloudflare (DNS-01)</option>
+            </template>
+            <template x-for="p in providers" :key="p.code">
+              <option :value="p.code" x-text="p.name"></option>
+            </template>
           </select>
         </div>
 
@@ -1152,18 +1156,32 @@
           </p>
         </div>
 
-        <div x-show="config.provider !== 'local'">
-          <label class="block text-sm font-medium mb-1" for="wiz-token">2. Cloudflare API token</label>
-          <input id="wiz-token" type="password" x-model="config.cloudflare_token"
-                 :placeholder="state.cloudflare_token_present ? '••••• (token set; leave blank to keep)' : 'Paste your Cloudflare API token'"
-                 autocomplete="new-password"
-                 :aria-invalid="!!cloudflareTokenError"
-                 :class="cloudflareTokenError ? 'border-red-400' : ''"
-                 class="block w-full font-mono border rounded px-3 py-2">
-          <p x-show="cloudflareTokenError" class="text-xs text-red-700 mt-1" x-text="cloudflareTokenError"></p>
-          <p class="text-xs text-gray-500 mt-1">
-            Token needs <span class="font-mono">Zone:Zone:Read</span> +
-            <span class="font-mono">Zone:DNS:Edit</span> on the target zone.
+        <!-- Credential fields are generated from the provider catalogue, not
+             hardcoded: the shapes differ (one token, key+secret, or netcup's
+             three), and deriving them from the same table the exporter reads
+             is what keeps the form and cont-init from drifting apart. -->
+        <div x-show="config.provider !== 'local' && providerFields.length" class="space-y-4">
+          <template x-for="(f, i) in providerFields" :key="f.env">
+            <div>
+              <label class="block text-sm font-medium mb-1" :for="'cred-' + f.env">
+                <span x-text="(i + 2) + '. ' + f.label"></span>
+              </label>
+              <input :id="'cred-' + f.env"
+                     :type="f.secret ? 'password' : 'text'"
+                     x-model="config.provider_credentials[f.env]"
+                     :placeholder="f.present ? '••••• (set; leave blank to keep)' : f.label"
+                     autocomplete="new-password"
+                     class="block w-full font-mono border rounded px-3 py-2">
+              <p class="text-xs text-gray-500 mt-1">
+                <span class="font-mono" x-text="f.env"></span><span x-show="f.help"> &mdash; </span><span x-text="f.help"></span>
+              </p>
+            </div>
+          </template>
+          <p class="text-xs text-gray-500" x-show="currentProvider && currentProvider.docs_url">
+            Where to find these:
+            <a class="underline" target="_blank" rel="noopener"
+               :href="currentProvider ? currentProvider.docs_url : '#'"
+               x-text="currentProvider ? currentProvider.docs_url : ''"></a>
           </p>
         </div>
 
