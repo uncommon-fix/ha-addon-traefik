@@ -82,7 +82,7 @@ COPY web/ /usr/share/traefik-web/
 # differs from what's already deployed. BUILD_VERSION is auto-injected by the
 # home-assistant/builder CI action (= config.yaml's version:); the default
 # below covers local builds — keep it in sync with config.yaml's version: field.
-ARG BUILD_VERSION=0.1.0-alpha.23
+ARG BUILD_VERSION=0.1.0-alpha.24
 # alpha.14: also export BUILD_VERSION as a runtime env var so the backend can
 # read it for the app.js cache-buster query string. The integration's
 # .bundled_version file already gives cont-init's deploy step a version to

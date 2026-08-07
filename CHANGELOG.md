@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.1.0-alpha.24
+
+- **The add-on is now confined by an enforcing AppArmor profile.** It previously
+  ran with `apparmor: false`, which is not neutral: it means no AppArmor
+  confinement at all, and the supervisor penalises the security rating for it.
+
+  Every rule was traced to a logged denial rather than inferred. Three of them
+  turned out to matter a great deal: Go's resolver reads `/etc/hosts`,
+  `/etc/nsswitch.conf` and `/etc/resolv.conf` before any outbound connection,
+  and `abstractions/base` does not cover them — so ACME and every backend health
+  check depended on rules that were not present.
+
+  Verified on a clean install with the data directory removed between passes:
+  nine denials, then zero, then flipped to enforce and reinstalled. Traefik
+  answers on `:80`, the renderer writes its config, and the bundled integration
+  redeploys.
+
+  **Not exercised:** the ACME/DNS-01 path that writes `/data/acme.json`. It needs
+  Cloudflare credentials the test environment does not have, so the rules
+  covering it remain the ones inferred when the profile was written.
+
 ## 0.1.0-alpha.23
 
 - **New: cross-addon scaffold API.** Sibling Home Assistant add-ons
