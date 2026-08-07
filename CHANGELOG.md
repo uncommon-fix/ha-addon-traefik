@@ -2,6 +2,21 @@
 
 ## 0.1.0-alpha.25
 
+- **Setup is a page now, not a popup over an unusable dashboard.** On a fresh
+  install the wizard is the whole screen until it is finished, instead of a
+  dialog floating over a dashboard full of empty state.
+
+- **Finishing setup now publishes it.** Previously the wizard saved your answers
+  as a draft and left them unapplied, so you landed on a dashboard reporting
+  "2 pending changes" — which were your own answers — with nothing explaining
+  it. Finishing now applies, and if applying fails your answers survive so you
+  can correct them and try again.
+
+  Two smaller consequences of the same bug: the add-on considered itself
+  configured as soon as you *typed* a domain, so reloading mid-wizard dropped
+  you on the dashboard; and the pending banner counted changed settings without
+  naming them. Both fixed.
+
 - **Ten more DNS providers**, so Cloudflare is no longer the only way to get a
   real certificate: deSEC, DigitalOcean, Duck DNS, Gandi, Hetzner, IONOS,
   Namecheap, netcup, Porkbun and Amazon Route 53. Cloudflare is unchanged and
