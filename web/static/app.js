@@ -208,11 +208,25 @@ function traefikAppData() {
 
         ingressPath: INGRESS_PATH,
         appVersion: APP_VERSION,
-        // Default 'routes' once configured; load() flips to 'config'
-        // (with wizardOpen=true) on first run so a sensible underlay
-        // sits behind the wizard overlay.
         tab: 'routes',
         dashboardLoaded: false,
+
+        // THE top-level view switch. Three states on purpose, mirroring the
+        // sibling unifi-controller's starting/unconfigured/configured:
+        //   null  — loadConfig() hasn't answered yet. Render neither view;
+        //           without this beat an already-configured install flashes
+        //           the onboarding page on every load.
+        //   false — onboarding IS the page. No dashboard markup exists in the
+        //           DOM at all (index.html gates it behind x-if, not x-show),
+        //           because the dashboard pre-configuration is nothing but
+        //           empty tables and disabled tabs.
+        //   true  — the dashboard. Setup is still reachable, as a modal, from
+        //           "Re-run setup wizard" on the Configuration tab.
+        // Set ONLY from the draft-derived state (loadConfig / saveConfig).
+        // pollStatus must not touch it: /api/state reports LIVE config, and
+        // the wizard writes a draft that only Apply commits, so a poll would
+        // otherwise bounce a just-onboarded user straight back to onboarding.
+        onboarded: null,
 
         // alpha.12: session takeover. The backend allows ONE active editor at
         // a time. On load() the UI POSTs /api/session/claim; a 409 surfaces a
@@ -231,9 +245,10 @@ function traefikAppData() {
         toasts: [],
         _toastUid: 0,
 
-        // Configuration tab + wizard overlay share the same config object.
-        // wizardOpen is shown on first-load when !configured, or when the
-        // user clicks "Re-run setup wizard" on the Configuration page.
+        // Configuration tab + setup form share the same config object.
+        // wizardOpen only means "the MODAL is open" — it says nothing about
+        // onboarding, which is `onboarded === false` and needs no flag of its
+        // own. See setupVisible / setupIsModal below.
         config: blankConfig(),
         state: blankState(),
         wizardOpen: false,
@@ -397,6 +412,16 @@ function traefikAppData() {
             return this.providers.find(p => p.code === this.config.provider) || null;
         },
 
+        // What the provider <select> iterates. A getter rather than a
+        // `<template x-if>` fallback inside the select, which is invalid HTML
+        // and breaks the binding — see docs/ui.md. Non-empty always, so the
+        // select never renders as an empty box if /api/providers failed.
+        get providerOptions() {
+            return this.providers.length
+                ? this.providers
+                : [{ code: 'cloudflare', name: 'Cloudflare (DNS-01)' }];
+        },
+
         // Fields for the selected provider, each carrying whether a value is
         // already stored so the box can say so instead of looking empty.
         get providerFields() {
@@ -419,6 +444,36 @@ function traefikAppData() {
             }
         },
 
+        // ONE setup form, two presentations — a whole-page onboarding step
+        // before there is anything to go back to, and a modal over the
+        // dashboard afterwards. Two copies of this form is how the two drift
+        // apart, so index.html renders it once and swaps the chrome.
+        get setupIsModal() { return this.onboarded === true; },
+        get setupVisible() { return this.onboarded === false || this.wizardOpen; },
+
+        // Step numbers in the form. Not hardcoded: the credential block is
+        // generated from the provider catalogue, so it is 0 fields (local),
+        // 1 (Cloudflare) or 3 (netcup) long and everything after it shifts.
+        get stepAcmeEmail() { return this.providerFields.length + 2; },
+        get stepDomain() {
+            return this.config.provider === 'local' ? 2 : this.providerFields.length + 3;
+        },
+
+        // The credential map is edited as one object and survives provider
+        // switches, so it can hold names the CURRENT provider doesn't use —
+        // which the backend rejects with a 400. Every payload is filtered to
+        // the selected provider's field list first. Blank values are omitted
+        // rather than sent empty: absent means "keep what is stored".
+        _credsPayload() {
+            const held = this.config.provider_credentials || {};
+            const out = {};
+            for (const f of this.providerFields) {
+                const v = held[f.env];
+                if (typeof v === 'string' && v.trim()) out[f.env] = v.trim();
+            }
+            return out;
+        },
+
         get wizardFormValid() {
             // Wizard doesn't expose entry points or log level; just the
             // initial-config fields. A credential may be blank only if one is
@@ -431,7 +486,7 @@ function traefikAppData() {
                 return !this.domainError;
             }
             const credsOk = this.providerFields.every(f =>
-                (this.config.provider_credentials[f.env] || '').trim() || f.present);
+                ((this.config.provider_credentials || {})[f.env] || '').trim() || f.present);
             return credsOk && !this.acmeEmailError && !this.domainError;
         },
 
@@ -903,15 +958,12 @@ function traefikAppData() {
             // state, and we still load read data so the read-only view is
             // populated.
             await this.claimSession();
-            // Always load config first so we can decide what to show.
+            // Config first, and only then is `onboarded` anything but null:
+            // it decides which of the two top-level views exists at all.
+            // The routes/middlewares loads below still run while
+            // unconfigured — they are cheap, and they mean the dashboard has
+            // data the instant onboarding hands over to it.
             await this.loadConfig();
-            // First-run UX: not configured -> open wizard. Underneath, put
-            // the Configuration tab (the Routes tab is gated to disabled
-            // while unconfigured, so 'routes' would render as a no-op).
-            if (!this.state.configured) {
-                this.tab = 'config';
-                this.wizardOpen = true;
-            }
             await this.loadRoutes();
             await this.loadMiddlewares();   // Phase F
             // alpha.20: All surfaces are loaded; re-enable auto-save so the
@@ -951,15 +1003,36 @@ function traefikAppData() {
             this.wizardOpen = true;
         },
 
+        // Only the modal closes. During onboarding there is nothing behind the
+        // form to reveal, so Escape / backdrop / Cancel are all no-ops there
+        // (index.html also hides those controls; this is the belt).
         closeWizard() {
+            if (!this.setupIsModal) return;
             this.wizardOpen = false;
         },
 
         async saveWizard() {
             // saveConfig returns true on success, false on failure (toast already
-            // shown). Only close the wizard on a real save.
+            // shown). Only leave the form on a real save.
+            const wasOnboarding = !this.setupIsModal;
             const ok = await this.saveConfig();
-            if (ok) this.wizardOpen = false;
+            if (!ok) return;
+            this.wizardOpen = false;
+            // The second half of the condition matters: the backend decides
+            // what "configured" means, and if it still says no (a field we
+            // didn't gate on) the onboarding page stays put rather than
+            // handing over to a dashboard the server doesn't think is ready.
+            if (!wasOnboarding || this.onboarded !== true) return;
+            // Onboarding just finished: saveConfig set `onboarded` from the
+            // response, so the dashboard has replaced this page. Land on
+            // Routes and make the Apply footer honest about what is now
+            // sitting in the draft — saveConfig writes the draft, and only
+            // Apply pushes it to Traefik.
+            this.tab = 'routes';
+            await this.loadPending().catch(() => {});
+            this.toast.info(
+                'Setup saved. Click Apply to publish it to Traefik.'
+            );
         },
 
         async loadConfig() {
@@ -994,6 +1067,12 @@ function traefikAppData() {
                 this.config = {
                     provider: j.provider || 'cloudflare',
                     cloudflare_token: '',
+                    // Credential values are write-only over the API: the
+                    // server never sends them back, so this always starts
+                    // empty and the "••••• (set)" placeholder comes from
+                    // state.credentials_present. It MUST exist as an object —
+                    // the wizard's x-model writes straight into it.
+                    provider_credentials: {},
                     acme_email: j.acme_email || '',
                     domain: j.domain || '',
                     // Phase F: ha_hostname is no longer surfaced (HA system route).
@@ -1003,8 +1082,14 @@ function traefikAppData() {
                     force_ssl: !!j.force_ssl,
                 };
                 this.state = j.state || blankState();
+                // Draft-derived, and the only place besides saveConfig that
+                // may set it. See the `onboarded` declaration.
+                this.onboarded = !!this.state.configured;
             } catch (e) {
                 this.loadFailed.config = e.message || String(e);
+                // `onboarded` is deliberately left alone. On a first load it
+                // stays null and index.html renders the boot-error panel
+                // rather than guessing a view from a failed read.
             }
         },
 
@@ -1169,6 +1254,9 @@ function traefikAppData() {
             const payload = { ...this.config };
             // Strip blank cloudflare_token (preserve-existing semantic).
             if (!(payload.cloudflare_token || '').trim()) delete payload.cloudflare_token;
+            // Never spread the raw credential map: it accumulates names across
+            // provider switches and the backend 400s on foreign ones.
+            payload.provider_credentials = this._credsPayload();
             await this.api('PUT', '/api/config', payload);
         },
 
@@ -1439,7 +1527,22 @@ function traefikAppData() {
             try {
                 const rs = await fetch(this.url('/api/state'), { headers: sidHeader });
                 if (rs.ok) {
-                    this.state = await rs.json();
+                    const live = await rs.json();
+                    // /api/state reports the LIVE config; the setup form edits
+                    // the DRAFT, which only Apply commits. Keep the four
+                    // onboarding/credential keys draft-derived (loadConfig and
+                    // saveConfig own them) and take the rest — the banner
+                    // signals, which are genuinely about live state — from the
+                    // poll. Overwriting wholesale used to un-configure a user
+                    // who had just finished setup but not yet clicked Apply,
+                    // and blank out the "••••• (set)" credential placeholders.
+                    this.state = {
+                        ...live,
+                        configured: this.state.configured,
+                        missing: this.state.missing,
+                        cloudflare_token_present: this.state.cloudflare_token_present,
+                        credentials_present: this.state.credentials_present,
+                    };
                     backendUp = true;
                 }
             } catch (_) { /* ignore; backendUp stays false */ }
@@ -1504,6 +1607,11 @@ function traefikAppData() {
                 // Empty token = "keep existing" (backend preserves the
                 // currently-stored value). Non-empty = overwrite.
                 cloudflare_token: this.config.cloudflare_token || '',
+                // Same rule per credential, and the reason this is not just
+                // spread from this.config: an omitted name means "keep what is
+                // stored", and a name the selected provider doesn't use is a
+                // 400. _credsPayload enforces both.
+                provider_credentials: this._credsPayload(),
                 acme_email: this.config.acme_email,
                 domain: this.config.domain,
                 // Phase F: ha_hostname dropped from the payload; HA system
@@ -1516,10 +1624,14 @@ function traefikAppData() {
             try {
                 const j = await this.api('PUT', '/api/config', payload);
                 this.state = j.state || blankState();
+                // Draft-derived, like loadConfig: this is what unloads the
+                // onboarding page and mounts the dashboard.
+                this.onboarded = !!this.state.configured;
                 this.restartRequired = !!j.restart_required;
-                // Wipe the token input back to empty: it's been saved
-                // (or preserved); the placeholder switches to ••••• now.
+                // Wipe the secret inputs back to empty: they've been saved
+                // (or preserved); the placeholders switch to ••••• now.
                 this.config.cloudflare_token = '';
+                this.config.provider_credentials = {};
                 this.toast.success('Configuration saved.');
                 return true;
             } catch (e) {

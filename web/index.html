@@ -16,7 +16,7 @@
   <script defer src="{{INGRESS_PATH}}/static/alpinejs-3.15.12.min.js"></script>
 </head>
 <body class="h-full bg-gray-50 text-gray-900 antialiased"
-      :class="pending.total > 0 && viewMode === 'rw' ? 'pb-20' : ''"
+      :class="onboarded === true && pending.total > 0 && viewMode === 'rw' ? 'pb-20' : ''"
       x-data="traefikApp" x-init="load()" x-cloak>
   <!-- ============ TOAST REGION (alpha.12) ============ -->
   <!-- Two aria-live regions: polite for success/info (announced when idle);
@@ -29,7 +29,7 @@
        is `py-2` with a single line of text + button on the default HA theme;
        `top-14` (3.5rem / 56px) clears it with margin to spare. -->
   <div class="fixed right-3 z-[60] flex flex-col gap-2 max-w-sm w-[calc(100%-1.5rem)] sm:w-96 pointer-events-none"
-       :class="viewMode === 'ro' ? 'top-14' : 'top-3'">
+       :class="viewMode === 'ro' && onboarded === true ? 'top-14' : 'top-3'">
     <div role="status" aria-live="polite" aria-atomic="false" class="flex flex-col gap-2">
       <template x-for="t in toasts.filter(t => t.kind !== 'error')" :key="t.id">
         <div x-transition.opacity
@@ -56,1015 +56,1047 @@
     </div>
   </div>
 
-  <!-- ============ READ-ONLY MODE INDICATOR (alpha.12) ============ -->
-  <!-- Shown when viewMode === 'ro' (the user chose "View read-only" on the
-       takeover prompt, or their session was taken over). Permanent until the
-       user reloads or takes over via the prompt. -->
-  <div x-show="viewMode === 'ro'" x-transition.opacity
-       class="bg-gray-200 border-b border-gray-300 px-6 py-2 text-sm text-gray-700 flex items-center justify-between gap-3">
-    <span><strong>Read-only.</strong> Another session is editing; mutations are disabled.</span>
-    <button @click="takeover()"
-            class="shrink-0 px-3 py-1 rounded bg-gray-800 text-white text-xs font-medium hover:bg-gray-900">
-      Take over
-    </button>
+  <!-- ============ BOOT / BOOT FAILURE ============ -->
+  <!-- `onboarded` is null until loadConfig() answers. Neither top-level view
+       exists during that beat, which is what stops an already-configured
+       install from flashing the onboarding page on every load. If the config
+       read FAILS we stay here and say so rather than guessing a view — the
+       dashboard's own "Couldn't load configuration" panel is unreachable
+       while we don't know whether the dashboard should exist. -->
+  <div x-show="onboarded === null" class="min-h-full flex items-center justify-center p-6">
+    <template x-if="!loadFailed.config">
+      <p class="text-sm text-gray-500">Loading&hellip;</p>
+    </template>
+    <template x-if="loadFailed.config">
+      <div class="max-w-md w-full p-4 rounded border border-red-300 bg-red-50 text-sm text-red-900">
+        <strong>Couldn't load the add-on configuration.</strong>
+        <div class="font-mono text-xs mt-1 whitespace-pre-wrap" x-text="loadFailed.config"></div>
+        <button @click="loadConfig()"
+                class="mt-3 px-3 py-1.5 rounded bg-red-600 text-white text-sm font-medium hover:bg-red-700">
+          Retry
+        </button>
+      </div>
+    </template>
   </div>
 
-  <header class="border-b bg-white px-4 sm:px-6 py-3 flex flex-wrap items-center gap-3 sm:gap-6">
-    <h1 class="text-lg font-semibold">Traefik</h1>
-    <nav class="flex gap-1" aria-label="Sections">
-      <button @click="if (state.configured) { tab='routes' }"
-              :disabled="!state.configured"
-              :aria-disabled="!state.configured"
-              :aria-current="tab==='routes' ? 'page' : null"
-              :class="tab==='routes' ? 'bg-blue-100 text-blue-900' : (state.configured ? 'hover:bg-gray-100' : 'opacity-40 cursor-not-allowed')"
-              class="px-3 py-1.5 rounded text-sm font-medium transition"
-              :title="state.configured ? '' : 'Complete the setup wizard first'">Routes</button>
-      <button @click="if (state.configured) { tab='middlewares' }"
-              :disabled="!state.configured"
-              :aria-disabled="!state.configured"
-              :aria-current="tab==='middlewares' ? 'page' : null"
-              :class="tab==='middlewares' ? 'bg-blue-100 text-blue-900' : (state.configured ? 'hover:bg-gray-100' : 'opacity-40 cursor-not-allowed')"
-              class="px-3 py-1.5 rounded text-sm font-medium transition"
-              :title="state.configured ? '' : 'Complete the setup wizard first'">Middlewares</button>
-      <button @click="if (state.configured) { tab='dashboard'; dashboardLoaded=true }"
-              :disabled="!state.configured"
-              :aria-disabled="!state.configured"
-              :aria-current="tab==='dashboard' ? 'page' : null"
-              :class="tab==='dashboard' ? 'bg-blue-100 text-blue-900' : (state.configured ? 'hover:bg-gray-100' : 'opacity-40 cursor-not-allowed')"
-              class="px-3 py-1.5 rounded text-sm font-medium transition"
-              :title="state.configured ? '' : 'Complete the setup wizard first'">Traefik Dashboard</button>
-    </nav>
-    <div class="ml-auto flex items-center gap-3">
-      <button @click="tab='config'"
-              :class="tab==='config' ? 'bg-blue-100 text-blue-900' : 'hover:bg-gray-100'"
-              class="px-3 py-1.5 rounded text-sm font-medium transition">Configuration</button>
-      <div class="text-xs text-gray-500 flex items-center gap-2">
-        <span x-show="!state.configured" class="text-amber-600">Setup incomplete</span>
-        <span x-show="state.configured && status.traefik_up === false" class="text-amber-600">Traefik starting...</span>
-        <span x-show="state.configured && status.traefik_up" class="text-green-600">Traefik ready</span>
-        <template x-if="status.version"><span x-text="'v' + status.version"></span></template>
-      </div>
-    </div>
-  </header>
+  <!-- ============ DASHBOARD ============ -->
+  <!-- Everything from here to </main> is the configured-install UI: routes,
+       middlewares, configuration, Traefik's own dashboard. It is behind x-if,
+       NOT x-show — a brand-new user must not have a dashboard full of empty
+       tables and disabled tabs sitting under the setup form. Onboarding is a
+       step that ends; the sibling unifi-controller does the same thing by
+       serving a different template (backend/server.py serve_index). -->
+  <template x-if="onboarded === true">
+  <div>
 
-  <!-- ============ TRUSTED-PROXIES BANNER (alpha.6) ============ -->
-  <!-- Shown when configuration.yaml lacks the trusted_proxies /
-       use_x_forwarded_for config that lets HTTPS-through-Traefik work (HA Core
-       400s otherwise). The backend re-reads the file on every /api/state poll,
-       so this self-clears once fixed (by us or by hand). -->
-  <div x-show="state.trusted_proxies_pending" x-transition.opacity
-       class="bg-amber-100 border-b border-amber-300 px-6 py-3">
-    <div class="flex flex-wrap items-center justify-between gap-3">
-      <div class="text-sm text-amber-900">
-        <strong>HTTPS requests return 400 until Home&nbsp;Assistant trusts the proxy.</strong>
-        Add <code>use_x_forwarded_for</code> + <code>trusted_proxies</code> to
-        <span class="font-medium">configuration.yaml</span>.
-        <button type="button" @click="showTpSnippet = !showTpSnippet"
-                class="underline hover:no-underline">Show manual snippet</button>
-      </div>
-      <button @click="fixTrustedProxies()" :disabled="fixingTrustedProxies"
-              class="shrink-0 px-3 py-1.5 rounded bg-amber-600 text-white text-sm font-medium hover:bg-amber-700 disabled:bg-gray-500">
-        <span x-show="!fixingTrustedProxies">Fix automatically</span>
-        <span x-show="fixingTrustedProxies">Fixing...</span>
+    <!-- ============ READ-ONLY MODE INDICATOR (alpha.12) ============ -->
+    <!-- Shown when viewMode === 'ro' (the user chose "View read-only" on the
+         takeover prompt, or their session was taken over). Permanent until the
+         user reloads or takes over via the prompt. -->
+    <div x-show="viewMode === 'ro'" x-transition.opacity
+         class="bg-gray-200 border-b border-gray-300 px-6 py-2 text-sm text-gray-700 flex items-center justify-between gap-3">
+      <span><strong>Read-only.</strong> Another session is editing; mutations are disabled.</span>
+      <button @click="takeover()"
+              class="shrink-0 px-3 py-1 rounded bg-gray-800 text-white text-xs font-medium hover:bg-gray-900">
+        Take over
       </button>
     </div>
-    <pre x-show="showTpSnippet" x-transition
-         class="mt-2 p-2 rounded bg-amber-50 border border-amber-300 text-xs text-amber-900 whitespace-pre overflow-x-auto">http:
+
+    <header class="border-b bg-white px-4 sm:px-6 py-3 flex flex-wrap items-center gap-3 sm:gap-6">
+      <h1 class="text-lg font-semibold">Traefik</h1>
+      <!-- No per-tab "complete the wizard first" gating any more: this header
+           only exists once onboarding is done, so there is no unconfigured
+           state left for it to defend against. -->
+      <nav class="flex gap-1" aria-label="Sections">
+        <button @click="tab='routes'"
+                :aria-current="tab==='routes' ? 'page' : null"
+                :class="tab==='routes' ? 'bg-blue-100 text-blue-900' : 'hover:bg-gray-100'"
+                class="px-3 py-1.5 rounded text-sm font-medium transition">Routes</button>
+        <button @click="tab='middlewares'"
+                :aria-current="tab==='middlewares' ? 'page' : null"
+                :class="tab==='middlewares' ? 'bg-blue-100 text-blue-900' : 'hover:bg-gray-100'"
+                class="px-3 py-1.5 rounded text-sm font-medium transition">Middlewares</button>
+        <button @click="tab='dashboard'; dashboardLoaded=true"
+                :aria-current="tab==='dashboard' ? 'page' : null"
+                :class="tab==='dashboard' ? 'bg-blue-100 text-blue-900' : 'hover:bg-gray-100'"
+                class="px-3 py-1.5 rounded text-sm font-medium transition">Traefik Dashboard</button>
+      </nav>
+      <div class="ml-auto flex items-center gap-3">
+        <button @click="tab='config'"
+                :class="tab==='config' ? 'bg-blue-100 text-blue-900' : 'hover:bg-gray-100'"
+                class="px-3 py-1.5 rounded text-sm font-medium transition">Configuration</button>
+        <div class="text-xs text-gray-500 flex items-center gap-2">
+          <span x-show="status.traefik_up === false" class="text-amber-600">Traefik starting...</span>
+          <span x-show="status.traefik_up" class="text-green-600">Traefik ready</span>
+          <template x-if="status.version"><span x-text="'v' + status.version"></span></template>
+        </div>
+      </div>
+    </header>
+
+    <!-- ============ TRUSTED-PROXIES BANNER (alpha.6) ============ -->
+    <!-- Shown when configuration.yaml lacks the trusted_proxies /
+         use_x_forwarded_for config that lets HTTPS-through-Traefik work (HA Core
+         400s otherwise). The backend re-reads the file on every /api/state poll,
+         so this self-clears once fixed (by us or by hand). -->
+    <div x-show="state.trusted_proxies_pending" x-transition.opacity
+         class="bg-amber-100 border-b border-amber-300 px-6 py-3">
+      <div class="flex flex-wrap items-center justify-between gap-3">
+        <div class="text-sm text-amber-900">
+          <strong>HTTPS requests return 400 until Home&nbsp;Assistant trusts the proxy.</strong>
+          Add <code>use_x_forwarded_for</code> + <code>trusted_proxies</code> to
+          <span class="font-medium">configuration.yaml</span>.
+          <button type="button" @click="showTpSnippet = !showTpSnippet"
+                  class="underline hover:no-underline">Show manual snippet</button>
+        </div>
+        <button @click="fixTrustedProxies()" :disabled="fixingTrustedProxies"
+                class="shrink-0 px-3 py-1.5 rounded bg-amber-600 text-white text-sm font-medium hover:bg-amber-700 disabled:bg-gray-500">
+          <span x-show="!fixingTrustedProxies">Fix automatically</span>
+          <span x-show="fixingTrustedProxies">Fixing...</span>
+        </button>
+      </div>
+      <pre x-show="showTpSnippet" x-transition
+           class="mt-2 p-2 rounded bg-amber-50 border border-amber-300 text-xs text-amber-900 whitespace-pre overflow-x-auto">http:
   use_x_forwarded_for: true
   trusted_proxies:
     - 172.30.32.0/23</pre>
-  </div>
-  <!-- ============ HA CORE RESTART BANNER (alpha.12 composite) ============ -->
-  <!-- Replaces the previously-stacked three banners (trustedProxiesFixed +
-       integration_pending_restart + integration_available) with a single
-       banner that lists each pending reason as a bullet. One Restart HA Core
-       button serves all reasons; the "integration available" reason has its
-       own Dismiss because it's a soft suggestion (the others are required).
-       Content-hash-derived reasons self-clear on restart (the integration
-       rewrites .loaded_content_hash on load, so coreRestartReasons recomputes
-       to empty after the next state poll). -->
-  <div x-show="coreRestartNeeded" x-transition.opacity
-       class="bg-amber-100 border-b border-amber-300 px-6 py-3 flex items-start justify-between gap-3">
-    <div class="text-sm text-amber-900">
-      <strong>Home Assistant Core restart needed.</strong>
-      <ul class="mt-1 space-y-1">
-        <template x-for="reason in coreRestartReasons" :key="reason.key">
-          <li class="flex items-center gap-2">
-            <span aria-hidden="true">•</span>
-            <span x-text="reason.text"></span>
-            <button x-show="reason.dismissable"
-                    @click="dismissIntegration()" :disabled="dismissingIntegration"
-                    class="ml-1 px-2 py-0.5 rounded border border-amber-400 text-amber-800 text-xs font-medium hover:bg-amber-200 disabled:opacity-50">
-              Dismiss
-            </button>
-          </li>
-        </template>
-      </ul>
     </div>
-    <button @click="restartCore()" :disabled="restartingCore"
-            class="shrink-0 px-3 py-1.5 rounded bg-amber-600 text-white text-sm font-medium hover:bg-amber-700 disabled:bg-gray-500">
-      <span x-show="!restartingCore">Restart HA Core</span>
-      <span x-show="restartingCore">Restarting HA Core...</span>
-    </button>
-  </div>
-  <main :class="tab === 'dashboard' ? '' : 'p-4 sm:p-6'">
-    <!-- ============ CONFIGURATION TAB ============ -->
-    <!-- Single page with all editable settings. The setup wizard (overlay
-         below) is a guided alternative for the 5 initial-config fields,
-         opened automatically on first-run and re-openable via the link at
-         the bottom of this form. -->
-    <section x-show="tab==='config'" x-transition class="max-w-2xl">
-      <div class="mb-6">
-        <h2 class="text-base font-semibold">Configuration</h2>
-        <p class="text-sm text-gray-500 mt-1">
-          All Traefik settings live here. The supervisor's Configure tab
-          is no longer used. Changes apply on add-on restart.
-        </p>
+    <!-- ============ HA CORE RESTART BANNER (alpha.12 composite) ============ -->
+    <!-- Replaces the previously-stacked three banners (trustedProxiesFixed +
+         integration_pending_restart + integration_available) with a single
+         banner that lists each pending reason as a bullet. One Restart HA Core
+         button serves all reasons; the "integration available" reason has its
+         own Dismiss because it's a soft suggestion (the others are required).
+         Content-hash-derived reasons self-clear on restart (the integration
+         rewrites .loaded_content_hash on load, so coreRestartReasons recomputes
+         to empty after the next state poll). -->
+    <div x-show="coreRestartNeeded" x-transition.opacity
+         class="bg-amber-100 border-b border-amber-300 px-6 py-3 flex items-start justify-between gap-3">
+      <div class="text-sm text-amber-900">
+        <strong>Home Assistant Core restart needed.</strong>
+        <ul class="mt-1 space-y-1">
+          <template x-for="reason in coreRestartReasons" :key="reason.key">
+            <li class="flex items-center gap-2">
+              <span aria-hidden="true">•</span>
+              <span x-text="reason.text"></span>
+              <button x-show="reason.dismissable"
+                      @click="dismissIntegration()" :disabled="dismissingIntegration"
+                      class="ml-1 px-2 py-0.5 rounded border border-amber-400 text-amber-800 text-xs font-medium hover:bg-amber-200 disabled:opacity-50">
+                Dismiss
+              </button>
+            </li>
+          </template>
+        </ul>
       </div>
-
-      <div x-show="restartRequired" x-transition
-           class="mb-4 p-3 rounded border border-amber-300 bg-amber-50 text-sm text-amber-900 flex items-center justify-between gap-3">
-        <span>
-          Configuration saved. <strong>Restart the add-on</strong>
-          so Traefik picks up the new settings.
-        </span>
-        <button @click="restartAddon()" :disabled="restarting"
-                class="shrink-0 px-3 py-1.5 rounded bg-amber-600 text-white text-sm font-medium hover:bg-amber-700 disabled:bg-gray-500">
-          <span x-show="!restarting">Restart now</span>
-          <span x-show="restarting">Restarting...</span>
-        </button>
-      </div>
-
-      <!-- alpha.12: per-section load-failure panel. Render INSTEAD of the
-           form so the user can't edit empty data and accidentally save it. -->
-      <div x-show="loadFailed.config" x-transition
-           class="mb-4 p-4 rounded border border-red-300 bg-red-50 text-sm text-red-900 flex items-start justify-between gap-3">
-        <div>
-          <strong>Couldn't load configuration.</strong>
-          <div class="font-mono text-xs mt-1 whitespace-pre-wrap" x-text="loadFailed.config"></div>
-        </div>
-        <button @click="loadConfig()"
-                class="shrink-0 px-3 py-1.5 rounded bg-red-600 text-white text-sm font-medium hover:bg-red-700">
-          Reload
-        </button>
-      </div>
-
-      <form x-show="!loadFailed.config" @submit.prevent="saveConfig()" class="space-y-5">
-        <!-- alpha.21: per-field undo. Each block wraps the input in a flex
-             row so the undo icon sits to the right; the amber border /
-             background lights up when the value differs from live. -->
-        <div class="flex items-start gap-2 p-3 rounded border bg-gray-50">
-          <input type="checkbox" id="force_ssl" x-model="config.force_ssl" class="mt-0.5">
-          <label for="force_ssl" class="text-sm">
-            <span class="font-medium">Force SSL</span>
-            <button x-show="isFieldDirty('config', null, 'force_ssl')"
-                    @click.prevent.stop="discardField('config', null, 'force_ssl')"
-                    type="button" title="Revert Force SSL to live"
-                    class="ml-1 text-amber-700 hover:text-amber-900 inline-flex"
-                    x-html="icon('undo', 'w-3.5 h-3.5 inline-block')"></button>
-            <span class="block text-xs text-gray-500 mt-0.5">
-              Redirect every HTTP request to HTTPS at the entry point (301),
-              globally — supersedes per-route redirects. HTTP-only routes (TLS
-              off) are not served while this is on, because they have no HTTPS
-              router to redirect to. Applies on add-on restart.
-            </span>
-          </label>
-        </div>
-        <div>
-          <label class="block text-sm font-medium mb-1">Log level</label>
-          <div class="flex items-center gap-1.5">
-            <select x-model="config.log_level"
-                    class="block w-full border rounded px-3 py-2"
-                    :class="isFieldDirty('config', null, 'log_level') ? 'border-amber-400 bg-amber-50' : 'bg-white'">
-              <option value="DEBUG">DEBUG</option>
-              <option value="INFO">INFO</option>
-              <option value="WARN">WARN</option>
-              <option value="ERROR">ERROR</option>
-              <option value="FATAL">FATAL</option>
-            </select>
-            <button x-show="isFieldDirty('config', null, 'log_level')"
-                    @click="discardField('config', null, 'log_level')"
-                    type="button" title="Revert log level to live"
-                    class="text-amber-700 hover:text-amber-900 inline-flex"
-                    x-html="icon('undo', 'w-4 h-4 inline-block')"></button>
-          </div>
-        </div>
-
-        <div>
-          <label class="block text-sm font-medium mb-1" for="cfg-ep-http">HTTP entry point name</label>
-          <div class="flex items-center gap-1.5">
-            <input id="cfg-ep-http" type="text" x-model="config.entrypoint_http"
-                   @blur="normalizeEntrypoint('entrypoint_http')"
-                   placeholder="web"
-                   :aria-invalid="!!entrypointHttpError"
-                   :class="entrypointHttpError
-                           ? 'border-red-400'
-                           : (isFieldDirty('config', null, 'entrypoint_http') ? 'border-amber-400 bg-amber-50' : '')"
-                   class="block w-full font-mono border rounded px-3 py-2">
-            <button x-show="isFieldDirty('config', null, 'entrypoint_http')"
-                    @click="discardField('config', null, 'entrypoint_http')"
-                    type="button" title="Revert HTTP entry point to live"
-                    class="text-amber-700 hover:text-amber-900 inline-flex"
-                    x-html="icon('undo', 'w-4 h-4 inline-block')"></button>
-          </div>
-          <p x-show="entrypointHttpError" class="text-xs text-red-700 mt-1" x-text="entrypointHttpError"></p>
-          <p class="text-xs text-gray-500 mt-1">
-            Name Traefik uses for the :80 listener.
-            Default <span class="font-mono">web</span>.
+      <button @click="restartCore()" :disabled="restartingCore"
+              class="shrink-0 px-3 py-1.5 rounded bg-amber-600 text-white text-sm font-medium hover:bg-amber-700 disabled:bg-gray-500">
+        <span x-show="!restartingCore">Restart HA Core</span>
+        <span x-show="restartingCore">Restarting HA Core...</span>
+      </button>
+    </div>
+    <main :class="tab === 'dashboard' ? '' : 'p-4 sm:p-6'">
+      <!-- ============ CONFIGURATION TAB ============ -->
+      <!-- Single page with all editable settings. The initial-config fields
+           (provider, credentials, ACME email, domain) are NOT here — they
+           belong to the setup form further down this file, which was the
+           onboarding page before this install was configured and is a modal
+           now. "Re-run setup wizard" at the bottom of this form is the way
+           back to it. -->
+      <section x-show="tab==='config'" x-transition class="max-w-2xl">
+        <div class="mb-6">
+          <h2 class="text-base font-semibold">Configuration</h2>
+          <p class="text-sm text-gray-500 mt-1">
+            All Traefik settings live here. The supervisor's Configure tab
+            is no longer used. Changes apply on add-on restart.
           </p>
         </div>
 
-        <div>
-          <label class="block text-sm font-medium mb-1" for="cfg-ep-https">HTTPS entry point name</label>
-          <div class="flex items-center gap-1.5">
-            <input id="cfg-ep-https" type="text" x-model="config.entrypoint_https"
-                   @blur="normalizeEntrypoint('entrypoint_https')"
-                   placeholder="websecure"
-                   :aria-invalid="!!entrypointHttpsError"
-                   :class="entrypointHttpsError
-                           ? 'border-red-400'
-                           : (isFieldDirty('config', null, 'entrypoint_https') ? 'border-amber-400 bg-amber-50' : '')"
-                   class="block w-full font-mono border rounded px-3 py-2">
-            <button x-show="isFieldDirty('config', null, 'entrypoint_https')"
-                    @click="discardField('config', null, 'entrypoint_https')"
-                    type="button" title="Revert HTTPS entry point to live"
-                    class="text-amber-700 hover:text-amber-900 inline-flex"
-                    x-html="icon('undo', 'w-4 h-4 inline-block')"></button>
-          </div>
-          <p x-show="entrypointHttpsError" class="text-xs text-red-700 mt-1" x-text="entrypointHttpsError"></p>
-          <p x-show="entrypointConflictError" class="text-xs text-red-700 mt-1" x-text="entrypointConflictError"></p>
-          <p class="text-xs text-gray-500 mt-1">
-            Name for the :443 listener.
-            Default <span class="font-mono">websecure</span>.
-          </p>
-        </div>
-
-        <div class="flex items-center gap-4 pt-2">
-          <!-- alpha.20: Save button removed — auto-save flushes edits to the
-               draft as you type (1500ms debounce on this form for regex-
-               validated fields). Apply (sticky footer) commits draft -> live. -->
-          <button type="button" @click="openWizard()"
-                  class="text-sm text-blue-600 hover:text-blue-800 underline">
-            Re-run setup wizard
-          </button>
-          <span x-show="autoSaveError.config" class="text-xs text-red-700"
-                x-text="'Auto-save error: ' + autoSaveError.config"></span>
-        </div>
-      </form>
-    </section>
-
-    <!-- ============ ROUTES TAB ============ -->
-    <section x-show="tab==='routes'" x-transition>
-      <!-- alpha.16: toolbar = heading | Group-by dropdown | Add route button. -->
-      <div class="flex items-center justify-between mb-4 flex-wrap gap-3">
-        <div>
-          <h2 class="text-base font-semibold">Routes</h2>
-          <p class="text-sm text-gray-500" x-show="config.domain">
-            Hostnames under <span class="font-mono" x-text="config.domain"></span>;
-            use <span class="font-mono">@</span> or empty for the apex.
-          </p>
-        </div>
-        <div class="flex items-center gap-3">
-          <label class="text-xs text-gray-600 flex items-center gap-1.5">
-            Group by:
-            <select :value="groupBy"
-                    @change="setGroupBy($event.target.value)"
-                    class="border rounded px-2 py-1 bg-white text-xs">
-              <template x-for="opt in groupByOptions" :key="opt.value">
-                <option :value="opt.value" :selected="groupBy === opt.value" x-text="opt.label"></option>
-              </template>
-            </select>
-          </label>
-          <button @click="startComposeRoute()"
-                  :disabled="_composeRoute !== null || viewMode === 'ro'"
-                  :title="_composeRoute !== null ? 'Finish the route you started above first' : ''"
-                  class="px-3 py-1.5 rounded bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 disabled:bg-gray-400">
-            Add route
+        <div x-show="restartRequired" x-transition
+             class="mb-4 p-3 rounded border border-amber-300 bg-amber-50 text-sm text-amber-900 flex items-center justify-between gap-3">
+          <span>
+            Configuration saved. <strong>Restart the add-on</strong>
+            so Traefik picks up the new settings.
+          </span>
+          <button @click="restartAddon()" :disabled="restarting"
+                  class="shrink-0 px-3 py-1.5 rounded bg-amber-600 text-white text-sm font-medium hover:bg-amber-700 disabled:bg-gray-500">
+            <span x-show="!restarting">Restart now</span>
+            <span x-show="restarting">Restarting...</span>
           </button>
         </div>
-      </div>
 
-      <!-- ============ NEW ROUTE COMPOSE PANEL (alpha.22) ============
-           Renders ONLY while _composeRoute !== null. The in-progress route
-           lives outside this.routes so it doesn't shuffle through the
-           grouped/sorted table as the user fills in fields, and so that
-           partial state (empty hostname / port) doesn't trigger
-           validation-failing auto-save PUTs. On Create it gets a uuid +
-           is pushed into this.routes; the watcher then fires auto-save.
-           -->
-      <template x-if="_composeRoute !== null">
-        <div class="mb-4 p-4 rounded-lg border-2 border-blue-300 bg-blue-50/50 shadow-sm">
-          <div class="flex items-center justify-between mb-3">
-            <h3 class="text-sm font-semibold text-blue-900">New route</h3>
-            <span class="text-xs text-gray-600">Fill in the required fields, then click <strong>Create</strong>. Nothing is sent to Traefik until you Apply.</span>
+        <!-- alpha.12: per-section load-failure panel. Render INSTEAD of the
+             form so the user can't edit empty data and accidentally save it. -->
+        <div x-show="loadFailed.config" x-transition
+             class="mb-4 p-4 rounded border border-red-300 bg-red-50 text-sm text-red-900 flex items-start justify-between gap-3">
+          <div>
+            <strong>Couldn't load configuration.</strong>
+            <div class="font-mono text-xs mt-1 whitespace-pre-wrap" x-text="loadFailed.config"></div>
           </div>
-
-          <div class="space-y-3 max-w-3xl">
-            <!-- Hostname -->
-            <div>
-              <label class="block text-xs text-gray-600 mb-0.5">Hostname <span class="text-red-600">*</span></label>
-              <input type="text" x-model="_composeRoute.hostname"
-                     placeholder="cloud or cloud.example.com"
-                     :class="composeHostnameError ? 'border-red-400 bg-red-50' : 'bg-white'"
-                     class="font-mono border rounded px-2 py-1 w-64">
-              <p x-show="composeHostnameError" class="text-[10px] text-red-700 mt-0.5" x-text="composeHostnameError"></p>
-            </div>
-
-            <!-- Backend kind + host/port -->
-            <div class="flex gap-3 items-end flex-wrap">
-              <div>
-                <label class="block text-xs text-gray-600 mb-0.5">Backend</label>
-                <select x-model="_composeRoute.backend_kind" class="border rounded px-2 py-1 bg-white">
-                  <option value="home_assistant">Home Assistant</option>
-                  <option value="external">External</option>
-                </select>
-              </div>
-              <div x-show="_composeRoute.backend_kind === 'external'" class="flex gap-1 items-end">
-                <div>
-                  <label class="block text-[10px] text-gray-500 mb-0.5">host <span class="text-red-600">*</span></label>
-                  <input type="text" x-model="_composeRoute.backend_host" placeholder="10.0.0.20"
-                         :class="composeBackendHostError ? 'border-red-400 bg-red-50' : 'bg-white'"
-                         class="font-mono border rounded px-2 py-1 w-40">
-                  <p x-show="composeBackendHostError" class="text-[10px] text-red-700 mt-0.5" x-text="composeBackendHostError"></p>
-                </div>
-                <div>
-                  <label class="block text-[10px] text-gray-500 mb-0.5">port <span class="text-red-600">*</span></label>
-                  <input type="number" x-model.number="_composeRoute.backend_port" placeholder="443"
-                         min="1" max="65535"
-                         :class="composeBackendPortError ? 'border-red-400 bg-red-50' : 'bg-white'"
-                         class="font-mono border rounded px-2 py-1 w-24">
-                  <p x-show="composeBackendPortError" class="text-[10px] text-red-700 mt-0.5" x-text="composeBackendPortError"></p>
-                </div>
-              </div>
-            </div>
-
-            <!-- Scheme + TLS + Skip TLS verify -->
-            <div class="flex gap-4 items-end flex-wrap">
-              <div>
-                <label class="block text-xs text-gray-600 mb-0.5">Scheme</label>
-                <select x-model="_composeRoute.scheme"
-                        class="border rounded px-2 py-1 bg-white"
-                        :disabled="_composeRoute.backend_kind === 'home_assistant'">
-                  <option value="http">http</option>
-                  <option value="https">https</option>
-                </select>
-              </div>
-              <label class="flex items-center gap-1.5 text-sm pb-1.5">
-                <input type="checkbox" x-model="_composeRoute.tls">
-                TLS on (front-side)
-              </label>
-              <label x-show="_composeRoute.scheme === 'https'" class="flex items-center gap-1.5 text-sm pb-1.5">
-                <input type="checkbox" x-model="_composeRoute.skip_tls_verify">
-                Skip TLS verify on backend
-              </label>
-            </div>
-
-            <!-- Actions -->
-            <div class="flex items-center gap-2 pt-2 border-t border-blue-200">
-              <button @click="commitComposeRoute()"
-                      :disabled="!isComposeRouteValid"
-                      :title="!isComposeRouteValid ? 'Fill in the required fields first' : 'Add the route to the table; auto-save will draft it'"
-                      class="px-4 py-1.5 rounded bg-blue-600 text-white text-sm font-semibold hover:bg-blue-700 disabled:bg-gray-400">
-                Create
-              </button>
-              <button @click="cancelComposeRoute()"
-                      class="px-3 py-1.5 rounded border bg-white text-sm font-medium hover:bg-gray-50">
-                Cancel
-              </button>
-              <span class="text-xs text-gray-500 ml-1">Required fields are marked <span class="text-red-600">*</span>. Other fields (middlewares, health check) are available after creation in the row editor.</span>
-            </div>
-          </div>
+          <button @click="loadConfig()"
+                  class="shrink-0 px-3 py-1.5 rounded bg-red-600 text-white text-sm font-medium hover:bg-red-700">
+            Reload
+          </button>
         </div>
-      </template>
 
-      <!-- alpha.12: per-section load-failure panel. Render INSTEAD of the
-           form / table so a stale load can't be 'fixed' by clicking Save. -->
-      <div x-show="loadFailed.routes" x-transition
-           class="mb-3 p-4 rounded border border-red-300 bg-red-50 text-sm text-red-900 flex items-start justify-between gap-3">
-        <div>
-          <strong>Couldn't load routes.</strong>
-          <div class="font-mono text-xs mt-1 whitespace-pre-wrap" x-text="loadFailed.routes"></div>
-        </div>
-        <button @click="loadRoutes()"
-                class="shrink-0 px-3 py-1.5 rounded bg-red-600 text-white text-sm font-medium hover:bg-red-700">
-          Reload
-        </button>
-      </div>
-
-      <div x-show="!loadFailed.routes && routes.length === 0" class="p-8 text-center text-gray-400 border border-dashed rounded">
-        No routes yet. Click <span class="font-medium">Add route</span> to create one.
-      </div>
-
-      <div x-show="systemRowInvalid" x-transition
-           class="mb-3 p-3 rounded border border-amber-300 bg-amber-50 text-sm text-amber-900">
-        The Home Assistant system route has no hostname. Type one (or disable it) before saving.
-      </div>
-
-      <!-- alpha.16: compact rows by default with inline-expandable editor.
-           Each item in routesTableItems is rendered as its own <tbody>:
-           - {type:'header'} → group header row (collapsible)
-           - {type:'route'} → compact row + optional expanded editor row
-           Per-tbody iteration is the only Alpine pattern that emits two
-           <tr>s per route inside a single x-for body. -->
-      <div x-show="!loadFailed.routes && routes.length > 0" class="overflow-x-auto">
-      <table class="w-full min-w-[720px] border-collapse text-sm">
-        <thead>
-          <!-- alpha.19: column headers are click-to-sort buttons. asc → desc →
-               clear cycle; chevron-up/-down indicator on the active column.
-               System rows still pin to the top of their group (see
-               _sortRoutes). Tags column removed. -->
-          <tr class="text-left border-b text-[11px] uppercase tracking-wide text-gray-500">
-            <th class="py-2 pr-1 w-8"></th>                <!-- chevron -->
-            <th class="py-2 pr-2 w-12">
-              <button type="button"
-                      class="uppercase tracking-wide hover:text-gray-900 flex items-center gap-0.5"
-                      :aria-sort="sortKey === 'enabled' ? (sortDir === 'desc' ? 'descending' : 'ascending') : 'none'"
-                      @click="toggleSort('enabled')">
-                <span>On</span>
-                <span x-show="sortKey === 'enabled'"
-                      x-html="icon(sortIndicator('enabled'), 'w-3 h-3 inline-block')"></span>
-              </button>
-            </th>
-            <th class="py-2 pr-3">
-              <button type="button"
-                      class="uppercase tracking-wide hover:text-gray-900 flex items-center gap-0.5"
-                      :aria-sort="sortKey === 'hostname' ? (sortDir === 'desc' ? 'descending' : 'ascending') : 'none'"
-                      @click="toggleSort('hostname')">
-                <span>Hostname</span>
-                <span x-show="sortKey === 'hostname'"
-                      x-html="icon(sortIndicator('hostname'), 'w-3 h-3 inline-block')"></span>
-              </button>
-            </th>
-            <th class="py-2 pr-3">
-              <button type="button"
-                      class="uppercase tracking-wide hover:text-gray-900 flex items-center gap-0.5"
-                      :aria-sort="sortKey === 'backend' ? (sortDir === 'desc' ? 'descending' : 'ascending') : 'none'"
-                      @click="toggleSort('backend')">
-                <span>Backend</span>
-                <span x-show="sortKey === 'backend'"
-                      x-html="icon(sortIndicator('backend'), 'w-3 h-3 inline-block')"></span>
-              </button>
-            </th>
-            <th class="py-2 pr-3 w-24">
-              <button type="button"
-                      class="uppercase tracking-wide hover:text-gray-900 flex items-center gap-0.5"
-                      :aria-sort="sortKey === 'scheme' ? (sortDir === 'desc' ? 'descending' : 'ascending') : 'none'"
-                      @click="toggleSort('scheme')">
-                <span>Scheme</span>
-                <span x-show="sortKey === 'scheme'"
-                      x-html="icon(sortIndicator('scheme'), 'w-3 h-3 inline-block')"></span>
-              </button>
-            </th>
-            <th class="py-2 w-20"></th>                    <!-- actions / System pill -->
-          </tr>
-        </thead>
-        <template x-for="item in routesTableItems" :key="item._key">
-          <tbody>
-            <!-- ============ GROUP HEADER ============ -->
-            <template x-if="item.type === 'header'">
-              <tr class="bg-gray-100 border-b cursor-pointer hover:bg-gray-200 select-none"
-                  @click="toggleGroupCollapsed(item.key)">
-                <td colspan="6" class="py-1.5 px-2 text-xs">
-                  <span class="inline-block text-gray-500 align-middle mr-0.5"
-                        x-html="icon(isGroupCollapsed(item.key) ? 'chevron-right' : 'chevron-down', 'w-4 h-4 inline-block')"></span>
-                  <span class="font-semibold text-gray-700" x-text="item.label"></span>
-                  <span class="text-gray-500 ml-1" x-text="'(' + item.count + ')'"></span>
-                </td>
-              </tr>
-            </template>
-
-            <!-- ============ COMPACT ROUTE ROW ============ -->
-            <template x-if="item.type === 'route'">
-              <tr :class="item.r._orphan
-                            ? 'bg-red-50/40 border-b border-red-100 line-through text-gray-500'
-                            : (item.r.system
-                                ? 'bg-blue-50 border-b border-blue-200'
-                                : 'border-b hover:bg-gray-50')">
-                <!-- Chevron: expand/collapse the editor below. alpha.20:
-                     orphan rows (soft-deleted) can't be edited; render a
-                     placeholder dash instead of the toggle. -->
-                <td class="py-2 pr-1 text-center">
-                  <template x-if="!item.r._orphan">
-                    <button type="button"
-                            @click="toggleRouteExpanded(item.r)"
-                            :aria-expanded="item.r._expanded"
-                            :aria-label="(item.r._expanded ? 'Collapse' : 'Expand') + ' editor for route ' + (item.r.hostname || 'unnamed')"
-                            class="text-gray-500 hover:text-gray-900 leading-none align-middle"
-                            x-html="icon(item.r._expanded ? 'chevron-down' : 'chevron-right', 'w-4 h-4 inline-block')"></button>
-                  </template>
-                  <template x-if="item.r._orphan">
-                    <span class="text-gray-300 text-xs" aria-hidden="true">—</span>
-                  </template>
-                </td>
-                <!-- Enabled: checkbox for user, static for system -->
-                <td class="py-2 pr-2">
-                  <template x-if="item.r.system">
-                    <span class="text-xs text-gray-700" x-text="item.r.enabled ? 'On' : 'Off'"></span>
-                  </template>
-                  <template x-if="!item.r.system">
-                    <input type="checkbox" x-model="item.r.enabled">
-                  </template>
-                </td>
-                <!-- Hostname (read-only display in compact view) + status dot +
-                     alpha.20: amber "modified" dot on the left when this row
-                     differs from live. -->
-                <td class="py-2 pr-3">
-                  <div class="flex items-center gap-2">
-                    <span x-show="isRouteDirty(item.r.rid)"
-                          class="shrink-0 w-2 h-2 rounded-full bg-amber-500"
-                          title="Pending change in this route"
-                          aria-label="Pending change"
-                          role="img"></span>
-                    <span class="shrink-0 w-2.5 h-2.5 rounded-full"
-                          :class="routeStatusColor(item.r)"
-                          :title="routeStatusTitle(item.r)"
-                          :aria-label="routeStatusTitle(item.r)"
-                          role="img"></span>
-                    <span class="sr-only" x-text="routeStatusTitle(item.r)"></span>
-                    <span class="font-mono text-sm" x-text="item.r.hostname || '(unnamed)'"></span>
-                  </div>
-                </td>
-                <!-- Backend summary -->
-                <td class="py-2 pr-3 text-xs text-gray-700">
-                  <span class="font-mono" x-text="compactBackendLabel(item.r)"></span>
-                </td>
-                <!-- Scheme + TLS + Skip TLS marker, all inline.
-                     alpha.18: lock + shield-alert are vendored MDI SVGs
-                     (was 🔒 + amber "skip-tls" text — the text marker
-                     wrapped narrow rows; the icon stays inline). -->
-                <td class="py-2 pr-3 text-xs whitespace-nowrap">
-                  <span class="font-mono align-middle" x-text="item.r.scheme"></span>
-                  <span x-show="item.r.tls" class="text-gray-500 ml-1 align-middle inline-block"
-                        aria-label="TLS enabled" title="TLS"
-                        x-html="icon('lock', 'w-3.5 h-3.5 inline-block')"></span>
-                  <span x-show="item.r.skip_tls_verify && item.r.scheme === 'https'"
-                        class="text-amber-600 ml-1 align-middle inline-block"
-                        aria-label="Skip TLS verify on backend"
-                        title="Skip TLS verify on backend"
-                        x-html="icon('shield-alert', 'w-3.5 h-3.5 inline-block')"></span>
-                </td>
-                <!-- Actions: System pill for system rows, Restore for orphan
-                     rows (alpha.20 soft-delete), Remove button for user rows -->
-                <td class="py-2 text-right pr-2">
-                  <template x-if="item.r._orphan">
-                    <button @click="restoreRoute(item.r.rid)"
-                            :aria-label="'Restore route ' + (item.r.hostname || 'unnamed')"
-                            class="text-blue-700 hover:text-blue-900 text-sm no-underline"
-                            title="Restore (was Removed; pending until Apply)">
-                      Restore
-                    </button>
-                  </template>
-                  <template x-if="!item.r._orphan && item.r.system">
-                    <span class="inline-block px-1.5 py-0.5 text-[10px] font-semibold rounded bg-blue-200 text-blue-900 uppercase tracking-wide">System</span>
-                  </template>
-                  <template x-if="!item.r._orphan && !item.r.system">
-                    <button @click="removeRoute(item.r)"
-                            :aria-label="'Remove route ' + (item.r.hostname || 'unnamed')"
-                            class="text-red-600 hover:text-red-800 text-sm" title="Remove">
-                      Remove
-                    </button>
-                  </template>
-                </td>
-              </tr>
-            </template>
-
-            <!-- ============ EXPANDED EDITOR ROW ============ -->
-            <template x-if="item.type === 'route' && item.r._expanded">
-              <tr :class="item.r.system ? 'bg-blue-50 border-b border-blue-200' : 'border-b bg-gray-50'">
-                <td></td>
-                <td colspan="6" class="py-3 pr-3 pl-1">
-                  <div class="space-y-3 max-w-3xl">
-                    <!-- Hostname (always editable; system route allows hostname change) -->
-                    <div>
-                      <label class="block text-xs text-gray-600 mb-0.5">Hostname</label>
-                      <!-- alpha.21: amber accent + undo icon when value differs from live -->
-                      <div class="flex items-center gap-1.5">
-                        <input type="text" x-model="item.r.hostname"
-                               class="font-mono border rounded px-2 py-1 w-64"
-                               :class="isFieldDirty('routes', item.r.rid, 'hostname') ? 'border-amber-400 bg-amber-50' : 'bg-white'"
-                               :placeholder="item.r.system ? 'hass' : 'cloud or cloud.example.com'">
-                        <button x-show="isFieldDirty('routes', item.r.rid, 'hostname')"
-                                @click="discardField('routes', item.r.rid, 'hostname')"
-                                type="button"
-                                title="Revert hostname to live value"
-                                aria-label="Revert hostname"
-                                class="text-amber-700 hover:text-amber-900 inline-flex"
-                                x-html="icon('undo', 'w-4 h-4 inline-block')"></button>
-                      </div>
-                    </div>
-
-                    <!-- Backend, Scheme, TLS, Middlewares, Health: user routes only.
-                         System row: those fields are server-locked. -->
-                    <template x-if="!item.r.system">
-                      <div class="space-y-3">
-                        <!-- Backend kind + host/port -->
-                        <div class="flex gap-3 items-end flex-wrap">
-                          <div>
-                            <label class="block text-xs text-gray-600 mb-0.5">Backend</label>
-                            <div class="flex items-center gap-1.5">
-                              <select x-model="item.r.backend_kind" class="border rounded px-2 py-1"
-                                      :class="isFieldDirty('routes', item.r.rid, 'backend_kind') ? 'border-amber-400 bg-amber-50' : 'bg-white'">
-                                <option value="home_assistant">Home Assistant</option>
-                                <option value="external">External</option>
-                              </select>
-                              <button x-show="isFieldDirty('routes', item.r.rid, 'backend_kind')"
-                                      @click="discardField('routes', item.r.rid, 'backend_kind')"
-                                      type="button" title="Revert backend kind to live"
-                                      class="text-amber-700 hover:text-amber-900 inline-flex"
-                                      x-html="icon('undo', 'w-4 h-4 inline-block')"></button>
-                            </div>
-                          </div>
-                          <div x-show="item.r.backend_kind === 'external'" class="flex gap-1 items-end">
-                            <div>
-                              <label class="block text-[10px] text-gray-500 mb-0.5">host</label>
-                              <div class="flex items-center gap-1.5">
-                                <input type="text" x-model="item.r.backend_host" placeholder="10.0.0.20"
-                                       class="font-mono border rounded px-2 py-1 w-40"
-                                       :class="isFieldDirty('routes', item.r.rid, 'backend_host') ? 'border-amber-400 bg-amber-50' : 'bg-white'">
-                                <button x-show="isFieldDirty('routes', item.r.rid, 'backend_host')"
-                                        @click="discardField('routes', item.r.rid, 'backend_host')"
-                                        type="button" title="Revert backend host to live"
-                                        class="text-amber-700 hover:text-amber-900 inline-flex"
-                                        x-html="icon('undo', 'w-4 h-4 inline-block')"></button>
-                              </div>
-                            </div>
-                            <div>
-                              <label class="block text-[10px] text-gray-500 mb-0.5">port</label>
-                              <div class="flex items-center gap-1.5">
-                                <input type="number" x-model.number="item.r.backend_port" placeholder="443"
-                                       min="1" max="65535"
-                                       class="font-mono border rounded px-2 py-1 w-24"
-                                       :class="isFieldDirty('routes', item.r.rid, 'backend_port') ? 'border-amber-400 bg-amber-50' : 'bg-white'">
-                                <button x-show="isFieldDirty('routes', item.r.rid, 'backend_port')"
-                                        @click="discardField('routes', item.r.rid, 'backend_port')"
-                                        type="button" title="Revert backend port to live"
-                                        class="text-amber-700 hover:text-amber-900 inline-flex"
-                                        x-html="icon('undo', 'w-4 h-4 inline-block')"></button>
-                              </div>
-                            </div>
-                          </div>
-                        </div>
-
-                        <!-- Scheme + TLS + Skip TLS verify (alpha.21: per-field diff + undo) -->
-                        <div class="flex gap-4 items-end flex-wrap">
-                          <div>
-                            <label class="block text-xs text-gray-600 mb-0.5">Scheme</label>
-                            <div class="flex items-center gap-1.5">
-                              <select x-model="item.r.scheme" @change="onRouteSchemeChange(item.r)"
-                                      class="border rounded px-2 py-1"
-                                      :class="isFieldDirty('routes', item.r.rid, 'scheme') ? 'border-amber-400 bg-amber-50' : 'bg-white'"
-                                      :disabled="item.r.backend_kind === 'home_assistant'">
-                                <option value="http">http</option>
-                                <option value="https">https</option>
-                              </select>
-                              <button x-show="isFieldDirty('routes', item.r.rid, 'scheme')"
-                                      @click="discardField('routes', item.r.rid, 'scheme')"
-                                      type="button" title="Revert scheme to live"
-                                      class="text-amber-700 hover:text-amber-900 inline-flex"
-                                      x-html="icon('undo', 'w-4 h-4 inline-block')"></button>
-                            </div>
-                          </div>
-                          <label class="flex items-center gap-1.5 text-sm pb-1.5">
-                            <input type="checkbox" x-model="item.r.tls">
-                            TLS on (front-side)
-                            <button x-show="isFieldDirty('routes', item.r.rid, 'tls')"
-                                    @click.prevent.stop="discardField('routes', item.r.rid, 'tls')"
-                                    type="button" title="Revert TLS to live"
-                                    class="text-amber-700 hover:text-amber-900 inline-flex"
-                                    x-html="icon('undo', 'w-3.5 h-3.5 inline-block')"></button>
-                          </label>
-                          <label x-show="item.r.scheme === 'https'" class="flex items-center gap-1.5 text-sm pb-1.5">
-                            <input type="checkbox" x-model="item.r.skip_tls_verify">
-                            Skip TLS verify on backend
-                            <button x-show="isFieldDirty('routes', item.r.rid, 'skip_tls_verify')"
-                                    @click.prevent.stop="discardField('routes', item.r.rid, 'skip_tls_verify')"
-                                    type="button" title="Revert Skip TLS verify to live"
-                                    class="text-amber-700 hover:text-amber-900 inline-flex"
-                                    x-html="icon('undo', 'w-3.5 h-3.5 inline-block')"></button>
-                          </label>
-                        </div>
-
-                        <!-- Middlewares (alpha.12 combobox preserved verbatim) -->
-                        <div>
-                          <label class="block text-xs text-gray-600 mb-0.5">Middlewares</label>
-                          <div class="relative w-64"
-                               x-data="{ open: false, activeIdx: -1 }"
-                               @click.outside="open = false"
-                               @keydown.escape.prevent="if (open) { open = false; $refs.trigger.focus(); }">
-                            <button type="button"
-                                    x-ref="trigger"
-                                    @click="open = !open; activeIdx = open ? 0 : -1"
-                                    @keydown.arrow-down.prevent="if (!open) { open = true; activeIdx = 0; } else { activeIdx = Math.min(eligibleRouteMiddlewares().length - 1, activeIdx + 1); }"
-                                    @keydown.arrow-up.prevent="if (open) activeIdx = Math.max(0, activeIdx - 1);"
-                                    @keydown.home.prevent="if (open) activeIdx = 0"
-                                    @keydown.end.prevent="if (open) activeIdx = eligibleRouteMiddlewares().length - 1"
-                                    @keydown.enter.prevent="if (open && activeIdx >= 0) { const mw = eligibleRouteMiddlewares()[activeIdx]; if (mw) toggleRouteMiddleware(item.r, mw.name, !(item.r.middlewares || []).includes(mw.name)); }"
-                                    @keydown.space.prevent="if (!open) { open = true; activeIdx = 0; } else if (activeIdx >= 0) { const mw = eligibleRouteMiddlewares()[activeIdx]; if (mw) toggleRouteMiddleware(item.r, mw.name, !(item.r.middlewares || []).includes(mw.name)); }"
-                                    @keydown.tab="open = false"
-                                    role="combobox"
-                                    aria-haspopup="listbox"
-                                    :aria-expanded="open"
-                                    :aria-controls="'lb-route-' + item.r._uid"
-                                    :aria-activedescendant="open && activeIdx >= 0 ? 'opt-route-' + item.r._uid + '-' + activeIdx : null"
-                                    :aria-label="'Middlewares: ' + routeMwSummary(item.r)"
-                                    class="border rounded px-2 py-1 w-full text-sm flex justify-between items-center gap-1 hover:bg-gray-50 bg-white">
-                              <span class="font-mono truncate" x-text="routeMwSummary(item.r)"></span>
-                              <span class="text-gray-400" aria-hidden="true">&#9662;</span>
-                            </button>
-                            <ul x-show="open" x-transition
-                                role="listbox"
-                                aria-multiselectable="true"
-                                :id="'lb-route-' + item.r._uid"
-                                class="absolute z-10 mt-1 w-full bg-white border rounded shadow-lg p-1 max-h-40 overflow-y-auto">
-                              <template x-if="!eligibleRouteMiddlewares().length">
-                                <li role="presentation" class="text-gray-400 text-xs px-1 py-0.5">No middlewares defined</li>
-                              </template>
-                              <template x-for="(mw, i) in eligibleRouteMiddlewares()" :key="mw.name">
-                                <li role="option"
-                                    :id="'opt-route-' + item.r._uid + '-' + i"
-                                    :aria-selected="(item.r.middlewares || []).includes(mw.name)"
-                                    @click="toggleRouteMiddleware(item.r, mw.name, !(item.r.middlewares || []).includes(mw.name))"
-                                    @mouseenter="activeIdx = i"
-                                    :class="activeIdx === i ? 'bg-blue-50' : 'hover:bg-gray-50'"
-                                    class="flex items-center gap-1.5 py-0.5 px-1 cursor-pointer rounded">
-                                  <input type="checkbox"
-                                         :checked="(item.r.middlewares || []).includes(mw.name)"
-                                         tabindex="-1"
-                                         @click.stop="toggleRouteMiddleware(item.r, mw.name, $event.target.checked)">
-                                  <span class="font-mono text-xs" x-text="mw.name"></span>
-                                </li>
-                              </template>
-                              <template x-for="mw in (item.r.middlewares || []).filter(n => !middlewares.some(m => m.name === n))" :key="'orphan-'+mw">
-                                <li role="option" aria-selected="true"
-                                    @click="toggleRouteMiddleware(item.r, mw, false)"
-                                    class="flex items-center gap-1.5 py-0.5 px-1 cursor-pointer hover:bg-gray-50 rounded">
-                                  <input type="checkbox" checked tabindex="-1"
-                                         @click.stop="toggleRouteMiddleware(item.r, mw, $event.target.checked)">
-                                  <span class="font-mono text-xs text-amber-700" x-text="mw + ' (missing)'"></span>
-                                </li>
-                              </template>
-                            </ul>
-                          </div>
-                        </div>
-
-                        <!-- Health check path -->
-                        <div>
-                          <label class="block text-xs text-gray-600 mb-0.5">Backend health check path</label>
-                          <input type="text" :value="item.r.health_path || ''"
-                                 @input="item.r.health_path = $event.target.value || null"
-                                 placeholder="/"
-                                 class="font-mono border rounded px-2 py-1 w-40">
-                        </div>
-                      </div>
-                    </template>
-
-                    <!-- System-route footer hint -->
-                    <template x-if="item.r.system">
-                      <div class="text-xs text-gray-600 border-t border-blue-200 pt-2">
-                        <strong>System route.</strong> Backend, scheme, TLS, middlewares, and Skip-TLS are
-                        add-on-managed; only the hostname can be edited here.
-                      </div>
-                    </template>
-                  </div>
-                </td>
-              </tr>
-            </template>
-          </tbody>
-        </template>
-      </table>
-      </div>
-
-      <!-- alpha.20: per-tab Save/Discard footers removed. Auto-save flushes
-           every edit to the draft (debounced); the sticky Apply footer at
-           the bottom of the page commits draft -> live for ALL surfaces. -->
-    </section>
-
-    <!-- ============ MIDDLEWARES TAB ============ -->
-    <section x-show="tab==='middlewares'" x-transition>
-      <div class="flex items-center justify-between mb-4">
-        <div>
-          <h2 class="text-base font-semibold">Middlewares</h2>
-          <p class="text-sm text-gray-500">
-            Define basicAuth, IP allow-lists, HTTP→HTTPS redirects, and custom headers.
-            Reference them by name in a route's <span class="font-mono">Middlewares</span> column.
-          </p>
-        </div>
-        <button @click="addMiddleware()"
-                class="px-3 py-1.5 rounded bg-blue-600 text-white text-sm font-medium hover:bg-blue-700">
-          Add middleware
-        </button>
-      </div>
-
-      <!-- alpha.12: per-section load-failure panel. -->
-      <div x-show="loadFailed.middlewares" x-transition
-           class="mb-3 p-4 rounded border border-red-300 bg-red-50 text-sm text-red-900 flex items-start justify-between gap-3">
-        <div>
-          <strong>Couldn't load middlewares.</strong>
-          <div class="font-mono text-xs mt-1 whitespace-pre-wrap" x-text="loadFailed.middlewares"></div>
-        </div>
-        <button @click="loadMiddlewares()"
-                class="shrink-0 px-3 py-1.5 rounded bg-red-600 text-white text-sm font-medium hover:bg-red-700">
-          Reload
-        </button>
-      </div>
-
-      <div x-show="!loadFailed.middlewares && visibleMiddlewares.length === 0" class="p-8 text-center text-gray-400 border border-dashed rounded">
-        No middlewares yet. Click <span class="font-medium">Add middleware</span> to create one.
-      </div>
-
-      <div x-show="!loadFailed.middlewares" class="space-y-4">
-        <!-- alpha.14: list visibleMiddlewares (drops every entry that's
-             owned by a feature toggle elsewhere — see FEATURE_MANAGED_MIDDLEWARES
-             in app.js). One filter rule, one source of truth. -->
-        <template x-for="m in visibleMiddlewares" :key="m._uid">
-          <div class="border rounded p-4 bg-white">
-            <div class="flex items-start gap-3 mb-3">
-              <div class="flex-1">
-                <label class="block text-xs font-medium text-gray-600 mb-1">
-                  Name
-                  <span x-show="m.system"
-                        class="ml-1 inline-block px-1.5 py-0.5 rounded bg-gray-200 text-gray-600 text-[10px] align-middle">Built-in</span>
-                </label>
-                <input type="text" x-model="m.name"
-                       :readonly="m.system"
-                       placeholder="my-middleware"
-                       class="font-mono border rounded px-2 py-1 w-full"
-                       :class="m.system ? 'bg-gray-100 text-gray-500 cursor-not-allowed' : ''">
-              </div>
-              <div class="w-48">
-                <label class="block text-xs font-medium text-gray-600 mb-1">Type</label>
-                <!-- Built-in: type is locked. Render it read-only (a <select> with
-                     a conditional <template> option is invalid HTML and breaks the
-                     :value binding, defaulting to the first option). -->
-                <template x-if="m.system">
-                  <div class="font-mono border rounded px-2 py-1 w-full bg-gray-100 text-gray-500"
-                       x-text="m.type"></div>
-                </template>
-                <template x-if="!m.system">
-                  <select :value="m.type"
-                          @change="changeMiddlewareType(m, $event.target.value)"
-                          class="border rounded px-2 py-1 w-full bg-white">
-                    <option value="basicAuth">basicAuth</option>
-                    <option value="ipAllowList">ipAllowList</option>
-                    <option value="redirectScheme">redirectScheme</option>
-                    <option value="headers">headers</option>
-                  </select>
-                </template>
-              </div>
-              <button x-show="!m.system" @click="removeMiddleware(m)"
-                      class="self-end text-red-600 hover:text-red-800 text-sm pb-1">Remove</button>
-              <span x-show="m.system"
-                    class="self-end text-xs text-gray-400 pb-1"
-                    title="Built-in middleware managed by the add-on">Locked</span>
-            </div>
-
-            <!-- alpha.12: inline type-change confirmation. Replaces the
-                 native confirm() that used to block on changeMiddlewareType. -->
-            <div x-show="m._pendingType" x-transition.opacity
-                 class="border-t pt-3 mt-2 -mb-1 flex items-center justify-between gap-3 bg-amber-50 -mx-4 px-4 py-2 rounded">
-              <span class="text-sm text-amber-900">
-                Switching to <span class="font-mono" x-text="m._pendingType"></span>
-                will discard the current configuration.
+        <form x-show="!loadFailed.config" @submit.prevent="saveConfig()" class="space-y-5">
+          <!-- alpha.21: per-field undo. Each block wraps the input in a flex
+               row so the undo icon sits to the right; the amber border /
+               background lights up when the value differs from live. -->
+          <div class="flex items-start gap-2 p-3 rounded border bg-gray-50">
+            <input type="checkbox" id="force_ssl" x-model="config.force_ssl" class="mt-0.5">
+            <label for="force_ssl" class="text-sm">
+              <span class="font-medium">Force SSL</span>
+              <button x-show="isFieldDirty('config', null, 'force_ssl')"
+                      @click.prevent.stop="discardField('config', null, 'force_ssl')"
+                      type="button" title="Revert Force SSL to live"
+                      class="ml-1 text-amber-700 hover:text-amber-900 inline-flex"
+                      x-html="icon('undo', 'w-3.5 h-3.5 inline-block')"></button>
+              <span class="block text-xs text-gray-500 mt-0.5">
+                Redirect every HTTP request to HTTPS at the entry point (301),
+                globally — supersedes per-route redirects. HTTP-only routes (TLS
+                off) are not served while this is on, because they have no HTTPS
+                router to redirect to. Applies on add-on restart.
               </span>
-              <div class="flex items-center gap-2 shrink-0">
-                <button @click="confirmTypeChange(m)"
-                        class="px-3 py-1 rounded bg-amber-600 text-white text-xs font-medium hover:bg-amber-700">
-                  Discard and switch
+            </label>
+          </div>
+          <div>
+            <label class="block text-sm font-medium mb-1">Log level</label>
+            <div class="flex items-center gap-1.5">
+              <select x-model="config.log_level"
+                      class="block w-full border rounded px-3 py-2"
+                      :class="isFieldDirty('config', null, 'log_level') ? 'border-amber-400 bg-amber-50' : 'bg-white'">
+                <option value="DEBUG">DEBUG</option>
+                <option value="INFO">INFO</option>
+                <option value="WARN">WARN</option>
+                <option value="ERROR">ERROR</option>
+                <option value="FATAL">FATAL</option>
+              </select>
+              <button x-show="isFieldDirty('config', null, 'log_level')"
+                      @click="discardField('config', null, 'log_level')"
+                      type="button" title="Revert log level to live"
+                      class="text-amber-700 hover:text-amber-900 inline-flex"
+                      x-html="icon('undo', 'w-4 h-4 inline-block')"></button>
+            </div>
+          </div>
+
+          <div>
+            <label class="block text-sm font-medium mb-1" for="cfg-ep-http">HTTP entry point name</label>
+            <div class="flex items-center gap-1.5">
+              <input id="cfg-ep-http" type="text" x-model="config.entrypoint_http"
+                     @blur="normalizeEntrypoint('entrypoint_http')"
+                     placeholder="web"
+                     :aria-invalid="!!entrypointHttpError"
+                     :class="entrypointHttpError
+                             ? 'border-red-400'
+                             : (isFieldDirty('config', null, 'entrypoint_http') ? 'border-amber-400 bg-amber-50' : '')"
+                     class="block w-full font-mono border rounded px-3 py-2">
+              <button x-show="isFieldDirty('config', null, 'entrypoint_http')"
+                      @click="discardField('config', null, 'entrypoint_http')"
+                      type="button" title="Revert HTTP entry point to live"
+                      class="text-amber-700 hover:text-amber-900 inline-flex"
+                      x-html="icon('undo', 'w-4 h-4 inline-block')"></button>
+            </div>
+            <p x-show="entrypointHttpError" class="text-xs text-red-700 mt-1" x-text="entrypointHttpError"></p>
+            <p class="text-xs text-gray-500 mt-1">
+              Name Traefik uses for the :80 listener.
+              Default <span class="font-mono">web</span>.
+            </p>
+          </div>
+
+          <div>
+            <label class="block text-sm font-medium mb-1" for="cfg-ep-https">HTTPS entry point name</label>
+            <div class="flex items-center gap-1.5">
+              <input id="cfg-ep-https" type="text" x-model="config.entrypoint_https"
+                     @blur="normalizeEntrypoint('entrypoint_https')"
+                     placeholder="websecure"
+                     :aria-invalid="!!entrypointHttpsError"
+                     :class="entrypointHttpsError
+                             ? 'border-red-400'
+                             : (isFieldDirty('config', null, 'entrypoint_https') ? 'border-amber-400 bg-amber-50' : '')"
+                     class="block w-full font-mono border rounded px-3 py-2">
+              <button x-show="isFieldDirty('config', null, 'entrypoint_https')"
+                      @click="discardField('config', null, 'entrypoint_https')"
+                      type="button" title="Revert HTTPS entry point to live"
+                      class="text-amber-700 hover:text-amber-900 inline-flex"
+                      x-html="icon('undo', 'w-4 h-4 inline-block')"></button>
+            </div>
+            <p x-show="entrypointHttpsError" class="text-xs text-red-700 mt-1" x-text="entrypointHttpsError"></p>
+            <p x-show="entrypointConflictError" class="text-xs text-red-700 mt-1" x-text="entrypointConflictError"></p>
+            <p class="text-xs text-gray-500 mt-1">
+              Name for the :443 listener.
+              Default <span class="font-mono">websecure</span>.
+            </p>
+          </div>
+
+          <div class="flex items-center gap-4 pt-2">
+            <!-- alpha.20: Save button removed — auto-save flushes edits to the
+                 draft as you type (1500ms debounce on this form for regex-
+                 validated fields). Apply (sticky footer) commits draft -> live. -->
+            <button type="button" @click="openWizard()"
+                    class="text-sm text-blue-600 hover:text-blue-800 underline">
+              Re-run setup wizard
+            </button>
+            <span x-show="autoSaveError.config" class="text-xs text-red-700"
+                  x-text="'Auto-save error: ' + autoSaveError.config"></span>
+          </div>
+        </form>
+      </section>
+
+      <!-- ============ ROUTES TAB ============ -->
+      <section x-show="tab==='routes'" x-transition>
+        <!-- alpha.16: toolbar = heading | Group-by dropdown | Add route button. -->
+        <div class="flex items-center justify-between mb-4 flex-wrap gap-3">
+          <div>
+            <h2 class="text-base font-semibold">Routes</h2>
+            <p class="text-sm text-gray-500" x-show="config.domain">
+              Hostnames under <span class="font-mono" x-text="config.domain"></span>;
+              use <span class="font-mono">@</span> or empty for the apex.
+            </p>
+          </div>
+          <div class="flex items-center gap-3">
+            <label class="text-xs text-gray-600 flex items-center gap-1.5">
+              Group by:
+              <select :value="groupBy"
+                      @change="setGroupBy($event.target.value)"
+                      class="border rounded px-2 py-1 bg-white text-xs">
+                <template x-for="opt in groupByOptions" :key="opt.value">
+                  <option :value="opt.value" :selected="groupBy === opt.value" x-text="opt.label"></option>
+                </template>
+              </select>
+            </label>
+            <button @click="startComposeRoute()"
+                    :disabled="_composeRoute !== null || viewMode === 'ro'"
+                    :title="_composeRoute !== null ? 'Finish the route you started above first' : ''"
+                    class="px-3 py-1.5 rounded bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 disabled:bg-gray-400">
+              Add route
+            </button>
+          </div>
+        </div>
+
+        <!-- ============ NEW ROUTE COMPOSE PANEL (alpha.22) ============
+             Renders ONLY while _composeRoute !== null. The in-progress route
+             lives outside this.routes so it doesn't shuffle through the
+             grouped/sorted table as the user fills in fields, and so that
+             partial state (empty hostname / port) doesn't trigger
+             validation-failing auto-save PUTs. On Create it gets a uuid +
+             is pushed into this.routes; the watcher then fires auto-save.
+             -->
+        <template x-if="_composeRoute !== null">
+          <div class="mb-4 p-4 rounded-lg border-2 border-blue-300 bg-blue-50/50 shadow-sm">
+            <div class="flex items-center justify-between mb-3">
+              <h3 class="text-sm font-semibold text-blue-900">New route</h3>
+              <span class="text-xs text-gray-600">Fill in the required fields, then click <strong>Create</strong>. Nothing is sent to Traefik until you Apply.</span>
+            </div>
+
+            <div class="space-y-3 max-w-3xl">
+              <!-- Hostname -->
+              <div>
+                <label class="block text-xs text-gray-600 mb-0.5">Hostname <span class="text-red-600">*</span></label>
+                <input type="text" x-model="_composeRoute.hostname"
+                       placeholder="cloud or cloud.example.com"
+                       :class="composeHostnameError ? 'border-red-400 bg-red-50' : 'bg-white'"
+                       class="font-mono border rounded px-2 py-1 w-64">
+                <p x-show="composeHostnameError" class="text-[10px] text-red-700 mt-0.5" x-text="composeHostnameError"></p>
+              </div>
+
+              <!-- Backend kind + host/port -->
+              <div class="flex gap-3 items-end flex-wrap">
+                <div>
+                  <label class="block text-xs text-gray-600 mb-0.5">Backend</label>
+                  <select x-model="_composeRoute.backend_kind" class="border rounded px-2 py-1 bg-white">
+                    <option value="home_assistant">Home Assistant</option>
+                    <option value="external">External</option>
+                  </select>
+                </div>
+                <div x-show="_composeRoute.backend_kind === 'external'" class="flex gap-1 items-end">
+                  <div>
+                    <label class="block text-[10px] text-gray-500 mb-0.5">host <span class="text-red-600">*</span></label>
+                    <input type="text" x-model="_composeRoute.backend_host" placeholder="10.0.0.20"
+                           :class="composeBackendHostError ? 'border-red-400 bg-red-50' : 'bg-white'"
+                           class="font-mono border rounded px-2 py-1 w-40">
+                    <p x-show="composeBackendHostError" class="text-[10px] text-red-700 mt-0.5" x-text="composeBackendHostError"></p>
+                  </div>
+                  <div>
+                    <label class="block text-[10px] text-gray-500 mb-0.5">port <span class="text-red-600">*</span></label>
+                    <input type="number" x-model.number="_composeRoute.backend_port" placeholder="443"
+                           min="1" max="65535"
+                           :class="composeBackendPortError ? 'border-red-400 bg-red-50' : 'bg-white'"
+                           class="font-mono border rounded px-2 py-1 w-24">
+                    <p x-show="composeBackendPortError" class="text-[10px] text-red-700 mt-0.5" x-text="composeBackendPortError"></p>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Scheme + TLS + Skip TLS verify -->
+              <div class="flex gap-4 items-end flex-wrap">
+                <div>
+                  <label class="block text-xs text-gray-600 mb-0.5">Scheme</label>
+                  <select x-model="_composeRoute.scheme"
+                          class="border rounded px-2 py-1 bg-white"
+                          :disabled="_composeRoute.backend_kind === 'home_assistant'">
+                    <option value="http">http</option>
+                    <option value="https">https</option>
+                  </select>
+                </div>
+                <label class="flex items-center gap-1.5 text-sm pb-1.5">
+                  <input type="checkbox" x-model="_composeRoute.tls">
+                  TLS on (front-side)
+                </label>
+                <label x-show="_composeRoute.scheme === 'https'" class="flex items-center gap-1.5 text-sm pb-1.5">
+                  <input type="checkbox" x-model="_composeRoute.skip_tls_verify">
+                  Skip TLS verify on backend
+                </label>
+              </div>
+
+              <!-- Actions -->
+              <div class="flex items-center gap-2 pt-2 border-t border-blue-200">
+                <button @click="commitComposeRoute()"
+                        :disabled="!isComposeRouteValid"
+                        :title="!isComposeRouteValid ? 'Fill in the required fields first' : 'Add the route to the table; auto-save will draft it'"
+                        class="px-4 py-1.5 rounded bg-blue-600 text-white text-sm font-semibold hover:bg-blue-700 disabled:bg-gray-400">
+                  Create
                 </button>
-                <button @click="cancelTypeChange(m)"
-                        class="px-3 py-1 rounded border text-xs font-medium hover:bg-gray-50">
+                <button @click="cancelComposeRoute()"
+                        class="px-3 py-1.5 rounded border bg-white text-sm font-medium hover:bg-gray-50">
                   Cancel
                 </button>
+                <span class="text-xs text-gray-500 ml-1">Required fields are marked <span class="text-red-600">*</span>. Other fields (middlewares, health check) are available after creation in the row editor.</span>
               </div>
-            </div>
-
-            <!-- basicAuth editor -->
-            <div x-show="m.type === 'basicAuth'" class="border-t pt-3 mt-2 space-y-2">
-              <div class="flex items-center justify-between">
-                <label class="text-xs font-medium text-gray-600">Users</label>
-                <button @click="addBasicAuthUser(m)"
-                        class="text-xs text-blue-600 hover:text-blue-800">+ Add user</button>
-              </div>
-              <template x-for="u in (m.config.users || [])" :key="u._orig_username + ':' + (m.config.users.indexOf(u))">
-                <div class="flex gap-2 items-center">
-                  <input type="text" x-model="u.username"
-                         placeholder="username"
-                         class="font-mono border rounded px-2 py-1 w-40">
-                  <input type="password" x-model="u.password"
-                         :placeholder="u.password_set ? '••••• (set; leave blank to keep)' : 'password'"
-                         autocomplete="new-password"
-                         class="font-mono border rounded px-2 py-1 flex-1">
-                  <button @click="removeBasicAuthUser(m, u)"
-                          class="text-red-600 hover:text-red-800 text-sm">Remove</button>
-                </div>
-              </template>
-              <p class="text-xs text-gray-500">
-                Passwords are bcrypt-hashed at save time and never shown back.
-                Renaming a user requires setting a new password.
-              </p>
-            </div>
-
-            <!-- ipAllowList editor -->
-            <div x-show="m.type === 'ipAllowList'" class="border-t pt-3 mt-2 space-y-2">
-              <div class="flex items-center justify-between">
-                <label class="text-xs font-medium text-gray-600">Allowed CIDR ranges</label>
-                <button @click="addAllowRange(m)"
-                        class="text-xs text-blue-600 hover:text-blue-800">+ Add range</button>
-              </div>
-              <template x-for="(s, idx) in (m.config.sourceRange || [])" :key="idx">
-                <div class="flex gap-2 items-center">
-                  <input type="text"
-                         :value="s"
-                         @input="m.config.sourceRange[idx] = $event.target.value"
-                         placeholder="192.168.1.0/24 or 10.0.0.5"
-                         class="font-mono border rounded px-2 py-1 flex-1">
-                  <button @click="removeAllowRange(m, idx)"
-                          class="text-red-600 hover:text-red-800 text-sm">Remove</button>
-                </div>
-              </template>
-              <p class="text-xs text-gray-500">
-                Bare IPs become <span class="font-mono">/32</span> (or <span class="font-mono">/128</span> for IPv6).
-                Host bits are normalised to the network address on save.
-              </p>
-            </div>
-
-            <!-- redirectScheme editor -->
-            <div x-show="m.type === 'redirectScheme'" class="border-t pt-3 mt-2 space-y-3">
-              <div class="flex items-center gap-4">
-                <label class="text-xs font-medium text-gray-600">Redirect to</label>
-                <select x-model="m.config.scheme" class="border rounded px-2 py-1 bg-white">
-                  <option value="https">https</option>
-                  <option value="http">http</option>
-                </select>
-              </div>
-              <label class="flex items-center gap-2 text-sm">
-                <input type="checkbox" x-model="m.config.permanent">
-                <span>Permanent redirect (301 instead of 302)</span>
-              </label>
-              <p class="text-xs text-gray-500">
-                Common use: attach to an HTTP route to force browsers to upgrade to HTTPS.
-              </p>
-            </div>
-
-            <!-- headers editor -->
-            <div x-show="m.type === 'headers'" class="border-t pt-3 mt-2 space-y-4">
-              <div>
-                <div class="flex items-center justify-between mb-1">
-                  <label class="text-xs font-medium text-gray-600">Custom request headers (to backend)</label>
-                  <button @click="addHeaderRow(m, 'customRequestHeaders')"
-                          class="text-xs text-blue-600 hover:text-blue-800">+ Add header</button>
-                </div>
-                <template x-for="(row, idx) in (m.config.customRequestHeaders || [])" :key="'req-' + idx">
-                  <div class="flex gap-2 items-center mb-1">
-                    <input type="text" x-model="row.key" placeholder="Header-Name"
-                           class="font-mono border rounded px-2 py-1 w-56">
-                    <input type="text" x-model="row.value" placeholder="value (empty = sets to empty)"
-                           class="font-mono border rounded px-2 py-1 flex-1">
-                    <button @click="removeHeaderRow(m, 'customRequestHeaders', idx)"
-                            class="text-red-600 hover:text-red-800 text-sm">Remove</button>
-                  </div>
-                </template>
-              </div>
-              <div>
-                <div class="flex items-center justify-between mb-1">
-                  <label class="text-xs font-medium text-gray-600">Custom response headers (to client)</label>
-                  <button @click="addHeaderRow(m, 'customResponseHeaders')"
-                          class="text-xs text-blue-600 hover:text-blue-800">+ Add header</button>
-                </div>
-                <template x-for="(row, idx) in (m.config.customResponseHeaders || [])" :key="'res-' + idx">
-                  <div class="flex gap-2 items-center mb-1">
-                    <input type="text" x-model="row.key" placeholder="Header-Name"
-                           class="font-mono border rounded px-2 py-1 w-56">
-                    <input type="text" x-model="row.value" placeholder="value (empty = sets to empty)"
-                           class="font-mono border rounded px-2 py-1 flex-1">
-                    <button @click="removeHeaderRow(m, 'customResponseHeaders', idx)"
-                            class="text-red-600 hover:text-red-800 text-sm">Remove</button>
-                  </div>
-                </template>
-              </div>
-              <p class="text-xs text-gray-500">
-                Removing a row deletes the entry on save. An empty value SETS the header to empty
-                (Traefik does not delete via empty value).
-              </p>
             </div>
           </div>
         </template>
-      </div>
 
-      <!-- alpha.20: per-tab Save/Discard footers removed; see global
-           sticky Apply footer at the bottom of <body>. -->
-    </section>
+        <!-- alpha.12: per-section load-failure panel. Render INSTEAD of the
+             form / table so a stale load can't be 'fixed' by clicking Save. -->
+        <div x-show="loadFailed.routes" x-transition
+             class="mb-3 p-4 rounded border border-red-300 bg-red-50 text-sm text-red-900 flex items-start justify-between gap-3">
+          <div>
+            <strong>Couldn't load routes.</strong>
+            <div class="font-mono text-xs mt-1 whitespace-pre-wrap" x-text="loadFailed.routes"></div>
+          </div>
+          <button @click="loadRoutes()"
+                  class="shrink-0 px-3 py-1.5 rounded bg-red-600 text-white text-sm font-medium hover:bg-red-700">
+            Reload
+          </button>
+        </div>
 
-    <!-- ============ TRAEFIK DASHBOARD TAB ============ -->
-    <section x-show="tab==='dashboard'" x-transition class="w-full">
-      <template x-if="dashboardLoaded">
-        <iframe :src="ingressPath + '/dashboard/'"
-                class="w-full block bg-white border-0"
-                style="height: calc(100vh - 49px);"
-                title="Traefik dashboard"></iframe>
-      </template>
-    </section>
-  </main>
+        <div x-show="!loadFailed.routes && routes.length === 0" class="p-8 text-center text-gray-400 border border-dashed rounded">
+          No routes yet. Click <span class="font-medium">Add route</span> to create one.
+        </div>
+
+        <div x-show="systemRowInvalid" x-transition
+             class="mb-3 p-3 rounded border border-amber-300 bg-amber-50 text-sm text-amber-900">
+          The Home Assistant system route has no hostname. Type one (or disable it) before saving.
+        </div>
+
+        <!-- alpha.16: compact rows by default with inline-expandable editor.
+             Each item in routesTableItems is rendered as its own <tbody>:
+             - {type:'header'} → group header row (collapsible)
+             - {type:'route'} → compact row + optional expanded editor row
+             Per-tbody iteration is the only Alpine pattern that emits two
+             <tr>s per route inside a single x-for body. -->
+        <div x-show="!loadFailed.routes && routes.length > 0" class="overflow-x-auto">
+        <table class="w-full min-w-[720px] border-collapse text-sm">
+          <thead>
+            <!-- alpha.19: column headers are click-to-sort buttons. asc → desc →
+                 clear cycle; chevron-up/-down indicator on the active column.
+                 System rows still pin to the top of their group (see
+                 _sortRoutes). Tags column removed. -->
+            <tr class="text-left border-b text-[11px] uppercase tracking-wide text-gray-500">
+              <th class="py-2 pr-1 w-8"></th>                <!-- chevron -->
+              <th class="py-2 pr-2 w-12">
+                <button type="button"
+                        class="uppercase tracking-wide hover:text-gray-900 flex items-center gap-0.5"
+                        :aria-sort="sortKey === 'enabled' ? (sortDir === 'desc' ? 'descending' : 'ascending') : 'none'"
+                        @click="toggleSort('enabled')">
+                  <span>On</span>
+                  <span x-show="sortKey === 'enabled'"
+                        x-html="icon(sortIndicator('enabled'), 'w-3 h-3 inline-block')"></span>
+                </button>
+              </th>
+              <th class="py-2 pr-3">
+                <button type="button"
+                        class="uppercase tracking-wide hover:text-gray-900 flex items-center gap-0.5"
+                        :aria-sort="sortKey === 'hostname' ? (sortDir === 'desc' ? 'descending' : 'ascending') : 'none'"
+                        @click="toggleSort('hostname')">
+                  <span>Hostname</span>
+                  <span x-show="sortKey === 'hostname'"
+                        x-html="icon(sortIndicator('hostname'), 'w-3 h-3 inline-block')"></span>
+                </button>
+              </th>
+              <th class="py-2 pr-3">
+                <button type="button"
+                        class="uppercase tracking-wide hover:text-gray-900 flex items-center gap-0.5"
+                        :aria-sort="sortKey === 'backend' ? (sortDir === 'desc' ? 'descending' : 'ascending') : 'none'"
+                        @click="toggleSort('backend')">
+                  <span>Backend</span>
+                  <span x-show="sortKey === 'backend'"
+                        x-html="icon(sortIndicator('backend'), 'w-3 h-3 inline-block')"></span>
+                </button>
+              </th>
+              <th class="py-2 pr-3 w-24">
+                <button type="button"
+                        class="uppercase tracking-wide hover:text-gray-900 flex items-center gap-0.5"
+                        :aria-sort="sortKey === 'scheme' ? (sortDir === 'desc' ? 'descending' : 'ascending') : 'none'"
+                        @click="toggleSort('scheme')">
+                  <span>Scheme</span>
+                  <span x-show="sortKey === 'scheme'"
+                        x-html="icon(sortIndicator('scheme'), 'w-3 h-3 inline-block')"></span>
+                </button>
+              </th>
+              <th class="py-2 w-20"></th>                    <!-- actions / System pill -->
+            </tr>
+          </thead>
+          <template x-for="item in routesTableItems" :key="item._key">
+            <tbody>
+              <!-- ============ GROUP HEADER ============ -->
+              <template x-if="item.type === 'header'">
+                <tr class="bg-gray-100 border-b cursor-pointer hover:bg-gray-200 select-none"
+                    @click="toggleGroupCollapsed(item.key)">
+                  <td colspan="6" class="py-1.5 px-2 text-xs">
+                    <span class="inline-block text-gray-500 align-middle mr-0.5"
+                          x-html="icon(isGroupCollapsed(item.key) ? 'chevron-right' : 'chevron-down', 'w-4 h-4 inline-block')"></span>
+                    <span class="font-semibold text-gray-700" x-text="item.label"></span>
+                    <span class="text-gray-500 ml-1" x-text="'(' + item.count + ')'"></span>
+                  </td>
+                </tr>
+              </template>
+
+              <!-- ============ COMPACT ROUTE ROW ============ -->
+              <template x-if="item.type === 'route'">
+                <tr :class="item.r._orphan
+                              ? 'bg-red-50/40 border-b border-red-100 line-through text-gray-500'
+                              : (item.r.system
+                                  ? 'bg-blue-50 border-b border-blue-200'
+                                  : 'border-b hover:bg-gray-50')">
+                  <!-- Chevron: expand/collapse the editor below. alpha.20:
+                       orphan rows (soft-deleted) can't be edited; render a
+                       placeholder dash instead of the toggle. -->
+                  <td class="py-2 pr-1 text-center">
+                    <template x-if="!item.r._orphan">
+                      <button type="button"
+                              @click="toggleRouteExpanded(item.r)"
+                              :aria-expanded="item.r._expanded"
+                              :aria-label="(item.r._expanded ? 'Collapse' : 'Expand') + ' editor for route ' + (item.r.hostname || 'unnamed')"
+                              class="text-gray-500 hover:text-gray-900 leading-none align-middle"
+                              x-html="icon(item.r._expanded ? 'chevron-down' : 'chevron-right', 'w-4 h-4 inline-block')"></button>
+                    </template>
+                    <template x-if="item.r._orphan">
+                      <span class="text-gray-300 text-xs" aria-hidden="true">—</span>
+                    </template>
+                  </td>
+                  <!-- Enabled: checkbox for user, static for system -->
+                  <td class="py-2 pr-2">
+                    <template x-if="item.r.system">
+                      <span class="text-xs text-gray-700" x-text="item.r.enabled ? 'On' : 'Off'"></span>
+                    </template>
+                    <template x-if="!item.r.system">
+                      <input type="checkbox" x-model="item.r.enabled">
+                    </template>
+                  </td>
+                  <!-- Hostname (read-only display in compact view) + status dot +
+                       alpha.20: amber "modified" dot on the left when this row
+                       differs from live. -->
+                  <td class="py-2 pr-3">
+                    <div class="flex items-center gap-2">
+                      <span x-show="isRouteDirty(item.r.rid)"
+                            class="shrink-0 w-2 h-2 rounded-full bg-amber-500"
+                            title="Pending change in this route"
+                            aria-label="Pending change"
+                            role="img"></span>
+                      <span class="shrink-0 w-2.5 h-2.5 rounded-full"
+                            :class="routeStatusColor(item.r)"
+                            :title="routeStatusTitle(item.r)"
+                            :aria-label="routeStatusTitle(item.r)"
+                            role="img"></span>
+                      <span class="sr-only" x-text="routeStatusTitle(item.r)"></span>
+                      <span class="font-mono text-sm" x-text="item.r.hostname || '(unnamed)'"></span>
+                    </div>
+                  </td>
+                  <!-- Backend summary -->
+                  <td class="py-2 pr-3 text-xs text-gray-700">
+                    <span class="font-mono" x-text="compactBackendLabel(item.r)"></span>
+                  </td>
+                  <!-- Scheme + TLS + Skip TLS marker, all inline.
+                       alpha.18: lock + shield-alert are vendored MDI SVGs
+                       (was 🔒 + amber "skip-tls" text — the text marker
+                       wrapped narrow rows; the icon stays inline). -->
+                  <td class="py-2 pr-3 text-xs whitespace-nowrap">
+                    <span class="font-mono align-middle" x-text="item.r.scheme"></span>
+                    <span x-show="item.r.tls" class="text-gray-500 ml-1 align-middle inline-block"
+                          aria-label="TLS enabled" title="TLS"
+                          x-html="icon('lock', 'w-3.5 h-3.5 inline-block')"></span>
+                    <span x-show="item.r.skip_tls_verify && item.r.scheme === 'https'"
+                          class="text-amber-600 ml-1 align-middle inline-block"
+                          aria-label="Skip TLS verify on backend"
+                          title="Skip TLS verify on backend"
+                          x-html="icon('shield-alert', 'w-3.5 h-3.5 inline-block')"></span>
+                  </td>
+                  <!-- Actions: System pill for system rows, Restore for orphan
+                       rows (alpha.20 soft-delete), Remove button for user rows -->
+                  <td class="py-2 text-right pr-2">
+                    <template x-if="item.r._orphan">
+                      <button @click="restoreRoute(item.r.rid)"
+                              :aria-label="'Restore route ' + (item.r.hostname || 'unnamed')"
+                              class="text-blue-700 hover:text-blue-900 text-sm no-underline"
+                              title="Restore (was Removed; pending until Apply)">
+                        Restore
+                      </button>
+                    </template>
+                    <template x-if="!item.r._orphan && item.r.system">
+                      <span class="inline-block px-1.5 py-0.5 text-[10px] font-semibold rounded bg-blue-200 text-blue-900 uppercase tracking-wide">System</span>
+                    </template>
+                    <template x-if="!item.r._orphan && !item.r.system">
+                      <button @click="removeRoute(item.r)"
+                              :aria-label="'Remove route ' + (item.r.hostname || 'unnamed')"
+                              class="text-red-600 hover:text-red-800 text-sm" title="Remove">
+                        Remove
+                      </button>
+                    </template>
+                  </td>
+                </tr>
+              </template>
+
+              <!-- ============ EXPANDED EDITOR ROW ============ -->
+              <template x-if="item.type === 'route' && item.r._expanded">
+                <tr :class="item.r.system ? 'bg-blue-50 border-b border-blue-200' : 'border-b bg-gray-50'">
+                  <td></td>
+                  <td colspan="6" class="py-3 pr-3 pl-1">
+                    <div class="space-y-3 max-w-3xl">
+                      <!-- Hostname (always editable; system route allows hostname change) -->
+                      <div>
+                        <label class="block text-xs text-gray-600 mb-0.5">Hostname</label>
+                        <!-- alpha.21: amber accent + undo icon when value differs from live -->
+                        <div class="flex items-center gap-1.5">
+                          <input type="text" x-model="item.r.hostname"
+                                 class="font-mono border rounded px-2 py-1 w-64"
+                                 :class="isFieldDirty('routes', item.r.rid, 'hostname') ? 'border-amber-400 bg-amber-50' : 'bg-white'"
+                                 :placeholder="item.r.system ? 'hass' : 'cloud or cloud.example.com'">
+                          <button x-show="isFieldDirty('routes', item.r.rid, 'hostname')"
+                                  @click="discardField('routes', item.r.rid, 'hostname')"
+                                  type="button"
+                                  title="Revert hostname to live value"
+                                  aria-label="Revert hostname"
+                                  class="text-amber-700 hover:text-amber-900 inline-flex"
+                                  x-html="icon('undo', 'w-4 h-4 inline-block')"></button>
+                        </div>
+                      </div>
+
+                      <!-- Backend, Scheme, TLS, Middlewares, Health: user routes only.
+                           System row: those fields are server-locked. -->
+                      <template x-if="!item.r.system">
+                        <div class="space-y-3">
+                          <!-- Backend kind + host/port -->
+                          <div class="flex gap-3 items-end flex-wrap">
+                            <div>
+                              <label class="block text-xs text-gray-600 mb-0.5">Backend</label>
+                              <div class="flex items-center gap-1.5">
+                                <select x-model="item.r.backend_kind" class="border rounded px-2 py-1"
+                                        :class="isFieldDirty('routes', item.r.rid, 'backend_kind') ? 'border-amber-400 bg-amber-50' : 'bg-white'">
+                                  <option value="home_assistant">Home Assistant</option>
+                                  <option value="external">External</option>
+                                </select>
+                                <button x-show="isFieldDirty('routes', item.r.rid, 'backend_kind')"
+                                        @click="discardField('routes', item.r.rid, 'backend_kind')"
+                                        type="button" title="Revert backend kind to live"
+                                        class="text-amber-700 hover:text-amber-900 inline-flex"
+                                        x-html="icon('undo', 'w-4 h-4 inline-block')"></button>
+                              </div>
+                            </div>
+                            <div x-show="item.r.backend_kind === 'external'" class="flex gap-1 items-end">
+                              <div>
+                                <label class="block text-[10px] text-gray-500 mb-0.5">host</label>
+                                <div class="flex items-center gap-1.5">
+                                  <input type="text" x-model="item.r.backend_host" placeholder="10.0.0.20"
+                                         class="font-mono border rounded px-2 py-1 w-40"
+                                         :class="isFieldDirty('routes', item.r.rid, 'backend_host') ? 'border-amber-400 bg-amber-50' : 'bg-white'">
+                                  <button x-show="isFieldDirty('routes', item.r.rid, 'backend_host')"
+                                          @click="discardField('routes', item.r.rid, 'backend_host')"
+                                          type="button" title="Revert backend host to live"
+                                          class="text-amber-700 hover:text-amber-900 inline-flex"
+                                          x-html="icon('undo', 'w-4 h-4 inline-block')"></button>
+                                </div>
+                              </div>
+                              <div>
+                                <label class="block text-[10px] text-gray-500 mb-0.5">port</label>
+                                <div class="flex items-center gap-1.5">
+                                  <input type="number" x-model.number="item.r.backend_port" placeholder="443"
+                                         min="1" max="65535"
+                                         class="font-mono border rounded px-2 py-1 w-24"
+                                         :class="isFieldDirty('routes', item.r.rid, 'backend_port') ? 'border-amber-400 bg-amber-50' : 'bg-white'">
+                                  <button x-show="isFieldDirty('routes', item.r.rid, 'backend_port')"
+                                          @click="discardField('routes', item.r.rid, 'backend_port')"
+                                          type="button" title="Revert backend port to live"
+                                          class="text-amber-700 hover:text-amber-900 inline-flex"
+                                          x-html="icon('undo', 'w-4 h-4 inline-block')"></button>
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+
+                          <!-- Scheme + TLS + Skip TLS verify (alpha.21: per-field diff + undo) -->
+                          <div class="flex gap-4 items-end flex-wrap">
+                            <div>
+                              <label class="block text-xs text-gray-600 mb-0.5">Scheme</label>
+                              <div class="flex items-center gap-1.5">
+                                <select x-model="item.r.scheme" @change="onRouteSchemeChange(item.r)"
+                                        class="border rounded px-2 py-1"
+                                        :class="isFieldDirty('routes', item.r.rid, 'scheme') ? 'border-amber-400 bg-amber-50' : 'bg-white'"
+                                        :disabled="item.r.backend_kind === 'home_assistant'">
+                                  <option value="http">http</option>
+                                  <option value="https">https</option>
+                                </select>
+                                <button x-show="isFieldDirty('routes', item.r.rid, 'scheme')"
+                                        @click="discardField('routes', item.r.rid, 'scheme')"
+                                        type="button" title="Revert scheme to live"
+                                        class="text-amber-700 hover:text-amber-900 inline-flex"
+                                        x-html="icon('undo', 'w-4 h-4 inline-block')"></button>
+                              </div>
+                            </div>
+                            <label class="flex items-center gap-1.5 text-sm pb-1.5">
+                              <input type="checkbox" x-model="item.r.tls">
+                              TLS on (front-side)
+                              <button x-show="isFieldDirty('routes', item.r.rid, 'tls')"
+                                      @click.prevent.stop="discardField('routes', item.r.rid, 'tls')"
+                                      type="button" title="Revert TLS to live"
+                                      class="text-amber-700 hover:text-amber-900 inline-flex"
+                                      x-html="icon('undo', 'w-3.5 h-3.5 inline-block')"></button>
+                            </label>
+                            <label x-show="item.r.scheme === 'https'" class="flex items-center gap-1.5 text-sm pb-1.5">
+                              <input type="checkbox" x-model="item.r.skip_tls_verify">
+                              Skip TLS verify on backend
+                              <button x-show="isFieldDirty('routes', item.r.rid, 'skip_tls_verify')"
+                                      @click.prevent.stop="discardField('routes', item.r.rid, 'skip_tls_verify')"
+                                      type="button" title="Revert Skip TLS verify to live"
+                                      class="text-amber-700 hover:text-amber-900 inline-flex"
+                                      x-html="icon('undo', 'w-3.5 h-3.5 inline-block')"></button>
+                            </label>
+                          </div>
+
+                          <!-- Middlewares (alpha.12 combobox preserved verbatim) -->
+                          <div>
+                            <label class="block text-xs text-gray-600 mb-0.5">Middlewares</label>
+                            <div class="relative w-64"
+                                 x-data="{ open: false, activeIdx: -1 }"
+                                 @click.outside="open = false"
+                                 @keydown.escape.prevent="if (open) { open = false; $refs.trigger.focus(); }">
+                              <button type="button"
+                                      x-ref="trigger"
+                                      @click="open = !open; activeIdx = open ? 0 : -1"
+                                      @keydown.arrow-down.prevent="if (!open) { open = true; activeIdx = 0; } else { activeIdx = Math.min(eligibleRouteMiddlewares().length - 1, activeIdx + 1); }"
+                                      @keydown.arrow-up.prevent="if (open) activeIdx = Math.max(0, activeIdx - 1);"
+                                      @keydown.home.prevent="if (open) activeIdx = 0"
+                                      @keydown.end.prevent="if (open) activeIdx = eligibleRouteMiddlewares().length - 1"
+                                      @keydown.enter.prevent="if (open && activeIdx >= 0) { const mw = eligibleRouteMiddlewares()[activeIdx]; if (mw) toggleRouteMiddleware(item.r, mw.name, !(item.r.middlewares || []).includes(mw.name)); }"
+                                      @keydown.space.prevent="if (!open) { open = true; activeIdx = 0; } else if (activeIdx >= 0) { const mw = eligibleRouteMiddlewares()[activeIdx]; if (mw) toggleRouteMiddleware(item.r, mw.name, !(item.r.middlewares || []).includes(mw.name)); }"
+                                      @keydown.tab="open = false"
+                                      role="combobox"
+                                      aria-haspopup="listbox"
+                                      :aria-expanded="open"
+                                      :aria-controls="'lb-route-' + item.r._uid"
+                                      :aria-activedescendant="open && activeIdx >= 0 ? 'opt-route-' + item.r._uid + '-' + activeIdx : null"
+                                      :aria-label="'Middlewares: ' + routeMwSummary(item.r)"
+                                      class="border rounded px-2 py-1 w-full text-sm flex justify-between items-center gap-1 hover:bg-gray-50 bg-white">
+                                <span class="font-mono truncate" x-text="routeMwSummary(item.r)"></span>
+                                <span class="text-gray-400" aria-hidden="true">&#9662;</span>
+                              </button>
+                              <ul x-show="open" x-transition
+                                  role="listbox"
+                                  aria-multiselectable="true"
+                                  :id="'lb-route-' + item.r._uid"
+                                  class="absolute z-10 mt-1 w-full bg-white border rounded shadow-lg p-1 max-h-40 overflow-y-auto">
+                                <template x-if="!eligibleRouteMiddlewares().length">
+                                  <li role="presentation" class="text-gray-400 text-xs px-1 py-0.5">No middlewares defined</li>
+                                </template>
+                                <template x-for="(mw, i) in eligibleRouteMiddlewares()" :key="mw.name">
+                                  <li role="option"
+                                      :id="'opt-route-' + item.r._uid + '-' + i"
+                                      :aria-selected="(item.r.middlewares || []).includes(mw.name)"
+                                      @click="toggleRouteMiddleware(item.r, mw.name, !(item.r.middlewares || []).includes(mw.name))"
+                                      @mouseenter="activeIdx = i"
+                                      :class="activeIdx === i ? 'bg-blue-50' : 'hover:bg-gray-50'"
+                                      class="flex items-center gap-1.5 py-0.5 px-1 cursor-pointer rounded">
+                                    <input type="checkbox"
+                                           :checked="(item.r.middlewares || []).includes(mw.name)"
+                                           tabindex="-1"
+                                           @click.stop="toggleRouteMiddleware(item.r, mw.name, $event.target.checked)">
+                                    <span class="font-mono text-xs" x-text="mw.name"></span>
+                                  </li>
+                                </template>
+                                <template x-for="mw in (item.r.middlewares || []).filter(n => !middlewares.some(m => m.name === n))" :key="'orphan-'+mw">
+                                  <li role="option" aria-selected="true"
+                                      @click="toggleRouteMiddleware(item.r, mw, false)"
+                                      class="flex items-center gap-1.5 py-0.5 px-1 cursor-pointer hover:bg-gray-50 rounded">
+                                    <input type="checkbox" checked tabindex="-1"
+                                           @click.stop="toggleRouteMiddleware(item.r, mw, $event.target.checked)">
+                                    <span class="font-mono text-xs text-amber-700" x-text="mw + ' (missing)'"></span>
+                                  </li>
+                                </template>
+                              </ul>
+                            </div>
+                          </div>
+
+                          <!-- Health check path -->
+                          <div>
+                            <label class="block text-xs text-gray-600 mb-0.5">Backend health check path</label>
+                            <input type="text" :value="item.r.health_path || ''"
+                                   @input="item.r.health_path = $event.target.value || null"
+                                   placeholder="/"
+                                   class="font-mono border rounded px-2 py-1 w-40">
+                          </div>
+                        </div>
+                      </template>
+
+                      <!-- System-route footer hint -->
+                      <template x-if="item.r.system">
+                        <div class="text-xs text-gray-600 border-t border-blue-200 pt-2">
+                          <strong>System route.</strong> Backend, scheme, TLS, middlewares, and Skip-TLS are
+                          add-on-managed; only the hostname can be edited here.
+                        </div>
+                      </template>
+                    </div>
+                  </td>
+                </tr>
+              </template>
+            </tbody>
+          </template>
+        </table>
+        </div>
+
+        <!-- alpha.20: per-tab Save/Discard footers removed. Auto-save flushes
+             every edit to the draft (debounced); the sticky Apply footer at
+             the bottom of the page commits draft -> live for ALL surfaces. -->
+      </section>
+
+      <!-- ============ MIDDLEWARES TAB ============ -->
+      <section x-show="tab==='middlewares'" x-transition>
+        <div class="flex items-center justify-between mb-4">
+          <div>
+            <h2 class="text-base font-semibold">Middlewares</h2>
+            <p class="text-sm text-gray-500">
+              Define basicAuth, IP allow-lists, HTTP→HTTPS redirects, and custom headers.
+              Reference them by name in a route's <span class="font-mono">Middlewares</span> column.
+            </p>
+          </div>
+          <button @click="addMiddleware()"
+                  class="px-3 py-1.5 rounded bg-blue-600 text-white text-sm font-medium hover:bg-blue-700">
+            Add middleware
+          </button>
+        </div>
+
+        <!-- alpha.12: per-section load-failure panel. -->
+        <div x-show="loadFailed.middlewares" x-transition
+             class="mb-3 p-4 rounded border border-red-300 bg-red-50 text-sm text-red-900 flex items-start justify-between gap-3">
+          <div>
+            <strong>Couldn't load middlewares.</strong>
+            <div class="font-mono text-xs mt-1 whitespace-pre-wrap" x-text="loadFailed.middlewares"></div>
+          </div>
+          <button @click="loadMiddlewares()"
+                  class="shrink-0 px-3 py-1.5 rounded bg-red-600 text-white text-sm font-medium hover:bg-red-700">
+            Reload
+          </button>
+        </div>
+
+        <div x-show="!loadFailed.middlewares && visibleMiddlewares.length === 0" class="p-8 text-center text-gray-400 border border-dashed rounded">
+          No middlewares yet. Click <span class="font-medium">Add middleware</span> to create one.
+        </div>
+
+        <div x-show="!loadFailed.middlewares" class="space-y-4">
+          <!-- alpha.14: list visibleMiddlewares (drops every entry that's
+               owned by a feature toggle elsewhere — see FEATURE_MANAGED_MIDDLEWARES
+               in app.js). One filter rule, one source of truth. -->
+          <template x-for="m in visibleMiddlewares" :key="m._uid">
+            <div class="border rounded p-4 bg-white">
+              <div class="flex items-start gap-3 mb-3">
+                <div class="flex-1">
+                  <label class="block text-xs font-medium text-gray-600 mb-1">
+                    Name
+                    <span x-show="m.system"
+                          class="ml-1 inline-block px-1.5 py-0.5 rounded bg-gray-200 text-gray-600 text-[10px] align-middle">Built-in</span>
+                  </label>
+                  <input type="text" x-model="m.name"
+                         :readonly="m.system"
+                         placeholder="my-middleware"
+                         class="font-mono border rounded px-2 py-1 w-full"
+                         :class="m.system ? 'bg-gray-100 text-gray-500 cursor-not-allowed' : ''">
+                </div>
+                <div class="w-48">
+                  <label class="block text-xs font-medium text-gray-600 mb-1">Type</label>
+                  <!-- Built-in: type is locked. Render it read-only (a <select> with
+                       a conditional <template> option is invalid HTML and breaks the
+                       :value binding, defaulting to the first option). -->
+                  <template x-if="m.system">
+                    <div class="font-mono border rounded px-2 py-1 w-full bg-gray-100 text-gray-500"
+                         x-text="m.type"></div>
+                  </template>
+                  <template x-if="!m.system">
+                    <select :value="m.type"
+                            @change="changeMiddlewareType(m, $event.target.value)"
+                            class="border rounded px-2 py-1 w-full bg-white">
+                      <option value="basicAuth">basicAuth</option>
+                      <option value="ipAllowList">ipAllowList</option>
+                      <option value="redirectScheme">redirectScheme</option>
+                      <option value="headers">headers</option>
+                    </select>
+                  </template>
+                </div>
+                <button x-show="!m.system" @click="removeMiddleware(m)"
+                        class="self-end text-red-600 hover:text-red-800 text-sm pb-1">Remove</button>
+                <span x-show="m.system"
+                      class="self-end text-xs text-gray-400 pb-1"
+                      title="Built-in middleware managed by the add-on">Locked</span>
+              </div>
+
+              <!-- alpha.12: inline type-change confirmation. Replaces the
+                   native confirm() that used to block on changeMiddlewareType. -->
+              <div x-show="m._pendingType" x-transition.opacity
+                   class="border-t pt-3 mt-2 -mb-1 flex items-center justify-between gap-3 bg-amber-50 -mx-4 px-4 py-2 rounded">
+                <span class="text-sm text-amber-900">
+                  Switching to <span class="font-mono" x-text="m._pendingType"></span>
+                  will discard the current configuration.
+                </span>
+                <div class="flex items-center gap-2 shrink-0">
+                  <button @click="confirmTypeChange(m)"
+                          class="px-3 py-1 rounded bg-amber-600 text-white text-xs font-medium hover:bg-amber-700">
+                    Discard and switch
+                  </button>
+                  <button @click="cancelTypeChange(m)"
+                          class="px-3 py-1 rounded border text-xs font-medium hover:bg-gray-50">
+                    Cancel
+                  </button>
+                </div>
+              </div>
+
+              <!-- basicAuth editor -->
+              <div x-show="m.type === 'basicAuth'" class="border-t pt-3 mt-2 space-y-2">
+                <div class="flex items-center justify-between">
+                  <label class="text-xs font-medium text-gray-600">Users</label>
+                  <button @click="addBasicAuthUser(m)"
+                          class="text-xs text-blue-600 hover:text-blue-800">+ Add user</button>
+                </div>
+                <template x-for="u in (m.config.users || [])" :key="u._orig_username + ':' + (m.config.users.indexOf(u))">
+                  <div class="flex gap-2 items-center">
+                    <input type="text" x-model="u.username"
+                           placeholder="username"
+                           class="font-mono border rounded px-2 py-1 w-40">
+                    <input type="password" x-model="u.password"
+                           :placeholder="u.password_set ? '••••• (set; leave blank to keep)' : 'password'"
+                           autocomplete="new-password"
+                           class="font-mono border rounded px-2 py-1 flex-1">
+                    <button @click="removeBasicAuthUser(m, u)"
+                            class="text-red-600 hover:text-red-800 text-sm">Remove</button>
+                  </div>
+                </template>
+                <p class="text-xs text-gray-500">
+                  Passwords are bcrypt-hashed at save time and never shown back.
+                  Renaming a user requires setting a new password.
+                </p>
+              </div>
+
+              <!-- ipAllowList editor -->
+              <div x-show="m.type === 'ipAllowList'" class="border-t pt-3 mt-2 space-y-2">
+                <div class="flex items-center justify-between">
+                  <label class="text-xs font-medium text-gray-600">Allowed CIDR ranges</label>
+                  <button @click="addAllowRange(m)"
+                          class="text-xs text-blue-600 hover:text-blue-800">+ Add range</button>
+                </div>
+                <template x-for="(s, idx) in (m.config.sourceRange || [])" :key="idx">
+                  <div class="flex gap-2 items-center">
+                    <input type="text"
+                           :value="s"
+                           @input="m.config.sourceRange[idx] = $event.target.value"
+                           placeholder="192.168.1.0/24 or 10.0.0.5"
+                           class="font-mono border rounded px-2 py-1 flex-1">
+                    <button @click="removeAllowRange(m, idx)"
+                            class="text-red-600 hover:text-red-800 text-sm">Remove</button>
+                  </div>
+                </template>
+                <p class="text-xs text-gray-500">
+                  Bare IPs become <span class="font-mono">/32</span> (or <span class="font-mono">/128</span> for IPv6).
+                  Host bits are normalised to the network address on save.
+                </p>
+              </div>
+
+              <!-- redirectScheme editor -->
+              <div x-show="m.type === 'redirectScheme'" class="border-t pt-3 mt-2 space-y-3">
+                <div class="flex items-center gap-4">
+                  <label class="text-xs font-medium text-gray-600">Redirect to</label>
+                  <select x-model="m.config.scheme" class="border rounded px-2 py-1 bg-white">
+                    <option value="https">https</option>
+                    <option value="http">http</option>
+                  </select>
+                </div>
+                <label class="flex items-center gap-2 text-sm">
+                  <input type="checkbox" x-model="m.config.permanent">
+                  <span>Permanent redirect (301 instead of 302)</span>
+                </label>
+                <p class="text-xs text-gray-500">
+                  Common use: attach to an HTTP route to force browsers to upgrade to HTTPS.
+                </p>
+              </div>
+
+              <!-- headers editor -->
+              <div x-show="m.type === 'headers'" class="border-t pt-3 mt-2 space-y-4">
+                <div>
+                  <div class="flex items-center justify-between mb-1">
+                    <label class="text-xs font-medium text-gray-600">Custom request headers (to backend)</label>
+                    <button @click="addHeaderRow(m, 'customRequestHeaders')"
+                            class="text-xs text-blue-600 hover:text-blue-800">+ Add header</button>
+                  </div>
+                  <template x-for="(row, idx) in (m.config.customRequestHeaders || [])" :key="'req-' + idx">
+                    <div class="flex gap-2 items-center mb-1">
+                      <input type="text" x-model="row.key" placeholder="Header-Name"
+                             class="font-mono border rounded px-2 py-1 w-56">
+                      <input type="text" x-model="row.value" placeholder="value (empty = sets to empty)"
+                             class="font-mono border rounded px-2 py-1 flex-1">
+                      <button @click="removeHeaderRow(m, 'customRequestHeaders', idx)"
+                              class="text-red-600 hover:text-red-800 text-sm">Remove</button>
+                    </div>
+                  </template>
+                </div>
+                <div>
+                  <div class="flex items-center justify-between mb-1">
+                    <label class="text-xs font-medium text-gray-600">Custom response headers (to client)</label>
+                    <button @click="addHeaderRow(m, 'customResponseHeaders')"
+                            class="text-xs text-blue-600 hover:text-blue-800">+ Add header</button>
+                  </div>
+                  <template x-for="(row, idx) in (m.config.customResponseHeaders || [])" :key="'res-' + idx">
+                    <div class="flex gap-2 items-center mb-1">
+                      <input type="text" x-model="row.key" placeholder="Header-Name"
+                             class="font-mono border rounded px-2 py-1 w-56">
+                      <input type="text" x-model="row.value" placeholder="value (empty = sets to empty)"
+                             class="font-mono border rounded px-2 py-1 flex-1">
+                      <button @click="removeHeaderRow(m, 'customResponseHeaders', idx)"
+                              class="text-red-600 hover:text-red-800 text-sm">Remove</button>
+                    </div>
+                  </template>
+                </div>
+                <p class="text-xs text-gray-500">
+                  Removing a row deletes the entry on save. An empty value SETS the header to empty
+                  (Traefik does not delete via empty value).
+                </p>
+              </div>
+            </div>
+          </template>
+        </div>
+
+        <!-- alpha.20: per-tab Save/Discard footers removed; see global
+             sticky Apply footer at the bottom of <body>. -->
+      </section>
+
+      <!-- ============ TRAEFIK DASHBOARD TAB ============ -->
+      <section x-show="tab==='dashboard'" x-transition class="w-full">
+        <template x-if="dashboardLoaded">
+          <iframe :src="ingressPath + '/dashboard/'"
+                  class="w-full block bg-white border-0"
+                  style="height: calc(100vh - 49px);"
+                  title="Traefik dashboard"></iframe>
+        </template>
+      </section>
+    </main>
+
+  </div>
+  </template>
+  <!-- ============ END DASHBOARD ============ -->
 
   <!-- ============ TAKEOVER PROMPT (alpha.12) ============ -->
   <!-- Shown on load() when /api/session/claim returns 409: another session
@@ -1093,51 +1125,89 @@
     </div>
   </div>
 
-  <!-- ============ SETUP WIZARD OVERLAY ============ -->
-  <!-- Shown on first load when !state.configured, OR when the user clicks
-       "Re-run setup wizard" from the Configuration page. The wizard owns
-       the initial-config fields (provider/token/email/domain/ha_hostname);
-       they're NOT duplicated on the Configuration page.
+  <!-- ============ SETUP — ONBOARDING PAGE *OR* MODAL ============ -->
+  <!-- ONE form, two presentations, chosen by setupIsModal:
 
-       Backdrop and panel animate independently so the backdrop just fades
-       and doesn't visibly zoom along with the panel.
+         onboarded === false  the whole page. Nothing else is rendered, so a
+                              brand-new user sees a setup form and not a
+                              configure popup floating over a broken-looking
+                              dashboard. There is nothing behind it to close
+                              to, so no Escape / backdrop / Cancel / ×.
+         onboarded === true   a modal over the dashboard, opened by "Re-run
+                              setup wizard" on the Configuration tab. All the
+                              close affordances come back.
 
-       alpha.12 a11y: role=dialog + aria-modal + aria-labelledby; Escape
-       closes (when configured); Tab/Shift+Tab cycle inside the panel; the
-       first focusable input is focused on open; clicking the backdrop
-       closes (when configured). -->
-  <div x-show="wizardOpen" x-transition.opacity
-       @click="if (state.configured) closeWizard()"
+       Two copies of this form — an onboarding one and a wizard one — is
+       exactly how the two would drift apart, so the chrome is what varies and
+       the fields are written once. The form owns the initial-config fields
+       (provider / credentials / email / domain); they are NOT duplicated on
+       the Configuration page.
+
+       Backdrop and panel animate independently so the backdrop just fades and
+       doesn't visibly zoom along with the panel (docs/ui.md).
+
+       alpha.12 a11y, modal presentation only: role=dialog + aria-modal +
+       aria-labelledby; Escape closes; Tab/Shift+Tab cycle inside the panel;
+       clicking the backdrop closes. The first field is focused on open in
+       both presentations. -->
+  <div x-show="setupIsModal && wizardOpen" x-transition.opacity
+       @click="closeWizard()"
        class="fixed inset-0 z-40 bg-gray-900/40"></div>
-  <div x-show="wizardOpen" x-transition
-       @keydown.escape.window="if (wizardOpen && state.configured) closeWizard()"
-       class="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto p-4 sm:p-6 pointer-events-none">
-    <div role="dialog" aria-modal="true" aria-labelledby="wizard-title"
+  <div x-show="setupVisible" x-transition
+       @keydown.escape.window="closeWizard()"
+       :class="setupIsModal
+                 ? 'fixed inset-0 z-50 flex items-start justify-center overflow-y-auto p-4 sm:p-6 pointer-events-none'
+                 : 'min-h-full flex items-start justify-center p-4 sm:p-6'">
+    <div :role="setupIsModal ? 'dialog' : null"
+         :aria-modal="setupIsModal ? 'true' : null"
+         aria-labelledby="setup-title"
          x-ref="wizardPanel"
-         x-effect="if (wizardOpen) $nextTick(() => $refs.wizardFirstInput && $refs.wizardFirstInput.focus())"
-         @keydown.tab="trapFocus($event, $refs.wizardPanel)"
-         class="bg-white rounded-lg shadow-xl max-w-xl w-full my-12 p-4 sm:p-8 relative pointer-events-auto">
-      <button x-show="state.configured" @click="closeWizard()"
+         x-effect="if (setupVisible) $nextTick(() => $refs.wizardFirstInput && $refs.wizardFirstInput.focus())"
+         @keydown.tab="if (setupIsModal) trapFocus($event, $refs.wizardPanel)"
+         class="bg-white rounded-lg max-w-xl w-full p-4 sm:p-8 relative"
+         :class="setupIsModal
+                   ? 'shadow-xl my-12 pointer-events-auto'
+                   : 'shadow-sm border my-8 sm:my-12'">
+      <button x-show="setupIsModal" @click="closeWizard()"
               class="absolute top-3 right-4 text-gray-400 hover:text-gray-700 text-2xl leading-none"
               aria-label="Close setup wizard"
               title="Close (configuration is already saved)">&times;</button>
 
-      <h2 id="wizard-title" class="text-lg font-semibold mb-1">Setup wizard</h2>
-      <p class="text-sm text-gray-500 mb-6">
+      <!-- The onboarding page has no header bar of its own, so the panel
+           carries the product name and version. -->
+      <template x-if="!setupIsModal">
+        <div class="mb-4 pb-4 border-b flex items-baseline gap-2">
+          <span class="text-lg font-semibold">Traefik</span>
+          <span class="text-xs text-gray-400" x-show="appVersion" x-text="'v' + appVersion"></span>
+        </div>
+      </template>
+
+      <h2 id="setup-title" class="text-lg font-semibold mb-1"
+          x-text="setupIsModal ? 'Setup wizard' : 'Set up the add-on'"></h2>
+      <p class="text-sm text-gray-500" :class="setupIsModal ? 'mb-6' : 'mb-2'">
         Pick a TLS certificate provider and provide the credentials Traefik
         needs to obtain certificates via DNS-01 challenge.
       </p>
+      <template x-if="!setupIsModal">
+        <p class="text-sm text-gray-700 mb-6">
+          Finish this form and the routes, middlewares and Traefik dashboard
+          take over this page. You can come back to it any time from
+          <span class="font-medium">Configuration</span>.
+        </p>
+      </template>
 
       <form @submit.prevent="saveWizard()" class="space-y-5">
         <div>
           <label class="block text-sm font-medium mb-1" for="wizard-provider">1. Certificate provider</label>
+          <!-- One x-for and nothing else inside the <select>. The catalogue-
+               fetch-failed fallback is a getter, not a `<template x-if>`
+               sibling: a conditional template inside a select is invalid HTML
+               and breaks the binding, which is alpha.8's "Type field showed
+               basicAuth" bug (docs/ui.md). -->
           <select id="wizard-provider" x-model="config.provider"
                   x-ref="wizardFirstInput"
                   class="block w-full border rounded px-3 py-2 bg-white">
-            <template x-if="!providers.length">
-              <option value="cloudflare">Cloudflare (DNS-01)</option>
-            </template>
-            <template x-for="p in providers" :key="p.code">
+            <template x-for="p in providerOptions" :key="p.code">
               <option :value="p.code" x-text="p.name"></option>
             </template>
           </select>
@@ -1169,6 +1239,7 @@
               <input :id="'cred-' + f.env"
                      :type="f.secret ? 'password' : 'text'"
                      x-model="config.provider_credentials[f.env]"
+                     autocapitalize="off" spellcheck="false"
                      :placeholder="f.present ? '••••• (set; leave blank to keep)' : f.label"
                      autocomplete="new-password"
                      class="block w-full font-mono border rounded px-3 py-2">
@@ -1186,7 +1257,10 @@
         </div>
 
         <div x-show="config.provider !== 'local'">
-          <label class="block text-sm font-medium mb-1" for="wiz-email">3. ACME contact email</label>
+          <!-- Step numbers are computed, not written down: the credential
+               block above is 0 fields (local), 1 (Cloudflare) or 3 (netcup)
+               long, so everything after it shifts. -->
+          <label class="block text-sm font-medium mb-1" for="wiz-email"><span x-text="stepAcmeEmail"></span>. ACME contact email</label>
           <input id="wiz-email" type="email" x-model="config.acme_email"
                  placeholder="you@example.com"
                  :aria-invalid="!!acmeEmailError"
@@ -1200,7 +1274,7 @@
         </div>
 
         <div>
-          <label class="block text-sm font-medium mb-1" for="wiz-domain">4. Domain</label>
+          <label class="block text-sm font-medium mb-1" for="wiz-domain"><span x-text="stepDomain"></span>. Domain</label>
           <input id="wiz-domain" type="text" x-model="config.domain"
                  placeholder="example.com"
                  :aria-invalid="!!domainError"
@@ -1218,10 +1292,10 @@
                   :disabled="savingConfig || !wizardFormValid"
                   :title="!wizardFormValid ? 'Fix the highlighted fields first' : ''"
                   class="px-4 py-2 rounded bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 disabled:bg-gray-500">
-            <span x-show="!savingConfig">Save and finish</span>
+            <span x-show="!savingConfig" x-text="setupIsModal ? 'Save' : 'Save and finish'"></span>
             <span x-show="savingConfig">Saving...</span>
           </button>
-          <button x-show="state.configured" type="button" @click="closeWizard()"
+          <button x-show="setupIsModal" type="button" @click="closeWizard()"
                   class="px-3 py-2 rounded border text-sm font-medium hover:bg-gray-50">
             Cancel
           </button>
@@ -1251,7 +1325,11 @@
   <!-- ============ STICKY APPLY FOOTER (alpha.20) ============ -->
   <!-- Replaces the per-tab Save/Discard footers. Visible on every tab so
        the user can Apply or Discard pending changes regardless of where
-       they are. Hidden completely on read-only view. -->
+       they are. Hidden completely on read-only view, and not rendered at all
+       during onboarding — the setup form auto-saves into the draft as you
+       type, and a pending-changes bar over a first-run page would be asking
+       the user to Apply a form they haven't finished. -->
+  <template x-if="onboarded === true">
   <div x-show="pending.total > 0 && viewMode === 'rw'" x-transition
        class="fixed bottom-0 left-0 right-0 z-40 bg-amber-50 border-t border-amber-200 shadow-lg">
     <div class="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between flex-wrap gap-3">
@@ -1324,6 +1402,7 @@
       </div>
     </div>
   </div>
+  </template>
 
   <!-- alpha.20: input lockout overlay during Apply (~1s render). Dims the
        body and blocks pointer events so a fast-typed edit can't sneak in

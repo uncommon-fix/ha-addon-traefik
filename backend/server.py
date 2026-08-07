@@ -762,6 +762,13 @@ def _load_config_from(path: Path) -> dict:
     merged = {
         "provider": "cloudflare",
         "cloudflare_token": "",
+        # {ENV_NAME: value} for the selected provider. This default MUST be
+        # here: the config.yml pass below only copies keys that are ALREADY in
+        # `merged`, so without it every stored credential was silently dropped
+        # on load -- credentials_present reported nothing set, no provider but
+        # the legacy cloudflare one could ever count as configured, and the
+        # next save wrote the map back out empty.
+        "provider_credentials": {},
         "acme_email": "",
         "domain": "",
         "ha_hostname": "hass",
@@ -851,17 +858,28 @@ def _validate_config(body):
     body["cloudflare_token"] = token
     body["provider"] = body["provider"].strip().lower()
 
-    # provider_credentials: only names this provider actually uses, and the
-    # same character rules the cloudflare token has always had. A credential
-    # with an embedded newline validates fine, exports fine, and then fails
-    # at certificate-issue time, which is the worst place to find out.
+    # provider_credentials: the same character rules the cloudflare token has
+    # always had. A credential with an embedded newline validates fine,
+    # exports fine, and then fails at certificate-issue time, which is the
+    # worst place to find out.
+    #
+    # Names are deliberately NOT restricted to the selected provider's set. A
+    # credential for a provider you are not using right now is PARKED, not an
+    # error: switching provider -- or to `local` -- must not destroy a token
+    # you may switch back to, which is the promise useLocalProvider already
+    # makes about the legacy cloudflare_token. cont-init exports only
+    # required_env(provider) and deletes the rest, so a parked value never
+    # reaches Traefik's environment. This also has to hold because post_apply
+    # re-validates the stored draft: a rule that rejected parked names would
+    # make Apply fail on a config this very endpoint wrote.
+    # Names the add-on knows nothing about are still rejected -- that is a
+    # client bug, not a parked secret.
     creds = body.get("provider_credentials") or {}
-    allowed = set(required_env(body["provider"]))
-    unknown_creds = set(creds) - allowed
+    unknown_creds = set(creds) - set(ALL_CREDENTIAL_ENV)
     if unknown_creds:
         raise web.HTTPBadRequest(
-            text=f"provider_credentials: {sorted(unknown_creds)} are not used "
-                 f"by provider {body['provider']!r}"
+            text=f"provider_credentials: unknown credential name(s) "
+                 f"{sorted(unknown_creds)}"
         )
     cleaned = {}
     for name, value in creds.items():
@@ -1130,23 +1148,41 @@ def _do_fix_trusted_proxies() -> None:
 
 
 def _config_state(config: dict) -> dict:
-    """Onboarding state surfaced to the UI. Token value never leaves; only
-    presence is reported."""
-    # Onboarding asks for the user-facing setup fields only. The Advanced
-    # fields all have working defaults and don't gate routing. Phase F:
-    # ha_hostname is no longer in CONFIG_REQUIRED, so it's not in the
-    # subtraction either.
-    onboarding_fields = CONFIG_REQUIRED - {
-        "entrypoint_http", "entrypoint_https", "log_level",
-    }
-    missing = [f for f in onboarding_fields if not (config.get(f) or "").strip()]
+    """Onboarding state surfaced to the UI. Credential values never leave;
+    only presence is reported.
+
+    `configured` is the single flag the frontend routes on: false means the
+    onboarding page is the whole UI, true means the dashboard mounts. What it
+    takes to be configured is PROVIDER-DEPENDENT, and cannot be the fixed
+    field list it used to be:
+
+      - the Advanced fields (entry points, log level) all have working
+        defaults and never gate routing, so they are not asked about;
+      - `local` issues no certificates at all, so it needs neither an ACME
+        contact nor any credential -- demanding one would leave a user who
+        deliberately chose self-signed permanently stuck in onboarding;
+      - every other provider needs ITS OWN credentials. The old list
+        hardcoded `cloudflare_token`, which no provider added by the provider
+        table ever writes, so all eleven of them were unreachable.
+    """
+    creds = _credentials_present(config)
+    provider = (config.get("provider") or "").strip().lower()
+    missing: list[str] = []
+    if provider not in ALLOWED_PROVIDERS:
+        missing.append("provider")
+    elif provider != PROVIDER_LOCAL:
+        if not (config.get("acme_email") or "").strip():
+            missing.append("acme_email")
+        missing.extend(env for env in required_env(provider) if not creds.get(env))
+    if not (config.get("domain") or "").strip():
+        missing.append("domain")
     state = {
         "configured": not missing,
         "missing": missing,
         # Booleans so the UI can show a "already set" placeholder instead of
         # an empty box. We NEVER return a credential value.
-        "cloudflare_token_present": bool(config.get("cloudflare_token", "").strip()),
-        "credentials_present": _credentials_present(config),
+        "cloudflare_token_present": bool((config.get("cloudflare_token") or "").strip()),
+        "credentials_present": creds,
         # alpha.6: drives the trusted_proxies quick-fix banner.
         "trusted_proxies_pending": _trusted_proxies_pending(),
     }
@@ -1185,6 +1221,11 @@ def _redact_config(config: dict) -> dict:
     """Strip secrets from a config dict before returning to the UI."""
     redacted = dict(config)
     redacted["cloudflare_token"] = ""  # client sends new value or empty (= keep existing)
+    # Credential VALUES are write-only over the API (see CONFIG_TYPES). The UI
+    # learns which names are set from state.credentials_present and nothing
+    # more -- dropping the key here is what makes that true now that
+    # _load_config_from actually reads the map back off disk.
+    redacted.pop("provider_credentials", None)
     return redacted
 
 
@@ -1271,6 +1312,10 @@ async def put_config(request):
         body = await request.json()
     except json.JSONDecodeError as e:
         raise web.HTTPBadRequest(text=f"invalid JSON: {e}")
+    # _validate_config checks this too, but the preserve-existing merges below
+    # index into `body` first and would 500 on a list.
+    if not isinstance(body, dict):
+        raise web.HTTPBadRequest(text="payload: must be object")
     # Preserve-existing-token: empty cloudflare_token in PUT means "keep the
     # value already stored." Read from CURRENT DRAFT (not live) so a user who
     # has been editing the token sees the same write-only behaviour against
@@ -1278,6 +1323,27 @@ async def put_config(request):
     current = _load_config_draft()
     if not (body.get("cloudflare_token") or "").strip():
         body["cloudflare_token"] = current.get("cloudflare_token", "")
+    # Same preserve-existing rule for the per-provider credentials, and what
+    # makes the wizard's "••••• (set; leave blank to keep)" placeholder true:
+    # _validate_config drops blank values, so without this merge every save
+    # that didn't retype the secret erased it. Stored names the payload
+    # doesn't mention are carried through untouched -- see the parked-
+    # credential note in _validate_config.
+    stored_creds = {
+        name: value
+        for name, value in (current.get("provider_credentials") or {}).items()
+        if isinstance(value, str) and value.strip()
+    }
+    incoming_creds = body.get("provider_credentials")
+    if incoming_creds is not None and not isinstance(incoming_creds, dict):
+        raise web.HTTPBadRequest(
+            text="provider_credentials: wrong type (expected dict)"
+        )
+    merged_creds = dict(stored_creds)
+    for name, value in (incoming_creds or {}).items():
+        if isinstance(value, str) and value.strip():
+            merged_creds[name] = value
+    body["provider_credentials"] = merged_creds
     validated = _validate_config(body)
 
     async with request.app["draft_write_lock"]:
