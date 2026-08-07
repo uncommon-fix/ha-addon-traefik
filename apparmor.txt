@@ -1,0 +1,99 @@
+#include <tunables/global>
+
+# Traefik add-on. COMPLAIN MODE on every block -- see REPO-ISSUES.md "AppArmor"
+# for how to read denials and flip to enforce.
+#
+# Outer profile stays LOOSE (bare `file,`/`signal,`) because it covers the s6
+# supervision tree, bashio, cont-init, AND both Python-executed longruns
+# (backend/server.py, plus its own render.py/migrate.py subprocess calls) --
+# see apparmor.txt notes below for why Python isn't split into its own child.
+# The only real scoping is the traefik binary's child profile.
+profile traefik flags=(attach_disconnected,mediate_deleted,complain) {
+  #include <abstractions/base>
+  file,
+  signal,
+
+  # S6-Overlay & Bashio (dnsmasq/apparmor.txt shape -- do not enumerate
+  # /command/**, /package/**, /run/s6-rc*: those are s6-overlay-version
+  # internals covered by the bare `file,` above, not a stable contract).
+  /init rix,
+  /bin/** ix,
+  /usr/bin/** ix,
+  /etc/s6/** rix,
+  /run/s6/** rwix,
+  /etc/services.d/** rwix,
+  /etc/cont-init.d/** rwix,
+  /run/** rwk,
+  /usr/lib/bashio/** ix,
+  /tmp/** rw,
+
+  # cont-init + backend: migrate.py, render.py (both cont-init one-shots and
+  # every backend-triggered re-render after a Save -- server.py's own header
+  # comment "subprocess render.py"), server.py itself. All three are python3
+  # executing our own scripts, never attacker-supplied binaries, so they share
+  # this scope rather than each getting a `cx` transition -- AppArmor exec
+  # transitions key off the interpreter path (/usr/bin/python3), not argv, so
+  # a python3 transition can't distinguish migrate.py from server.py anyway.
+  /usr/local/bin/render.py rix,
+  /usr/local/bin/backend/** rix,
+
+  # add-on state: /data/*.yml (routes, config, middlewares, drafts, baselines,
+  # journal, options.json) -- render.py:19-31, backend/server.py:38-56.
+  /data/** rwk,
+
+  # rendered Traefik config -- outside /data, container-private, rewritten on
+  # every boot and every Apply (render.py:29-30,187-189,575-592).
+  /etc/traefik/ rw,
+  /etc/traefik/** rwk,
+
+  # cont-init's one-shot Cloudflare DNS-01 token export into s6's env-var
+  # injection dir -- 00-prep.sh:55-60. Already covered by `/run/** rwk,`
+  # above; named here for the reader, not because it adds a grant.
+  /run/s6/container_environment/CF_DNS_API_TOKEN rwk,
+
+  # /homeassistant is the host bind mount from `map: homeassistant_config:rw`
+  # (config.yaml:35-36). Two DIFFERENT processes write here, which is why this
+  # is a wildcard rather than one narrow path:
+  #   - cont-init's 99-deploy-integration.sh (root, one-shot): deploys the
+  #     bundled integration to custom_components/traefik/ via `find -delete`
+  #     + `cp -a`, then writes .bundled_version/.api_url/.content_hash
+  #     (99-deploy-integration.sh:27-59).
+  #   - the long-running backend itself (server.py:1007-1081, the
+  #     trusted_proxies quick-fix): reads/rewrites configuration.yaml at the
+  #     BIND-MOUNT ROOT, not just custom_components/ -- backs it up to
+  #     configuration.yaml.traefik-addon.bak and stages via
+  #     configuration.yaml.traefik-addon.tmp before an atomic os.replace.
+  #     This second write site is NOT in the phase brief; it was found by
+  #     reading server.py, not inferred. Also reads
+  #     custom_components/traefik/.content_hash and .loaded_content_hash
+  #     (server.py:79-80,905,912,1353) to drive the restart-required banner.
+  /homeassistant/** rwk,
+
+  /usr/local/bin/traefik cx,
+
+  # Traefik 3.7.1 itself: binds 80/443 (privileged) + a loopback-only
+  # dashboard/API entryPoint on 127.0.0.1:8090 (render.py:234-250), reads its
+  # own rendered config, and owns /data/acme.json directly (not through the
+  # backend) for its ACME DNS-01 cert storage (render.py:261).
+  profile /usr/local/bin/traefik flags=(attach_disconnected,mediate_deleted,complain) {
+    #include <abstractions/base>
+    signal receive,
+    capability net_bind_service,
+
+    # Cloudflare DNS-01 (outbound HTTPS to Cloudflare + Let's Encrypt) and the
+    # DNS propagation check lego does directly against 1.1.1.1/1.0.0.1:53
+    # (render.py:264) need both stream and dgram; AppArmor network mediation
+    # is family/type-scoped only, not address-scoped, so this can't be
+    # narrowed further to "only Cloudflare/LE".
+    network inet stream,
+    network inet6 stream,
+    network inet dgram,
+    network inet6 dgram,
+
+    /usr/local/bin/traefik mr,
+    /etc/traefik/traefik.yml r,
+    /etc/traefik/dynamic/ r,
+    /etc/traefik/dynamic/** r,
+    /data/acme.json rwk,
+  }
+}

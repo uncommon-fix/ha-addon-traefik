@@ -13,10 +13,6 @@ boot: manual
 # when `image:` is set, the supervisor PULLS the prebuilt image instead of
 # building from this Dockerfile, so local-add-on dev iteration needs it off.
 image: ghcr.io/uncommon-fix/ha-addon-traefik
-# AppArmor is disabled for the alpha: the add-on runs under Docker's default
-# profile rather than a custom one. A tailored profile is planned for a later
-# release. (Several official add-ons also ship without a custom profile.)
-apparmor: false
 # 0.9.0: enabled so backend can POST /core/restart via SUPERVISOR_TOKEN
 # (the user clicks "Restart HA Core" in the addon UI banner after the
 # bundled reachability integration is first deployed). hassio_api alone
