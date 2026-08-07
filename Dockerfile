@@ -63,8 +63,7 @@ RUN chmod +x /etc/services.d/backend/run \
              /etc/services.d/backend/finish \
              /etc/services.d/traefik/run \
              /etc/cont-init.d/00-prep.sh \
-             /etc/cont-init.d/99-deploy-integration.sh \
-             /usr/local/bin/state-sync.sh
+             /etc/cont-init.d/99-deploy-integration.sh
 
 # render.py installed at the same path Phase B/C used; backend invokes it as a
 # subprocess.
@@ -72,7 +71,12 @@ COPY --chmod=755 render.py /usr/local/bin/render.py
 
 # Backend Python scripts -- flat layout under /usr/local/bin/backend/, invoked
 # directly as `python3 /usr/local/bin/backend/server.py` (no -m, no PYTHONPATH
-# gotchas). migrate.py runs once from cont-init.
+# gotchas). migrate.py runs once from cont-init; state_sync.py runs from
+# cont-init and from the backend's s6 finish script.
+#
+# This also carries backend/addonkit/ -- the shared add-on kit, vendored by
+# tools/sync-shared.ps1. Running a script puts its own directory on sys.path,
+# which is exactly why `import addonkit` needs nothing added here.
 COPY backend/ /usr/local/bin/backend/
 
 # Static web assets the backend serves from /usr/share/traefik-web/{index.html,static/}.

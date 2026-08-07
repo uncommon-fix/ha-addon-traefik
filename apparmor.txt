@@ -29,11 +29,14 @@ profile traefik flags=(attach_disconnected,mediate_deleted) {
 
   # cont-init + backend: migrate.py, render.py (both cont-init one-shots and
   # every backend-triggered re-render after a Save -- server.py's own header
-  # comment "subprocess render.py"), server.py itself. All three are python3
-  # executing our own scripts, never attacker-supplied binaries, so they share
-  # this scope rather than each getting a `cx` transition -- AppArmor exec
-  # transitions key off the interpreter path (/usr/bin/python3), not argv, so
-  # a python3 transition can't distinguish migrate.py from server.py anyway.
+  # comment "subprocess render.py"), state_sync.py (cont-init restore + the
+  # backend's s6 finish export), server.py itself. All are python3 executing
+  # our own scripts, never attacker-supplied binaries, so they share this scope
+  # rather than each getting a `cx` transition -- AppArmor exec transitions key
+  # off the interpreter path (/usr/bin/python3), not argv, so a python3
+  # transition can't distinguish migrate.py from server.py anyway.
+  #
+  # The `**` also covers backend/addonkit/, the vendored shared kit.
   /usr/local/bin/render.py rix,
   /usr/local/bin/backend/** rix,
 
@@ -42,12 +45,17 @@ profile traefik flags=(attach_disconnected,mediate_deleted) {
   /data/** rwk,
 
   # /config -- the addon_config mount, and the only state that survives an
-  # uninstall. state-sync.sh mirrors /data here from the backend's s6 finish
-  # script and reads it back from cont-init, so both directions need write:
-  # `w` on the directory node itself for the temp-file rename the export uses.
+  # uninstall. backend/state_sync.py (addonkit.persist) mirrors /data here from
+  # the backend's s6 finish script and reads it back from cont-init, so both
+  # directions need write: `w` on the directory node itself for the temp-file
+  # rename the export uses.
+  #
+  # The mirror used to be /usr/local/bin/state-sync.sh, which needed its own
+  # `rix` line here. It is now a python3 script under /usr/local/bin/backend/,
+  # already covered by the `/usr/local/bin/backend/** rix,` grant above, so
+  # that line is gone rather than stale.
   /config/ rw,
   /config/** rwk,
-  /usr/local/bin/state-sync.sh rix,
 
   # rendered Traefik config -- outside /data, container-private, rewritten on
   # every boot and every Apply (render.py:29-30,187-189,575-592).

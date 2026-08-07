@@ -790,7 +790,7 @@ function traefikAppData() {
 
         // ---------- alpha.12: fetch wrapper ----------
         // Auto-injects X-Session-Id on mutations so the backend's
-        // session_gate_mw doesn't 423 our own saves. Raises a tagged
+        // gate middleware (addonkit.gate) doesn't 423 our own saves. Raises a tagged
         // SessionLost-class Error on 423 so the caller can switch to the
         // takeover toast instead of a generic save-failed message.
         async api(method, path, body) {

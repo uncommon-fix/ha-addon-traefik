@@ -10,5 +10,10 @@
 # It also runs on an ordinary restart or a crash, which is harmless: the export
 # is a dozen small files and is idempotent. Never let it fail the shutdown --
 # a non-zero exit here would make s6 report the service as failed.
-/usr/local/bin/state-sync.sh export || echo "[finish] state export failed, continuing"
+#
+# The mirror itself is addonkit.persist, driven by backend/state_sync.py, which
+# holds the tracked file list. It used to be /usr/local/bin/state-sync.sh; that
+# shell script was the original the kit module was ported from.
+python3 /usr/local/bin/backend/state_sync.py export \
+    || echo "[finish] state export failed, continuing"
 exit 0

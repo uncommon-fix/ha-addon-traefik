@@ -16,24 +16,30 @@ Architecture:
 from __future__ import annotations
 
 import asyncio
-import html as _html
 import ipaddress
 import json
 import os
 import re
-import secrets
 import shutil
 import sys
 import time
 import traceback
 import uuid
-from dataclasses import dataclass
 from pathlib import Path
 
 import aiohttp
 import bcrypt
 import yaml
 from aiohttp import web
+
+# The shared add-on kit, vendored at backend/addonkit/ by tools/sync-shared.ps1.
+# Resolvable as a plain name for the same reason `providers` below is: this file
+# is executed as a script (python3 /usr/local/bin/backend/server.py), which puts
+# its own directory on sys.path. Never edit backend/addonkit/ -- it is a copy.
+from addonkit.gate import Gate, gate_middleware
+from addonkit.ingress import ingress_path as kit_ingress_path
+from addonkit.ingress import render as kit_render
+from addonkit.ingress import view_headers as kit_view_headers
 
 OPTIONS = Path("/data/options.json")
 ROUTES_YML = Path("/data/routes.yml")
@@ -149,9 +155,10 @@ CONFIG_TYPES = {
     "force_ssl": bool,
 }
 
-# Supervisor's documented ingress URL shape. Reject anything else to defuse a
-# (theoretical) X-Ingress-Path XSS if the supervisor is ever compromised.
-INGRESS_RE = re.compile(r"^/api/hassio_ingress/[A-Za-z0-9_-]{20,128}/?$")
+# The X-Ingress-Path whitelist now lives in addonkit.ingress (INGRESS_RE +
+# ingress_path). The local copy this replaced ended `$`, which in Python also
+# matches immediately before a trailing newline -- so a header value ending in
+# "\n" passed the whitelist and was smuggled into the page. The kit ends `\Z`.
 
 # RFC 7230 §6.1 hop-by-hop; also strip Content-Length so aiohttp recomputes
 # the framing instead of double-setting it alongside Transfer-Encoding.
@@ -233,6 +240,25 @@ RESERVED_MIDDLEWARE_NAMES = {"chain", "noop", "api", "dashboard"}
 # control chars.
 BASICAUTH_USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 BCRYPT_ROUNDS = 12
+
+# ---------- application keys ----------
+# web.AppKey rather than plain strings: aiohttp 3.9+ raises NotAppKeyWarning on
+# every string-keyed app[...] and 4.0 removes them outright. A typed key also
+# cannot silently collide with an entry some other component puts on the app,
+# which a bare "client" very much can. Created in client_session_ctx below;
+# CLIENT is the only one aiohttp itself owns the lifetime of.
+CLIENT: web.AppKey[aiohttp.ClientSession] = web.AppKey("traefik.client")
+# apply_lock: held for the whole of POST /api/apply (snapshot + stage + journal
+# + rename + render + baseline update), and by the other handlers that mutate
+# live so they cannot race Apply.
+APPLY_LOCK: web.AppKey[asyncio.Lock] = web.AppKey("traefik.apply_lock")
+# draft_write_lock: held during PUT-to-draft (cheap, no render) and briefly
+# inside Apply for the snapshot+stage+rename phase.
+DRAFT_WRITE_LOCK: web.AppKey[asyncio.Lock] = web.AppKey("traefik.draft_write_lock")
+# The single-editor lock -- addonkit.gate.Gate. Constructed in make_app rather
+# than in the cleanup_ctx because gate_middleware closes over the instance and
+# the middleware list is built before the app starts.
+GATE: web.AppKey[Gate] = web.AppKey("traefik.gate")
 
 
 # ---------- validation ----------
@@ -318,8 +344,9 @@ def _enforce_system_route_protection(incoming: list, existing: list) -> None:
     PUTs can rename the hostname but cannot create new system routes,
     delete existing ones, or modify any other field.
 
-    MUST be called INSIDE save_lock with `existing` freshly loaded so a
-    concurrent PUT can't pass-then-race the comparison.
+    MUST be called INSIDE the draft/apply lock with `existing` freshly loaded
+    so a concurrent PUT can't pass-then-race the comparison. (Named save_lock
+    before the alpha.20 split; that alias is gone -- see APPLY_LOCK above.)
     """
     existing_systems = {r["system"]: r for r in existing if r.get("system")}
     incoming_systems = {r["system"]: r for r in incoming if r.get("system")}
@@ -1263,21 +1290,20 @@ def _strip_headers(headers, banned):
 
 # ---------- handlers ----------
 async def serve_index(request):
-    raw = request.headers.get("X-Ingress-Path", "")
-    ingress_path = raw if INGRESS_RE.match(raw) else ""
-    ingress_path = _html.escape(ingress_path.rstrip("/"), quote=True)
-    html_text = (
-        (WEB_ROOT / "index.html").read_text()
-        .replace("{{INGRESS_PATH}}", ingress_path)
-        .replace("{{APP_VERSION}}", ADDON_VERSION)
+    # kit_render substitutes in ONE pass, so a value can never be re-scanned
+    # for another token; the chained .replace() calls this replaced expanded
+    # whatever the previous substitution had just inserted.
+    html_text = kit_render(
+        (WEB_ROOT / "index.html").read_text(),
+        {},                       # no fragment files: this add-on has one template
+        INGRESS_PATH=kit_ingress_path(request),
+        APP_VERSION=ADDON_VERSION,
     )
     resp = web.Response(text=html_text, content_type="text/html")
-    # Same-origin iframe lock (HA ingress is same-origin to our SPA).
-    resp.headers["Content-Security-Policy"] = "frame-ancestors 'self'"
-    # Don't let the browser cache index.html -- it embeds {{INGRESS_PATH}}
-    # which can rotate between supervisor restarts, and we need every page
-    # load to pick up new app.js / version-busted asset URLs.
-    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    # Same-origin iframe lock (HA ingress is same-origin to our SPA), plus
+    # no-store: index.html embeds {{INGRESS_PATH}}, which can rotate between
+    # supervisor restarts, and every load must pick up version-busted assets.
+    resp.headers.update(kit_view_headers())
     return resp
 
 
@@ -1346,7 +1372,7 @@ async def put_config(request):
     body["provider_credentials"] = merged_creds
     validated = _validate_config(body)
 
-    async with request.app["draft_write_lock"]:
+    async with request.app[DRAFT_WRITE_LOCK]:
         _atomic_write_yml(CONFIG_DRAFT_YML, validated)
 
     state = _config_state(validated)
@@ -1372,7 +1398,7 @@ async def post_restart(request):
                  "in config.yaml and that the addon was rebuilt."
         )
     try:
-        async with request.app["client"].post(
+        async with request.app[CLIENT].post(
             f"{SUPERVISOR_URL}/addons/self/restart",
             headers={"Authorization": f"Bearer {SUPERVISOR_TOKEN}"},
             timeout=aiohttp.ClientTimeout(total=10.0),
@@ -1424,7 +1450,7 @@ async def post_restart_core(request):
     last_reason = "no response"
     for attempt, sleep_for in enumerate(backoffs, start=1):
         try:
-            async with request.app["client"].post(
+            async with request.app[CLIENT].post(
                 f"{SUPERVISOR_URL}/core/api/services/homeassistant/restart",
                 headers={"Authorization": f"Bearer {SUPERVISOR_TOKEN}"},
                 json={},
@@ -1467,7 +1493,7 @@ async def post_fix_trusted_proxies(request):
     # alpha.20: apply_lock — this handler writes outside /data so it doesn't
     # need draft_write_lock, but it's an exclusive long-running action so it
     # serializes against Apply.
-    async with request.app["apply_lock"]:
+    async with request.app[APPLY_LOCK]:
         try:
             await loop.run_in_executor(None, _do_fix_trusted_proxies)
         except _FixBail as e:
@@ -1486,7 +1512,7 @@ async def post_dismiss_integration(request):
     # alpha.20: apply_lock — this writes config.yml LIVE directly (server-
     # managed state field, not a user-editable draft surface), so it
     # serializes against Apply rather than draft writes.
-    async with request.app["apply_lock"]:
+    async with request.app[APPLY_LOCK]:
         raw = _read_raw_config()
         try:
             deployed = CONTENT_HASH_FILE.read_text(encoding="utf-8").strip()
@@ -1511,7 +1537,7 @@ async def put_routes(request):
     if not isinstance(body, dict):
         raise web.HTTPBadRequest(text="payload: must be object")
 
-    async with request.app["draft_write_lock"]:
+    async with request.app[DRAFT_WRITE_LOCK]:
         # Protection check is always against LIVE — locked fields are
         # immutable, draft or not.
         existing_live = _load_routes_yml()
@@ -1634,7 +1660,7 @@ async def post_internal_routes(request):
 
     # 5. Load draft, dedupe, append, validate, write — all inside
     #    draft_write_lock to serialise against other PUT/internal calls.
-    async with request.app["draft_write_lock"]:
+    async with request.app[DRAFT_WRITE_LOCK]:
         existing_draft = _load_routes_draft()
         existing_hostnames = {(r.get("hostname") or "").strip().lower()
                               for r in existing_draft}
@@ -1705,7 +1731,7 @@ async def put_middlewares(request):
     if not isinstance(body, dict):
         raise web.HTTPBadRequest(text="payload: must be object")
 
-    async with request.app["draft_write_lock"]:
+    async with request.app[DRAFT_WRITE_LOCK]:
         existing = _load_middlewares_draft()
         defs = await _validate_middlewares(body.get("middlewares", []), existing)
         defs = _reinject_system_middlewares(defs, existing)
@@ -1760,7 +1786,7 @@ async def get_route_health(request):
     domain = (config.get("domain") or "").strip().lower()
     routes = _load_routes_yml()
     try:
-        async with request.app["client"].get(
+        async with request.app[CLIENT].get(
             f"{TRAEFIK_URL}/api/http/services",
             timeout=aiohttp.ClientTimeout(total=2.0),
         ) as r:
@@ -1797,7 +1823,7 @@ async def get_route_health(request):
 async def get_status(request):
     """Reverse-proxy Traefik's /api/overview with friendlier 503-on-down."""
     try:
-        async with request.app["client"].get(
+        async with request.app[CLIENT].get(
             f"{TRAEFIK_URL}/api/overview",
             timeout=aiohttp.ClientTimeout(total=2.0),
         ) as r:
@@ -1845,7 +1871,7 @@ async def _proxy(request, upstream_url, *, inject_dashboard_rewrite=False):
         if k.lower() in PROXY_REQ_HEADERS
     }
     try:
-        async with request.app["client"].request(
+        async with request.app[CLIENT].request(
             request.method,
             upstream_url,
             data=request.content,
@@ -1910,95 +1936,36 @@ async def proxy_traefik_api(request):
 
 
 # ---------- session (alpha.12) ----------
-# Single-writer concurrent-edit guard. The UI has multiple tabs/browsers; the
-# server allows ONE active edit session at a time. Mutating endpoints require
-# the caller's X-Session-Id to match the current session's SID; otherwise 423.
+# Single-writer concurrent-edit guard. The implementation is now
+# addonkit.gate.Gate, which was generalised FROM the SessionManager that used
+# to live right here, so the model is unchanged: ONE active edit session,
+# mutating endpoints require the caller's X-Session-Id to match, otherwise 423.
 # A second tab is prompted to "Take over" (which invalidates the current
 # session) or "View read-only" (no SID, all mutations forbidden).
 #
 # Heartbeat: any request carrying X-Session-Id refreshes last_seen if the SID
-# matches. The frontend's existing /api/state poll (every 5s) keeps the
-# session alive; no separate heartbeat endpoint needed. After SESSION_TTL of
-# no heartbeat, the session expires server-side and a new claim succeeds.
+# matches. The frontend's existing /api/state poll (every 5s) keeps the session
+# alive; no separate heartbeat endpoint needed. After SESSION_TTL of no
+# heartbeat the session expires server-side and a new claim succeeds.
+#
+# Two things the kit does better, inherited here for free: its clock is
+# time.monotonic, so an NTP step can no longer expire or extend a live session
+# (the code this replaced used time.time), and a refused claim returns "" where
+# the old one returned None -- either way a reader never learns the holder's
+# SID, but the kit makes that a stated guarantee rather than an accident.
 SESSION_TTL = 60.0
 
-
-@dataclass
-class EditSession:
-    sid: str
-    last_seen: float
-
-
-class SessionManager:
-    def __init__(self) -> None:
-        self._current: EditSession | None = None
-
-    def _expire_if_stale(self, now: float) -> None:
-        if self._current and now - self._current.last_seen > SESSION_TTL:
-            self._current = None
-
-    def claim(self, incoming_sid: str | None = None) -> tuple[bool, str | None, float]:
-        """Try to become the active editor. Returns (ok, sid, current_age_s).
-        ok=True: claim succeeded; `sid` is the new session id (or the existing
-                 one if `incoming_sid` already matches the current session).
-        ok=False: another session is active; `sid` is None, current_age_s is
-                  how stale the current session looks (drives the UI prompt).
-
-        alpha.15: when `incoming_sid` matches the current session's SID, treat
-        the call as a no-op refresh and return success with the same sid. This
-        prevents the same browser from 409-ing itself when a code path re-runs
-        claim while already owning the session (e.g. the Routes-tab "Discard
-        changes" button calls load(), which calls claimSession() again).
-        Belt-and-braces with the client-side switch to call loadRoutes()
-        directly — protects any future caller that re-claims while holding.
-        SID collisions are negligible (24-byte secrets.token_urlsafe), so a
-        stale `incoming_sid` matching a fresh `self._current.sid` by accident
-        won't happen in practice."""
-        now = time.time()
-        self._expire_if_stale(now)
-        if self._current is None:
-            sid = secrets.token_urlsafe(24)
-            self._current = EditSession(sid=sid, last_seen=now)
-            return True, sid, 0.0
-        if incoming_sid and incoming_sid == self._current.sid:
-            self._current.last_seen = now
-            return True, self._current.sid, 0.0
-        return False, None, now - self._current.last_seen
-
-    def takeover(self) -> str:
-        """Forcibly become the active editor; invalidates any prior session."""
-        now = time.time()
-        sid = secrets.token_urlsafe(24)
-        self._current = EditSession(sid=sid, last_seen=now)
-        return sid
-
-    def heartbeat(self, sid: str) -> bool:
-        """Refresh last_seen on match. Returns True if the SID was current."""
-        now = time.time()
-        self._expire_if_stale(now)
-        if self._current and self._current.sid == sid:
-            self._current.last_seen = now
-            return True
-        return False
-
-    def is_current(self, sid: str) -> bool:
-        now = time.time()
-        self._expire_if_stale(now)
-        return self._current is not None and self._current.sid == sid
-
-
-class _HTTPLocked(web.HTTPException):
-    """423 Locked: returned for mutating endpoints when X-Session-Id does not
-    match the current session. aiohttp 3.9 doesn't ship a built-in HTTPLocked,
-    so we subclass HTTPException directly. The json_error_mw wraps this as
-    JSON like any other HTTPException."""
-    status_code = 423
-
-
-# (method, path) of endpoints that REQUIRE X-Session-Id to match the current
-# session. Read endpoints, the session/claim/takeover endpoints themselves,
-# the SPA at /, the /static/ assets, and the dashboard proxy paths are all
-# UNGATED — multiple readers are fine; only writers need serializing.
+# (method, ROUTE PATTERN) of endpoints that REQUIRE X-Session-Id to match the
+# current session. Read endpoints, the session/claim/takeover endpoints
+# themselves, the SPA at /, the /static/ assets, the dashboard proxy paths and
+# the /api/internal/* sibling bridge are all UNGATED -- multiple readers are
+# fine; only writers need serialising.
+#
+# The kit matches the REGISTERED ROUTE PATTERN, not the concrete path: it keys
+# on request.match_info.route.resource.canonical, so a dynamic endpoint would
+# be listed as e.g. ("DELETE", "/api/routes/{rid}"). Every gated endpoint below
+# is a static route, so pattern and path coincide today; the distinction starts
+# to matter the moment one of them grows a path variable.
 GATED_MUTATIONS: set[tuple[str, str]] = {
     ("PUT", "/api/config"),
     ("PUT", "/api/routes"),
@@ -2012,39 +1979,31 @@ GATED_MUTATIONS: set[tuple[str, str]] = {
     ("POST", "/api/discard"),
 }
 
-
-@web.middleware
-async def session_gate_mw(request, handler):
-    """Heartbeat on every request carrying X-Session-Id; gate mutating
-    endpoints to the current session.
-
-    Registration order matters: this middleware runs INSIDE json_error_mw so
-    the _HTTPLocked we raise here gets wrapped as a JSON 423 response by the
-    outer middleware (single JSON-shape contract for the UI)."""
-    mgr: SessionManager = request.app["session_mgr"]
-    sid_header = request.headers.get("X-Session-Id", "")
-    if sid_header:
-        mgr.heartbeat(sid_header)
-    if (request.method, request.path) in GATED_MUTATIONS:
-        if not mgr.is_current(sid_header):
-            raise _HTTPLocked(
-                text="Session not current. Another tab or browser is editing; "
-                     "reload to claim a new session or take over."
-            )
-    return await handler(request)
+# Kept verbatim from the SessionManager era instead of taking the kit's default
+# wording. app.js discards the 423 body and keys on the status alone, but the
+# string still reaches the add-on log, and changing user-visible text is not
+# what this migration is for.
+LOCKED_MESSAGE = (
+    "Session not current. Another tab or browser is editing; "
+    "reload to claim a new session or take over."
+)
 
 
 async def post_session_claim(request):
-    mgr: SessionManager = request.app["session_mgr"]
+    gate: Gate = request.app[GATE]
     # alpha.15: pass the requester's X-Session-Id through to claim() so a
     # caller already holding the active session gets a no-op refresh instead
-    # of 409-ing itself. (session_gate_mw at the outer level also heartbeats
-    # on any matching SID — claim() then short-circuits to success.)
+    # of 409-ing itself. (The gate middleware also heartbeats on any matching
+    # SID before we get here, so claim() then short-circuits to success.)
     incoming_sid = request.headers.get("X-Session-Id") or None
-    ok, sid, age = mgr.claim(incoming_sid)
-    if ok:
+    sid, claimed = gate.claim(incoming_sid)
+    if claimed:
         return web.json_response({"sid": sid})
-    return web.json_response({"current_age_s": age}, status=409)
+    # 409 + current_age_s is the shape app.js's takeover prompt reads. The kit
+    # ships its own claim handler that answers 200/{"claimed": false}; this
+    # frontend predates it, so the ENDPOINT stays ours and only the Gate is
+    # shared. Switching the status is a frontend change, not a kit adoption.
+    return web.json_response({"current_age_s": gate.age_s() or 0.0}, status=409)
 
 
 async def post_session_takeover(request):
@@ -2052,9 +2011,8 @@ async def post_session_takeover(request):
     opened second tab has no current SID and still needs to be able to take
     over. The UI surfaces this as an explicit 'Take over' button on the
     "another session active" modal."""
-    mgr: SessionManager = request.app["session_mgr"]
-    sid = mgr.takeover()
-    return web.json_response({"sid": sid})
+    gate: Gate = request.app[GATE]
+    return web.json_response({"sid": gate.takeover()})
 
 
 # ---------- lifecycle ----------
@@ -2238,8 +2196,8 @@ async def post_apply(request):
     # Acquire apply_lock. The draft_write_lock is acquired briefly inside
     # for the snapshot+stage phases; released before render so other tabs
     # can keep auto-saving while the ~1s render runs.
-    apply_lock: asyncio.Lock = request.app["apply_lock"]
-    draft_lock: asyncio.Lock = request.app["draft_write_lock"]
+    apply_lock = request.app[APPLY_LOCK]
+    draft_lock = request.app[DRAFT_WRITE_LOCK]
     async with apply_lock:
         live_paths = [ROUTES_YML, MIDDLEWARES_YML, CONFIG_YML]
         async with draft_lock:
@@ -2333,7 +2291,7 @@ async def post_discard(request):
     else:
         targets = [surface_targets[scope]]
 
-    async with request.app["draft_write_lock"]:
+    async with request.app[DRAFT_WRITE_LOCK]:
         for live_path, draft_path in targets:
             if live_path.exists():
                 _atomic_write_bytes(draft_path, live_path.read_bytes())
@@ -2387,7 +2345,7 @@ async def version_gate_mw(request, handler):
 
 
 async def client_session_ctx(app):
-    app["client"] = aiohttp.ClientSession()
+    app[CLIENT] = aiohttp.ClientSession()
     # alpha.20: lock split.
     # - apply_lock: held during POST /api/apply for the entire flow
     #   (snapshot + stage + journal + rename + render + baseline update).
@@ -2398,27 +2356,35 @@ async def client_session_ctx(app):
     #   briefly inside Apply for the snapshot+stage+rename phase. Released
     #   before the render call so concurrent auto-saves from other tabs
     #   don't hang during the ~1s render window. Within Apply, the
-    #   draft_write_lock release after rename is safe — live is already
+    #   draft_write_lock release after rename is safe -- live is already
     #   the new content and other writers are draft-only.
-    app["apply_lock"] = asyncio.Lock()
-    app["draft_write_lock"] = asyncio.Lock()
-    # Back-compat alias: any handler still referencing `save_lock` (none
-    # should after the alpha.20 refactor — grep before next release) gets
-    # the apply_lock semantics. Safe to delete once verified zero refs.
-    app["save_lock"] = app["apply_lock"]
-    app["session_mgr"] = SessionManager()
+    app[APPLY_LOCK] = asyncio.Lock()
+    app[DRAFT_WRITE_LOCK] = asyncio.Lock()
+    # (The `save_lock` back-compat alias that used to be created here is gone:
+    # it had zero references and was a plain string key, so keeping it would
+    # have meant inventing an AppKey for dead weight. ISSUES.md #5.)
     yield
-    await app["client"].close()
+    await app[CLIENT].close()
 
 
 def make_app():
+    # One Gate per application. Built here, not in the cleanup_ctx, because
+    # gate_middleware is a FACTORY that closes over the instance and the
+    # middleware list has to be complete before web.Application is constructed.
+    gate = Gate(ttl_s=SESSION_TTL)
+
     # Middleware order: outermost first. json_error_mw wraps ALL responses
-    # (including the _HTTPLocked from session_gate_mw) as JSON; version_gate_mw
-    # rejects stale clients early so neither session_gate nor the handler
-    # see a mismatched-version request; session_gate_mw runs innermost.
+    # (including the 423 HTTPLocked the gate raises) as JSON; version_gate_mw
+    # rejects stale clients early so neither the gate nor the handler sees a
+    # mismatched-version request; the gate runs innermost.
     app = web.Application(
-        middlewares=[json_error_mw, version_gate_mw, session_gate_mw]
+        middlewares=[
+            json_error_mw,
+            version_gate_mw,
+            gate_middleware(GATED_MUTATIONS, gate, message=LOCKED_MESSAGE),
+        ]
     )
+    app[GATE] = gate
     app.cleanup_ctx.append(client_session_ctx)
     app.router.add_get("/", serve_index)
     app.router.add_static("/static", str(WEB_ROOT / "static"))

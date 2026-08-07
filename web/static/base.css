@@ -1,0 +1,42 @@
+/* ---------------------------------------------------------------------------
+ * VENDORED FILE -- DO NOT EDIT HERE.
+ * Source of truth: shared/web/base.css, in the private workspace repo.
+ * Copied by tools/sync-shared.ps1. An edit made to THIS copy is drift:
+ * sync-shared.ps1 -Check reports it, and the next sync overwrites it.
+ * --------------------------------------------------------------------------- */
+
+/* base.css -- the shell every kit view shares.
+ *
+ * This is the ONLY styling the kit imposes. Anything one view needs on its own
+ * stays in that view; a third copy of the palette is a third thing to forget
+ * when one view is restyled, but a rule that lives here and is wrong is wrong
+ * in three add-ons at once. The bar for adding to this file is "all views,
+ * always".
+ *
+ * Served as a static asset and linked, not substituted:
+ *     <link rel="stylesheet" href="{{INGRESS_PATH}}/static/base.css">
+ * The {{FRAGMENT}} mechanism in ingress.render() is for HTML fragments that
+ * carry markup and behaviour (the Traefik banner); a stylesheet the browser
+ * can cache should not be inlined into every response, and view responses are
+ * no-store.
+ *
+ * Loaded BEFORE any per-view <style>, so a view overrides on equal
+ * specificity without needing !important.
+ */
+
+:root {
+  /* Tells the UA to render form controls, scrollbars and the canvas dark.
+     Without it the built-in widgets stay light on a dark page. */
+  color-scheme: dark;
+}
+
+html,
+body {
+  margin: 0;
+  background: #1b1c1e;
+  color: #e1e1e1;
+  /* Roboto first to match the Home Assistant frontend framing us; the rest is
+     a plain system stack, because an ingress view must not fetch a webfont --
+     the add-on may be the only thing reachable. */
+  font-family: Roboto, system-ui, -apple-system, sans-serif;
+}

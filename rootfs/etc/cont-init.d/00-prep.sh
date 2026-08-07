@@ -11,9 +11,12 @@ bashio::log.info "traefik add-on cont-init: migrate + initial render + token exp
 #    every uninstall unconditionally, so without this a reinstall starts blank
 #    even when the user chose to keep the configuration. No-ops when /data
 #    already holds state, so a normal restart is untouched.
-#    See rootfs/usr/local/bin/state-sync.sh for why /config is the only
-#    directory that survives, and docs/state-persistence.md for the contract.
-/usr/local/bin/state-sync.sh restore
+#    See backend/addonkit/persist.py for why /config is the only directory that
+#    survives; backend/state_sync.py holds the list of files mirrored.
+#    Best-effort: `set -e` is active, and a failed mirror must not abort a boot
+#    that would otherwise come up on whatever /data already has.
+python3 /usr/local/bin/backend/state_sync.py restore \
+    || bashio::log.warning "state restore failed; continuing with /data as found"
 
 # 1. Migrate options.routes -> /data/routes.yml AND options.{provider,
 #    cloudflare_token, acme_email, domain} -> /data/config.yml if missing.
